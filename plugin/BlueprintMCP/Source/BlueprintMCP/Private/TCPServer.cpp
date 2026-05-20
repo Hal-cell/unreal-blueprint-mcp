@@ -99,6 +99,13 @@
 #include "K2Node_EnhancedInputAction.h"
 #include "Kismet2/KismetEditorUtilities.h"  // already included earlier but harmless
 
+// v6 — IMC subscribe chain
+#include "EnhancedInputSubsystems.h"   // UEnhancedInputLocalPlayerSubsystem
+#include "Kismet/GameplayStatics.h"    // UGameplayStatics for GetPlayerController
+// USubsystemBlueprintLibrary — this is what UK2Node_GetSubsystemFromPC expands to at BP compile time.
+// We call the BP function directly to avoid depending on the (non-exported) K2Node.
+#include "Subsystems/SubsystemBlueprintLibrary.h"
+
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
 
 namespace
@@ -241,6 +248,7 @@ namespace
     /**
      * Resolve a user-friendly key name to UE's FKey, applying common aliases.
      * v5.0.1: LLMs / humans say "Space" but UE wants "SpaceBar". Same for Esc/Escape etc.
+     * v6.0.2: added Verbose log so future P2-style reports can be diagnosed from UE Output Log.
      */
     FKey ResolveFKeyWithAliases(const FString& Name)
     {
@@ -263,7 +271,13 @@ namespace
         const FString Lower = Name.ToLower();
         const FString* Mapped = kAliases.Find(Lower);
         const FString& Resolved = Mapped ? *Mapped : Name;
-        return FKey(*Resolved);
+        const FKey Result(*Resolved);
+        UE_LOG(LogBlueprintMCP_TCP, Verbose,
+            TEXT("ResolveFKeyWithAliases: input='%s' lower='%s' mapped='%s' resolved='%s' valid=%s"),
+            *Name, *Lower,
+            Mapped ? **Mapped : TEXT("<no-alias>"),
+            *Resolved, Result.IsValid() ? TEXT("true") : TEXT("false"));
+        return Result;
     }
 
     /** Build an FEdGraphPinType for a user-friendly variable type key. v1+v5 whitelist. */
@@ -468,6 +482,9 @@ namespace
      *   2. Well-known event short-name fallback — for default events that
      *      UBlueprintFactory auto-added (no NodeComment). E.g., "begin_play"
      *      maps to the K2Node_Event whose EventReference is `ReceiveBeginPlay`.
+     *   3. v6.0.4 GUID-prefix fallback — anchors of the form "node_<hex prefix>"
+     *      (as emitted by DeriveAnchorForNode for un-commented nodes) match by
+     *      NodeGuid prefix. Prefix must be ≥ 4 chars.
      *
      * Returns nullptr if not found.
      */
@@ -502,6 +519,29 @@ namespace
                     if (EventNode->EventReference.GetMemberName() == *EventFunc)
                     {
                         return EventNode;
+                    }
+                }
+            }
+        }
+
+        // 3. v6.0.4 fix (P7): GUID-prefix fallback. DeriveAnchorForNode emits
+        //    "node_<8-char-lowercase-guid>" for nodes without NodeComment (e.g. nodes
+        //    the user added manually in the editor, not via add_*). Before this fix,
+        //    those anchors were read-only — get_blueprint emitted them but tools
+        //    couldn't resolve them back. Now any prefix ≥4 chars matches.
+        if (AnchorName.StartsWith(TEXT("node_"), ESearchCase::CaseSensitive))
+        {
+            const FString GuidPrefix = AnchorName.Mid(5);
+            if (GuidPrefix.Len() >= 4)
+            {
+                const FString GuidPrefixLower = GuidPrefix.ToLower();
+                for (UEdGraphNode* Node : Graph->Nodes)
+                {
+                    if (Node == nullptr) continue;
+                    const FString NodeGuidStr = Node->NodeGuid.ToString(EGuidFormats::DigitsLower);
+                    if (NodeGuidStr.StartsWith(GuidPrefixLower))
+                    {
+                        return Node;
                     }
                 }
             }
@@ -708,10 +748,12 @@ namespace
         {
             return JsonError(TEXT("set_pin_default"), TEXT("exec_pin_no_default"), PinRef);
         }
-        // v1 primitive types OR v4 struct types
+        // v1 primitive types OR v4 struct types OR v6.0.2 class/object asset refs
         const FName Category = TargetPin->PinType.PinCategory;
         UScriptStruct* StructType = nullptr;
         FString ValueToSet = Value;
+        UObject* ObjectToSet = nullptr;   // for class / object pins (v6.0.2)
+        bool bUseObjectSetter = false;
 
         if (Category == UEdGraphSchema_K2::PC_Struct)
         {
@@ -721,8 +763,36 @@ namespace
                 return JsonError(TEXT("set_pin_default"), TEXT("unsupported_struct_type"),
                     StructType ? StructType->GetName() : TEXT("unknown"));
             }
-            // v4: reformat user input into UE-canonical struct text
             ValueToSet = FormatStructDefault(StructType, Value);
+        }
+        else if (Category == UEdGraphSchema_K2::PC_Class || Category == UEdGraphSchema_K2::PC_SoftClass)
+        {
+            // v6.0.2 P3 fix: class pin — value is a class name (e.g. "EnhancedInputLocalPlayerSubsystem"
+            // or a fully-qualified "/Script/EnhancedInput.EnhancedInputLocalPlayerSubsystem").
+            UClass* Found = FindFirstObject<UClass>(*Value, EFindFirstObjectOptions::NativeFirst);
+            if (!Found)
+            {
+                // Try as a full class path
+                Found = LoadObject<UClass>(nullptr, *Value);
+            }
+            if (!Found)
+            {
+                return JsonError(TEXT("set_pin_default"), TEXT("class_not_found"), Value);
+            }
+            ObjectToSet = Found;
+            bUseObjectSetter = true;
+        }
+        else if (Category == UEdGraphSchema_K2::PC_Object || Category == UEdGraphSchema_K2::PC_SoftObject ||
+                 Category == UEdGraphSchema_K2::PC_Interface)
+        {
+            // v6.0.2 P3 fix: object pin — value is an asset path like "/Game/Input/IMC_Default"
+            UObject* Asset = LoadObject<UObject>(nullptr, *Value);
+            if (!Asset)
+            {
+                return JsonError(TEXT("set_pin_default"), TEXT("asset_not_found"), Value);
+            }
+            ObjectToSet = Asset;
+            bUseObjectSetter = true;
         }
         else if (!IsSupportedPinTypeForDefault(Category))
         {
@@ -735,7 +805,14 @@ namespace
         {
             return JsonError(TEXT("set_pin_default"), TEXT("schema_not_k2"), BlueprintPath);
         }
-        Schema->TrySetDefaultValue(*TargetPin, ValueToSet, /*bMarkAsModified*/ true);
+        if (bUseObjectSetter)
+        {
+            Schema->TrySetDefaultObject(*TargetPin, ObjectToSet, /*bMarkAsModified*/ true);
+        }
+        else
+        {
+            Schema->TrySetDefaultValue(*TargetPin, ValueToSet, /*bMarkAsModified*/ true);
+        }
 
         // 8. Mark BP modified + save
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
@@ -747,11 +824,21 @@ namespace
         }
 
         // 9. Build response — report what UE actually stored (may differ after coercion)
+        // For object/class pins, value is the DefaultObject's path (since DefaultValue is empty)
+        FString StoredValue;
+        if (bUseObjectSetter && TargetPin->DefaultObject)
+        {
+            StoredValue = TargetPin->DefaultObject->GetPathName();
+        }
+        else
+        {
+            StoredValue = TargetPin->DefaultValue;
+        }
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"set_pin_default\",\"anchor_name\":%s,\"pin_name\":%s,\"value\":%s,\"pin_type\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName),
             *EscapeJsonString(PinName),
-            *EscapeJsonString(TargetPin->DefaultValue),
+            *EscapeJsonString(StoredValue),
             *EscapeJsonString(TargetPin->PinType.PinCategory.ToString()),
             bSaved ? TEXT("true") : TEXT("false"));
     }
@@ -1177,7 +1264,8 @@ namespace
         const FString& TargetClassStr,
         const FString& FunctionName,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& TargetPinRef = FString())  // v6: optional, auto-wire self
     {
         check(IsInGameThread());
 
@@ -1212,16 +1300,303 @@ namespace
         NewNode->PostPlacedNewNode();
         NewNode->AllocateDefaultPins();
 
+        // v6: optionally auto-wire self pin from a target pin
+        bool bSelfWired = false;
+        FString TargetPinError;
+        if (!TargetPinRef.IsEmpty())
+        {
+            FString TargetErr;
+            UEdGraphPin* SourcePin = ResolvePinRef(EventGraph, TargetPinRef, TEXT("call_blueprint_function"), TargetErr);
+            UEdGraphPin* SelfPin = NewNode->FindPin(UEdGraphSchema_K2::PN_Self);
+            if (!SelfPin)
+            {
+                // Fallback: try literal "self" pin name
+                SelfPin = NewNode->FindPin(FName("self"));
+            }
+            if (SourcePin && SelfPin)
+            {
+                const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(EventGraph->GetSchema());
+                if (Schema && Schema->TryCreateConnection(SourcePin, SelfPin))
+                {
+                    bSelfWired = true;
+                }
+                else
+                {
+                    TargetPinError = FString::Printf(TEXT("Could not wire %s -> %s.self"),
+                        *TargetPinRef, *AnchorName);
+                }
+            }
+            else if (!SourcePin)
+            {
+                TargetPinError = TargetErr;  // already JSON; we'll embed in detail
+            }
+            else
+            {
+                TargetPinError = TEXT("call node has no self pin (static function?)");
+            }
+        }
+
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
 
         const FString PinsJson = BuildPinsJsonArray(NewNode);
         const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        // Include target-pin wiring outcome in response if user asked for it
+        FString WiringJsonFragment;
+        if (!TargetPinRef.IsEmpty())
+        {
+            if (bSelfWired)
+            {
+                WiringJsonFragment = FString::Printf(
+                    TEXT(",\"self_wired\":true,\"self_source\":%s"),
+                    *EscapeJsonString(TargetPinRef));
+            }
+            else
+            {
+                WiringJsonFragment = FString::Printf(
+                    TEXT(",\"self_wired\":false,\"self_wire_error\":%s"),
+                    *EscapeJsonString(TargetPinError));
+            }
+        }
+
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"call_blueprint_function\",\"anchor_name\":%s,\"node_guid\":%s,\"target_class\":%s,\"function\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"call_blueprint_function\",\"anchor_name\":%s,\"node_guid\":%s,\"target_class\":%s,\"function\":%s,\"pins\":%s%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName), *EscapeJsonString(GuidStr),
             *EscapeJsonString(TargetClass->GetName()), *EscapeJsonString(FunctionName),
-            *PinsJson, bSaved ? TEXT("true") : TEXT("false"));
+            *PinsJson, *WiringJsonFragment,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v6 — wire_imc_subscribe (high-level macro) =====
+
+    /**
+     * Build the runtime IMC subscription chain in a BP's EventGraph:
+     *   BeginPlay → AddMappingContext(MappingContext=IMC, Priority=N)
+     *               .self ← GetSubsystem<UEnhancedInputLocalPlayerSubsystem>
+     *                         .PlayerController ← GetPlayerController(0)
+     *
+     * After this runs in PIE, the IMC is actually active and Enhanced Input
+     * events (added via add_enhanced_input_node) will fire.
+     */
+    FString WireImcSubscribeOnGameThread(
+        const FString& BlueprintPath,
+        const FString& IMCPath,
+        int32 Priority,
+        const FString& AnchorPrefix)
+    {
+        check(IsInGameThread());
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint) return JsonError(TEXT("wire_imc_subscribe"), TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(TEXT("wire_imc_subscribe"), TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        UInputMappingContext* IMC = LoadObject<UInputMappingContext>(nullptr, *IMCPath);
+        if (!IMC) return JsonError(TEXT("wire_imc_subscribe"), TEXT("imc_not_found"), IMCPath);
+
+        // Generate anchor names + check uniqueness. v6.0.2: add a 4th node (Cast) because
+        // GetLocalPlayerSubSystemFromPlayerController returns base ULocalPlayerSubsystem
+        // and DeterminesOutputType meta doesn't propagate through K2Node_CallFunction
+        // reliably for BlueprintInternalUseOnly functions called from outside their K2Node.
+        // An explicit Cast<EnhancedInputLocalPlayerSubsystem> sidesteps the issue cleanly.
+        const FString PCAnchor   = AnchorPrefix + TEXT("_get_pc");
+        const FString SubAnchor  = AnchorPrefix + TEXT("_get_sub");
+        const FString CastAnchor = AnchorPrefix + TEXT("_cast");
+        const FString AddAnchor  = AnchorPrefix + TEXT("_add_ctx");
+        for (const FString& A : { PCAnchor, SubAnchor, CastAnchor, AddAnchor })
+        {
+            if (FindNodeByAnchor(EventGraph, A) != nullptr)
+            {
+                return JsonError(TEXT("wire_imc_subscribe"), TEXT("anchor_name_exists"), A);
+            }
+        }
+
+        // Schema needed for pin-default setters (triggers PinDefaultValueChanged → type propagation)
+        const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(EventGraph->GetSchema());
+        if (!Schema) return JsonError(TEXT("wire_imc_subscribe"), TEXT("schema_not_k2"), TEXT(""));
+
+        // Find or spawn BeginPlay
+        UEdGraphNode* BeginPlay = FindOrSpawnNodeByAnchor(EventGraph, TEXT("begin_play"));
+        if (!BeginPlay) return JsonError(TEXT("wire_imc_subscribe"), TEXT("begin_play_unavailable"),
+            TEXT("BP parent class may not expose ReceiveBeginPlay"));
+        UEdGraphPin* BeginPlayThen = BeginPlay->FindPin(FName("then"));
+        if (!BeginPlayThen) return JsonError(TEXT("wire_imc_subscribe"), TEXT("begin_play_no_then_pin"), TEXT(""));
+
+        // Position chain to the right of BeginPlay
+        const int32 BaseX = BeginPlay->NodePosX + 350;
+        const int32 BaseY = BeginPlay->NodePosY + 250;
+
+        // --- Node 1: GetPlayerController(0) ---
+        UClass* GameplayStaticsClass = UGameplayStatics::StaticClass();
+        UFunction* GetPCFunc = GameplayStaticsClass->FindFunctionByName(FName("GetPlayerController"));
+        if (!GetPCFunc) return JsonError(TEXT("wire_imc_subscribe"), TEXT("getplayercontroller_missing"), TEXT(""));
+
+        UK2Node_CallFunction* GetPCNode = NewObject<UK2Node_CallFunction>(EventGraph);
+        GetPCNode->SetFlags(RF_Transactional);
+        GetPCNode->FunctionReference.SetExternalMember(GetPCFunc->GetFName(), GameplayStaticsClass);
+        GetPCNode->NodePosX = BaseX;
+        GetPCNode->NodePosY = BaseY;
+        GetPCNode->NodeComment = PCAnchor;
+        GetPCNode->bCommentBubbleVisible = true;
+        EventGraph->AddNode(GetPCNode, false, false);
+        GetPCNode->CreateNewGuid();
+        GetPCNode->PostPlacedNewNode();
+        GetPCNode->AllocateDefaultPins();
+
+        // --- Node 2: USubsystemBlueprintLibrary::GetLocalPlayerSubSystemFromPlayerController ---
+        // (This is exactly what UK2Node_GetSubsystemFromPC compiles to at BP compile time.
+        //  We call the function directly because the K2Node class isn't exported from
+        //  BlueprintGraph in UE 5.4.)
+        UClass* SubLibClass = USubsystemBlueprintLibrary::StaticClass();
+        UFunction* GetSubFunc = SubLibClass->FindFunctionByName(FName("GetLocalPlayerSubSystemFromPlayerController"));
+        if (!GetSubFunc) return JsonError(TEXT("wire_imc_subscribe"), TEXT("getsubsystem_function_missing"), TEXT(""));
+
+        UK2Node_CallFunction* GetSubNode = NewObject<UK2Node_CallFunction>(EventGraph);
+        GetSubNode->SetFlags(RF_Transactional);
+        GetSubNode->FunctionReference.SetExternalMember(GetSubFunc->GetFName(), SubLibClass);
+        GetSubNode->NodePosX = BaseX + 350;
+        GetSubNode->NodePosY = BaseY;
+        GetSubNode->NodeComment = SubAnchor;
+        GetSubNode->bCommentBubbleVisible = true;
+        EventGraph->AddNode(GetSubNode, false, false);
+        GetSubNode->CreateNewGuid();
+        GetSubNode->PostPlacedNewNode();
+        GetSubNode->AllocateDefaultPins();
+
+        // Set Class param default to UEnhancedInputLocalPlayerSubsystem.
+        // CRITICAL: must go through Schema so PinDefaultValueChanged fires and
+        // the ReturnValue pin retypes from ULocalPlayerSubsystem → UEnhancedInputLocalPlayerSubsystem
+        // (this function has meta=(DeterminesOutputType="Class")). Direct assignment skips that.
+        if (UEdGraphPin* ClassPin = GetSubNode->FindPin(FName("Class")))
+        {
+            Schema->TrySetDefaultObject(*ClassPin,
+                UEnhancedInputLocalPlayerSubsystem::StaticClass(), /*bMarkAsModified*/ true);
+        }
+
+        // --- Node 3: Cast to UEnhancedInputLocalPlayerSubsystem (v6.0.2 fix) ---
+        UClass* EISubsystemClass = UEnhancedInputLocalPlayerSubsystem::StaticClass();
+        UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(EventGraph);
+        CastNode->SetFlags(RF_Transactional);
+        CastNode->TargetType = EISubsystemClass;
+        CastNode->NodePosX = BaseX + 700;
+        CastNode->NodePosY = BaseY;
+        CastNode->NodeComment = CastAnchor;
+        CastNode->bCommentBubbleVisible = true;
+        EventGraph->AddNode(CastNode, false, false);
+        CastNode->CreateNewGuid();
+        CastNode->PostPlacedNewNode();
+        CastNode->AllocateDefaultPins();
+
+        // --- Node 4: AddMappingContext ---
+        UFunction* AddCtxFunc = EISubsystemClass->FindFunctionByName(FName("AddMappingContext"));
+        if (!AddCtxFunc) return JsonError(TEXT("wire_imc_subscribe"), TEXT("addmappingcontext_missing"), TEXT(""));
+
+        UK2Node_CallFunction* AddCtxNode = NewObject<UK2Node_CallFunction>(EventGraph);
+        AddCtxNode->SetFlags(RF_Transactional);
+        AddCtxNode->FunctionReference.SetExternalMember(AddCtxFunc->GetFName(), EISubsystemClass);
+        AddCtxNode->NodePosX = BaseX + 1050;
+        AddCtxNode->NodePosY = BaseY;
+        AddCtxNode->NodeComment = AddAnchor;
+        AddCtxNode->bCommentBubbleVisible = true;
+        EventGraph->AddNode(AddCtxNode, false, false);
+        AddCtxNode->CreateNewGuid();
+        AddCtxNode->PostPlacedNewNode();
+        AddCtxNode->AllocateDefaultPins();
+
+        // Set defaults on AddMappingContext: MappingContext = IMC, Priority = N.
+        // Same schema-based approach (notifications + mark-modified).
+        if (UEdGraphPin* MCPin = AddCtxNode->FindPin(FName("MappingContext")))
+        {
+            Schema->TrySetDefaultObject(*MCPin, IMC, /*bMarkAsModified*/ true);
+        }
+        if (UEdGraphPin* PriorityPin = AddCtxNode->FindPin(FName("Priority")))
+        {
+            Schema->TrySetDefaultValue(*PriorityPin, FString::Printf(TEXT("%d"), Priority), /*bMarkAsModified*/ true);
+        }
+
+        // --- Connect everything (v6.0.2 reroute: exec goes through Cast) ---
+
+        // v6.0.3 fix (P6): BeginPlay.then is single-output by K2 convention. If user has
+        // an existing BeginPlay chain (e.g. EnableInput), naive TryCreateConnection would
+        // sever it (CONNECT_RESPONSE_BREAK_OTHERS_A). Walk to the leaf of the existing
+        // .then chain and append our subscribe chain there instead of overwriting.
+        UEdGraphPin* InsertExecAfter = BeginPlayThen;
+        if (BeginPlayThen->LinkedTo.Num() > 0)
+        {
+            // Walk the existing chain to find the tail
+            UEdGraphPin* CurrentLink = BeginPlayThen->LinkedTo[0];
+            int32 SafetyCounter = 32;   // prevent infinite loop on circular graphs
+            while (CurrentLink && SafetyCounter-- > 0)
+            {
+                UEdGraphNode* CurrentNode = CurrentLink->GetOwningNode();
+                if (!CurrentNode) break;
+                UEdGraphPin* NextThen = CurrentNode->FindPin(FName("then"));
+                if (!NextThen)
+                {
+                    // Node has no .then (e.g. PrintString does have one — but some terminal nodes
+                    // don't). Fall back to attaching after this node by overwriting; better than
+                    // nothing.
+                    break;
+                }
+                if (NextThen->LinkedTo.Num() == 0)
+                {
+                    // Found the leaf
+                    InsertExecAfter = NextThen;
+                    break;
+                }
+                CurrentLink = NextThen->LinkedTo[0];
+            }
+        }
+
+        // EXEC chain: <leaf-of-existing-chain>.then → Cast.execute → Cast.then → AddCtx.execute
+        if (UEdGraphPin* CastExec = CastNode->FindPin(FName("execute")))
+        {
+            Schema->TryCreateConnection(InsertExecAfter, CastExec);
+        }
+        if (UEdGraphPin* CastThen = CastNode->FindPin(FName("then")))
+        {
+            if (UEdGraphPin* AddExec = AddCtxNode->FindPin(FName("execute")))
+            {
+                Schema->TryCreateConnection(CastThen, AddExec);
+            }
+        }
+
+        // DATA chain:
+        // GetPC.ReturnValue → GetSubsystem.PlayerController
+        if (UEdGraphPin* PCReturn = GetPCNode->FindPin(FName("ReturnValue")))
+        {
+            if (UEdGraphPin* SubPCIn = GetSubNode->FindPin(FName("PlayerController")))
+            {
+                Schema->TryCreateConnection(PCReturn, SubPCIn);
+            }
+        }
+        // GetSubsystem.ReturnValue → Cast.Object
+        if (UEdGraphPin* SubReturn = GetSubNode->FindPin(FName("ReturnValue")))
+        {
+            if (UEdGraphPin* CastObject = CastNode->FindPin(FName("Object")))
+            {
+                Schema->TryCreateConnection(SubReturn, CastObject);
+            }
+        }
+        // Cast result (typed as UEnhancedInputLocalPlayerSubsystem) → AddCtx.self
+        if (UEdGraphPin* CastResult = CastNode->GetCastResultPin())
+        {
+            UEdGraphPin* AddSelf = AddCtxNode->FindPin(UEdGraphSchema_K2::PN_Self);
+            if (!AddSelf) AddSelf = AddCtxNode->FindPin(FName("self"));
+            if (AddSelf) Schema->TryCreateConnection(CastResult, AddSelf);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"wire_imc_subscribe\",\"anchors_created\":[%s,%s,%s,%s],\"imc_path\":%s,\"priority\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(PCAnchor), *EscapeJsonString(SubAnchor),
+            *EscapeJsonString(CastAnchor), *EscapeJsonString(AddAnchor),
+            *EscapeJsonString(IMCPath), Priority,
+            bSaved ? TEXT("true") : TEXT("false"));
     }
 
     // ===== v5 — Enhanced Input =====
@@ -1693,6 +2068,15 @@ namespace
         NewNode->PostPlacedNewNode();
         NewNode->AllocateDefaultPins();
 
+        // v6.0.2 P5 fix: UE generates the cast result pin name from class display name
+        // (with spaces) for classes carrying a DisplayName meta. Override to a stable
+        // identifier-safe form: "As<ClassName>" (no spaces), regardless of class.
+        if (UEdGraphPin* ResultPin = NewNode->GetCastResultPin())
+        {
+            const FString ConsistentName = FString::Printf(TEXT("As%s"), *TargetClass->GetName());
+            ResultPin->PinName = FName(*ConsistentName);
+        }
+
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
@@ -1820,13 +2204,23 @@ namespace
             Writer->WriteValue(TEXT("direction"),
                 Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
             Writer->WriteValue(TEXT("type"), Pin->PinType.PinCategory.ToString());
-            // Default value for primitive input pins
+
+            // v6.0.2 P4 fix: surface default values for ALL pin storage forms
             if (Pin->Direction == EGPD_Input
-                && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
-                && !Pin->DefaultValue.IsEmpty())
+                && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
             {
-                Writer->WriteValue(TEXT("default"), Pin->DefaultValue);
+                if (!Pin->DefaultValue.IsEmpty())
+                {
+                    // Primitive defaults (string / int / float / bool / structs in text form)
+                    Writer->WriteValue(TEXT("default"), Pin->DefaultValue);
+                }
+                else if (Pin->DefaultObject)
+                {
+                    // Object / class / asset reference defaults — path to the referenced UObject
+                    Writer->WriteValue(TEXT("default"), Pin->DefaultObject->GetPathName());
+                }
             }
+
             // Linked flag — useful for LLM to know what's already wired
             if (Pin->LinkedTo.Num() > 0)
             {
@@ -1935,7 +2329,7 @@ namespace
         }
         Writer->WriteArrayEnd();
 
-        // variables [{name, type, subcategory}]
+        // variables [{name, type, subcategory, container}]  — v6.0.2 P4: add container info
         Writer->WriteArrayStart(TEXT("variables"));
         for (const FBPVariableDescription& Var : Blueprint->NewVariables)
         {
@@ -1945,6 +2339,19 @@ namespace
             if (Var.VarType.PinSubCategoryObject.IsValid())
             {
                 Writer->WriteValue(TEXT("subcategory"), Var.VarType.PinSubCategoryObject->GetName());
+            }
+            // Container info: none / array / set / map
+            const TCHAR* ContainerStr = TEXT("none");
+            switch (Var.VarType.ContainerType)
+            {
+                case EPinContainerType::Array: ContainerStr = TEXT("array"); break;
+                case EPinContainerType::Set:   ContainerStr = TEXT("set");   break;
+                case EPinContainerType::Map:   ContainerStr = TEXT("map");   break;
+                default: break;
+            }
+            if (Var.VarType.ContainerType != EPinContainerType::None)
+            {
+                Writer->WriteValue(TEXT("container"), ContainerStr);
             }
             Writer->WriteObjectEnd();
         }
@@ -2493,10 +2900,10 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- call_blueprint_function (v5) ---
+    // --- call_blueprint_function (v5 + v6 target_pin extension) ---
     if (Command.Equals(TEXT("call_blueprint_function"), ESearchCase::IgnoreCase))
     {
-        FString Blueprint, TargetClass, FunctionName, AnchorName;
+        FString Blueprint, TargetClass, FunctionName, AnchorName, TargetPin;
         if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
             return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("blueprint"));
         if (!JsonObject->TryGetStringField(TEXT("target_class"), TargetClass) || TargetClass.IsEmpty())
@@ -2505,16 +2912,40 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("function_name"));
         if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
             return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("anchor_name"));
+        // optional v6: target_pin to auto-wire self
+        JsonObject->TryGetStringField(TEXT("target_pin"), TargetPin);
         int32 PosX = 0, PosY = 0;
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY]() mutable
-            { Promise.SetValue(CallBlueprintFunctionOnGameThread(Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY)); });
+            [Promise = MoveTemp(Promise), Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin]() mutable
+            { Promise.SetValue(CallBlueprintFunctionOnGameThread(Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("call_blueprint_function"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- wire_imc_subscribe (v6) ---
+    if (Command.Equals(TEXT("wire_imc_subscribe"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, IMCPath, AnchorPrefix;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("wire_imc_subscribe"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("imc_path"), IMCPath) || IMCPath.IsEmpty())
+            return JsonError(TEXT("wire_imc_subscribe"), TEXT("missing_field"), TEXT("imc_path"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_prefix"), AnchorPrefix) || AnchorPrefix.IsEmpty())
+            AnchorPrefix = TEXT("imc_sub");
+        int32 Priority = 0;
+        JsonObject->TryGetNumberField(TEXT("priority"), Priority);
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, IMCPath, Priority, AnchorPrefix]() mutable
+            { Promise.SetValue(WireImcSubscribeOnGameThread(Blueprint, IMCPath, Priority, AnchorPrefix)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("wire_imc_subscribe"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

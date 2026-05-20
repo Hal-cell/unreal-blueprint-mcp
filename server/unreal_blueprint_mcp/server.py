@@ -66,7 +66,15 @@ def _send_command(command_payload: dict[str, Any]) -> dict[str, Any]:
             (UE_PLUGIN_HOST, UE_PLUGIN_PORT), timeout=UE_PLUGIN_TIMEOUT_SEC
         ) as sock:
             sock.sendall(payload_bytes)
-            data = sock.recv(8192)
+            # v6.0.2 P1 fix: loop recv until UE closes the connection (no 8KB cap).
+            # UE plugin closes the socket after sending the full response per HandleClient.
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            data = b"".join(chunks)
     except ConnectionRefusedError as e:
         return {
             "ok": False,
@@ -86,16 +94,21 @@ def _send_command(command_payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     response_str = data.decode("utf-8", errors="replace").strip()
-    log.info("← UE plugin: %s", response_str[:200])
+    log.info("← UE plugin: %d bytes, head=%s", len(response_str), response_str[:200])
 
     try:
         return json.loads(response_str)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        # Could be: actual non-JSON, OR a parse error we want to debug.
+        # The 8KB-truncation case from v6.0.1 is gone (recv loop now drains the socket),
+        # so this hint is now accurate.
         return {
             "ok": False,
             "error": "invalid_response_json",
             "raw": response_str,
-            "hint": "UE plugin returned non-JSON. Check Output Log on UE side.",
+            "raw_length": len(response_str),
+            "parse_error": str(e),
+            "hint": "UE plugin returned non-JSON or malformed JSON. Check Output Log on UE side.",
         }
 
 
@@ -460,6 +473,7 @@ def call_blueprint_function(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    target_pin: str = "",
 ) -> dict[str, Any]:
     """Call a function on another class / Blueprint from inside this BP's EventGraph.
 
@@ -477,10 +491,19 @@ def call_blueprint_function(
         function_name: Name of the function on that class.
         anchor_name: Label for the new node.
         position_x, position_y: Graph position.
+        target_pin: **v6 optional** — `<anchor>.<pin>` of a pin that produces an
+            object reference compatible with `target_class`. If provided, this
+            tool will auto-wire that pin → the call node's `self` input pin,
+            saving a `connect_pins` call.
+            Example: target_pin="get_target.ReturnValue"
 
     Returns:
         On success: {"ok": True, "anchor_name", "node_guid", "target_class", "function",
-                     "pins": [...], "saved": True}
+                     "pins": [...], "saved": True,
+                     # if target_pin was provided:
+                     "self_wired": True | False,
+                     "self_source": "<target_pin>"  # if wired
+                     "self_wire_error": "..."        # if not wired}
 
     Common errors:
         target_class_not_found  - couldn't resolve class via native lookup or BP load
@@ -495,6 +518,63 @@ def call_blueprint_function(
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
+        "target_pin": target_pin,
+    })
+
+
+@mcp.tool()
+def wire_imc_subscribe(
+    blueprint: str,
+    imc_path: str,
+    priority: int = 0,
+    anchor_prefix: str = "imc_sub",
+) -> dict[str, Any]:
+    """Wire the runtime "subscribe an InputMappingContext" chain in a BP's EventGraph.
+
+    The full canonical chain for Enhanced Input to actually fire at runtime is:
+
+        BeginPlay → AddMappingContext(MappingContext=IMC, Priority=N)
+                    .self ← GetSubsystem<UEnhancedInputLocalPlayerSubsystem>
+                              .PlayerController ← GetPlayerController(0)
+
+    This tool builds **all four nodes + three connections + two pin defaults**
+    in one shot. After running it, the IMC is actually active and any
+    `add_enhanced_input_node` events on the same BP (or anywhere) will fire
+    when their bound keys are pressed.
+
+    Use this:
+      - In a PlayerController BP, Pawn BP, or anywhere with BeginPlay access.
+      - Right after `create_input_mapping_context` + `add_mapping_to_imc`.
+
+    **v6.0.3 chain-tail insertion:** If BeginPlay.then already has an existing
+    downstream chain (e.g. EnableInput), the IMC subscribe chain is appended
+    AFTER the existing chain's leaf node rather than overwriting it. Walks
+    up to 32 nodes; if a node along the chain has no `then` pin, falls back
+    to overwriting at that point.
+
+    Args:
+        blueprint: BP where the subscribe chain is placed (typically the
+            controlling BP, e.g. a PlayerController or Pawn).
+        imc_path: Path to the UInputMappingContext to subscribe.
+        priority: AddMappingContext priority (default 0).
+        anchor_prefix: Prefix for generated anchor names. The three created
+            anchors are <prefix>_get_pc / <prefix>_get_sub / <prefix>_add_ctx.
+            Default "imc_sub".
+
+    Returns:
+        On success: {"ok": True, "anchors_created": [...], "imc_path", "priority", "saved": True}
+
+    Common errors:
+        blueprint_not_found / imc_not_found
+        anchor_name_exists    - one of the prefix-derived anchors collides
+        begin_play_unavailable - BP parent class doesn't support ReceiveBeginPlay
+    """
+    return _send_command({
+        "command": "wire_imc_subscribe",
+        "blueprint": blueprint,
+        "imc_path": imc_path,
+        "priority": priority,
+        "anchor_prefix": anchor_prefix,
     })
 
 

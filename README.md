@@ -5,8 +5,8 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v5](https://img.shields.io/badge/version-v5-brightgreen)](#status)
-[![27 tools](https://img.shields.io/badge/tools-27-blue)](#tools)
+[![v6](https://img.shields.io/badge/version-v6-brightgreen)](#status)
+[![28 tools](https://img.shields.io/badge/tools-28-blue)](#tools)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -42,8 +42,9 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v3** | ✅ `add_branch` (K2Node_IfThenElse) + `add_cast` (K2Node_DynamicCast) — conditional & type-narrowing flow |
 | **v4** | ✅ `add_macro` (ForEachLoop / WhileLoop / FlipFlop / DoOnce / Gate / ...) + `add_self_reference` + `add_input_key` + `delete_node` + `disconnect_pins` + struct types in `set_pin_default` (Vector / Rotator / Color) |
 | **v5** | ✅ Enhanced Input (`create_input_action` + `create_input_mapping_context` + `add_mapping_to_imc` + `add_enhanced_input_node`) + `add_function` + `call_blueprint_function` + **array variable types** + **+30 math/system/array short-names** in `add_node` whitelist |
-| **Unit tests** | 57 passing, 7 integration tests gated on a running UE editor |
-| **Plugin binary** | ~545 KB dylib on macOS / UE 5.4.4 |
+| **v6** | ✅ `wire_imc_subscribe` (one-shot Enhanced Input runtime subscribe chain) + `call_blueprint_function` `target_pin` auto-wire. v6.0.2-v6.0.4 hotfix bundle: `wire_imc_subscribe` inserts a Cast<EnhancedInputLocalPlayerSubsystem> in the chain (P0), recv loop removes 8KB cap (P1), `set_pin_default` accepts class+object refs (P3), `get_blueprint` shows object/class defaults + array container (P4), `add_cast` pin names consistent (P5), `wire_imc_subscribe` appends to existing BeginPlay chain instead of overwriting (P6), `node_<guid>` anchors are bidirectional (P7) |
+| **Unit tests** | 61 passing, 7 integration tests gated on a running UE editor |
+| **Plugin binary** | ~568 KB dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -135,6 +136,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`create_input_mapping_context`** (v5) | Create a UInputMappingContext asset |
 | **`add_mapping_to_imc`** (v5) | Bind a key (with aliases like Space → SpaceBar) to a UInputAction in an IMC |
 | **`add_enhanced_input_node`** (v5) | Add a `K2Node_EnhancedInputAction` event listener — modern UE input system |
+| **`wire_imc_subscribe`** (v6) | One-shot: builds the runtime IMC-subscribe chain (BeginPlay → GetPlayerController → GetSubsystem → Cast → AddMappingContext) with defaults & connections wired |
 | `set_pin_default` | Override a pin's default value (primitives + **Vector / Rotator / Color** since v4) |
 | `connect_pins` | Wire two pins; **auto-spawns well-known events on demand** |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |

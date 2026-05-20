@@ -61,7 +61,9 @@ def test_send_command_handles_invalid_response_json() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server._send_command({"command": "ping"})
@@ -82,7 +84,9 @@ def test_ping_ue_parses_plugin_success_response() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.ping_ue()
@@ -109,7 +113,9 @@ def test_create_blueprint_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent_payload["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.create_blueprint(name="BP_Test", parent_class="Actor", path="/Game/Blueprints")
@@ -140,7 +146,9 @@ def test_create_blueprint_handles_ue_error_response() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.create_blueprint(name="BP_Bad", parent_class="FooBar")
@@ -163,7 +171,9 @@ def test_create_blueprint_uses_defaults() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         server.create_blueprint(name="BP_X")
@@ -197,7 +207,9 @@ def test_add_node_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.add_node(
@@ -237,7 +249,9 @@ def test_add_node_handles_unknown_function() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.add_node(
@@ -263,7 +277,9 @@ def test_add_node_uses_position_defaults() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         server.add_node(
@@ -295,7 +311,9 @@ def test_set_pin_default_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.set_pin_default(
@@ -329,7 +347,9 @@ def test_set_pin_default_handles_anchor_not_found() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.set_pin_default(
@@ -352,7 +372,9 @@ def test_set_pin_default_handles_invalid_pin_ref() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.set_pin_default(
@@ -381,7 +403,9 @@ def test_connect_pins_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.connect_pins(
@@ -415,7 +439,9 @@ def test_connect_pins_handles_anchor_not_found() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.connect_pins(
@@ -438,7 +464,9 @@ def test_connect_pins_handles_incompatible_pins() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.connect_pins(
@@ -468,7 +496,9 @@ def test_compile_blueprint_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.compile_blueprint(name="/Game/Blueprints/BP_TestSpikeB1_v2")
@@ -492,7 +522,9 @@ def test_compile_blueprint_handles_warnings() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.compile_blueprint(name="/Game/Blueprints/BP_X")
@@ -510,7 +542,9 @@ def test_compile_blueprint_handles_error() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.compile_blueprint(name="/Game/Blueprints/BP_Broken")
@@ -538,7 +572,9 @@ def test_spawn_actor_success() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
@@ -569,7 +605,9 @@ def test_spawn_actor_handles_no_generated_class() -> None:
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data): pass
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         result = server.spawn_actor(blueprint="/Game/Blueprints/BP_NotCompiled")
@@ -589,7 +627,9 @@ def test_spawn_actor_passes_location() -> None:
         def __exit__(self, *a): pass
         def sendall(self, data):
             sent["data"] = data
-        def recv(self, n): return fake_response
+        def recv(self, n):
+            if getattr(self, "_sent", False): return b""
+            self._sent = True; return fake_response
 
     with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
         server.spawn_actor(
@@ -612,13 +652,22 @@ def test_spawn_actor_passes_location() -> None:
 
 
 def _fake_sock(response_bytes: bytes, sent_record: dict | None = None):
+    """v6.0.2: must simulate socket close after first read so the recv-loop in
+    _send_command terminates. Returning the same bytes forever caused an
+    infinite loop in pytest after the v6.0.2 P1 fix landed."""
     class FakeSock:
+        def __init__(self):
+            self._sent = False
         def __enter__(self): return self
         def __exit__(self, *a): pass
         def sendall(self, data):
             if sent_record is not None:
                 sent_record["data"] = data
-        def recv(self, n): return response_bytes
+        def recv(self, n):
+            if self._sent:
+                return b""   # simulate EOF — server closed the connection
+            self._sent = True
+            return response_bytes
     return FakeSock()
 
 
@@ -1043,6 +1092,32 @@ def test_call_blueprint_function_success() -> None:
     assert sent_dict["function_name"] == "DoThing"
 
 
+def test_call_blueprint_function_with_target_pin_success() -> None:
+    """v6: target_pin auto-wires self pin."""
+    response = (
+        b'{"ok":true,"command":"call_blueprint_function","anchor_name":"call_dothing",'
+        b'"node_guid":"G","target_class":"BP_Manager_C","function":"DoThing",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"}],'
+        b'"self_wired":true,"self_source":"get_target.ReturnValue","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.call_blueprint_function(
+            blueprint="/Game/Blueprints/BP_B",
+            target_class="BP_Manager",
+            function_name="DoThing",
+            anchor_name="call_dothing",
+            target_pin="get_target.ReturnValue",
+        )
+    assert r["ok"] is True
+    assert r["self_wired"] is True
+    assert r["self_source"] == "get_target.ReturnValue"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["target_pin"] == "get_target.ReturnValue"
+
+
 def test_call_blueprint_function_handles_class_not_found() -> None:
     response = b'{"ok":false,"command":"call_blueprint_function","error":"target_class_not_found","detail":"BP_DoesNotExist"}\n'
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
@@ -1113,6 +1188,64 @@ def test_add_enhanced_input_node_success() -> None:
         )
     assert r["ok"] is True
     assert any(p["name"] == "Triggered" for p in r["pins"])
+
+
+# ---------------------------------------------------------------------------
+# v6 — wire_imc_subscribe
+# ---------------------------------------------------------------------------
+
+
+def test_wire_imc_subscribe_success() -> None:
+    response = (
+        b'{"ok":true,"command":"wire_imc_subscribe",'
+        b'"anchors_created":["imc_sub_get_pc","imc_sub_get_sub","imc_sub_add_ctx"],'
+        b'"imc_path":"/Game/Input/IMC_Default","priority":0,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.wire_imc_subscribe(
+            blueprint="/Game/Blueprints/BP_PlayerController",
+            imc_path="/Game/Input/IMC_Default",
+            priority=0,
+        )
+    assert r["ok"] is True
+    assert "imc_sub_get_pc" in r["anchors_created"]
+    assert "imc_sub_add_ctx" in r["anchors_created"]
+    assert r["priority"] == 0
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "wire_imc_subscribe"
+    assert sent_dict["anchor_prefix"] == "imc_sub"
+
+
+def test_wire_imc_subscribe_custom_prefix() -> None:
+    response = (
+        b'{"ok":true,"command":"wire_imc_subscribe",'
+        b'"anchors_created":["combat_get_pc","combat_get_sub","combat_add_ctx"],'
+        b'"imc_path":"/Game/Input/IMC_Combat","priority":1,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.wire_imc_subscribe(
+            blueprint="/Game/Blueprints/BP_X",
+            imc_path="/Game/Input/IMC_Combat",
+            priority=1,
+            anchor_prefix="combat",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["anchor_prefix"] == "combat"
+    assert sent_dict["priority"] == 1
+
+
+def test_wire_imc_subscribe_handles_anchor_collision() -> None:
+    response = b'{"ok":false,"command":"wire_imc_subscribe","error":"anchor_name_exists","detail":"imc_sub_get_pc"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.wire_imc_subscribe(blueprint="/Game/X", imc_path="/Game/Y")
+    assert r["ok"] is False
+    assert r["error"] == "anchor_name_exists"
 
 
 # ---------------------------------------------------------------------------
