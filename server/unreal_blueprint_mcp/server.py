@@ -428,6 +428,204 @@ def set_pin_default(
 
 
 @mcp.tool()
+def add_function(blueprint: str, name: str) -> dict[str, Any]:
+    """Create a new user function graph in a Blueprint.
+
+    Adds an empty function to the BP's Functions list. After creation, the
+    function can be called from elsewhere via `call_blueprint_function`.
+
+    **v5 limitation:** parameters / return values are not yet exposed; the
+    function is empty + no-arg. Add nodes to the body manually in editor (or
+    wait for v6).
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        name: Function name (must be unique within this BP).
+
+    Returns:
+        On success: {"ok": True, "function_name": "...", "saved": True}
+
+    Common errors:
+        function_exists       - a function with this name already exists
+        graph_create_failed   - UE refused to create the graph
+    """
+    return _send_command({"command": "add_function", "blueprint": blueprint, "name": name})
+
+
+@mcp.tool()
+def call_blueprint_function(
+    blueprint: str,
+    target_class: str,
+    function_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Call a function on another class / Blueprint from inside this BP's EventGraph.
+
+    Use for cross-BP communication ("call BP_Manager.DoThing"), or for native
+    classes when you want explicit target-class syntax instead of the
+    `add_node` short-name whitelist.
+
+    Args:
+        blueprint: BP that will contain the call node.
+        target_class: Where the function lives. Accepts:
+            - Native class:  "Pawn", "PlayerController", "Actor", ...
+            - Bare BP name:  "BP_Manager"  (auto-resolves to /Game/Blueprints/BP_Manager)
+            - Game path:     "/Game/X/BP_Y"
+            - Class path:    "/Game/X/BP_Y.BP_Y_C"
+        function_name: Name of the function on that class.
+        anchor_name: Label for the new node.
+        position_x, position_y: Graph position.
+
+    Returns:
+        On success: {"ok": True, "anchor_name", "node_guid", "target_class", "function",
+                     "pins": [...], "saved": True}
+
+    Common errors:
+        target_class_not_found  - couldn't resolve class via native lookup or BP load
+        function_not_found      - function doesn't exist on the resolved class
+        anchor_name_exists      - anchor already used
+    """
+    return _send_command({
+        "command": "call_blueprint_function",
+        "blueprint": blueprint,
+        "target_class": target_class,
+        "function_name": function_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def create_input_action(
+    name: str,
+    value_type: str = "Boolean",
+    path: str = "/Game/Input/Actions",
+) -> dict[str, Any]:
+    """Create a new UInputAction asset (Enhanced Input system).
+
+    Args:
+        name: Asset name (typical convention: "IA_Jump", "IA_Look").
+        value_type: One of (case-insensitive):
+            - "Boolean" / "bool"     - on/off (default)
+            - "Axis1D" / "float"     - 1D scalar (analog trigger / scroll)
+            - "Axis2D" / "Vector2D"  - 2D vector (look / movement)
+            - "Axis3D" / "Vector"    - 3D vector
+        path: /Game-relative folder. Defaults to /Game/Input/Actions.
+
+    Returns:
+        On success: {"ok": True, "action_path": "...", "value_type": "...", "saved": True}
+
+    Common errors:
+        unknown_value_type  - value_type not in whitelist
+        asset_exists        - an asset with this name already exists at the path
+    """
+    return _send_command({
+        "command": "create_input_action",
+        "name": name,
+        "value_type": value_type,
+        "path": path,
+    })
+
+
+@mcp.tool()
+def create_input_mapping_context(
+    name: str,
+    path: str = "/Game/Input",
+) -> dict[str, Any]:
+    """Create a new UInputMappingContext asset (Enhanced Input system).
+
+    An IMC maps physical keys to UInputAction assets. After creation,
+    use `add_mapping_to_imc` to add key bindings.
+
+    Args:
+        name: Asset name (typical convention: "IMC_Default").
+        path: /Game-relative folder. Defaults to /Game/Input.
+
+    Returns:
+        On success: {"ok": True, "imc_path": "...", "saved": True}
+
+    Note: To actually receive input, the player must subscribe to this IMC at
+    runtime, typically via:
+        `EnhancedInputLocalPlayerSubsystem.AddMappingContext(IMC, Priority)`
+    in BeginPlay of the PlayerController or Pawn.
+    """
+    return _send_command({
+        "command": "create_input_mapping_context",
+        "name": name,
+        "path": path,
+    })
+
+
+@mcp.tool()
+def add_mapping_to_imc(
+    imc_path: str,
+    action_path: str,
+    key: str,
+) -> dict[str, Any]:
+    """Bind a physical key to a UInputAction inside an InputMappingContext.
+
+    Args:
+        imc_path: Full path to a UInputMappingContext asset.
+        action_path: Full path to a UInputAction asset.
+        key: FKey name (same syntax as `add_input_key`): "P" / "Space" /
+            "LeftMouseButton" / "Gamepad_FaceButton_Bottom" / ...
+
+    Returns:
+        On success: {"ok": True, "imc_path", "action_path", "key", "saved": True}
+
+    Common errors:
+        imc_not_found / action_not_found  - one of the paths failed to load
+        invalid_key                       - FKey rejected the name
+    """
+    return _send_command({
+        "command": "add_mapping_to_imc",
+        "imc_path": imc_path,
+        "action_path": action_path,
+        "key": key,
+    })
+
+
+@mcp.tool()
+def add_enhanced_input_node(
+    blueprint: str,
+    action_path: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add an Enhanced Input action event node to a Blueprint's EventGraph.
+
+    The K2Node_EnhancedInputAction node listens for triggers/state changes
+    on a UInputAction asset. Output exec pins: Triggered, Started, Ongoing,
+    Completed, Canceled. Output value pin (type depends on the action's
+    ValueType: bool / float / Vector2D / Vector).
+
+    Args:
+        blueprint: BP to add the node to.
+        action_path: Full path to a UInputAction asset (create via `create_input_action`).
+        anchor_name: Label for the new node.
+        position_x, position_y: Graph position.
+
+    Returns:
+        On success: {"ok": True, "anchor_name", "node_guid", "action_path", "pins": [...], "saved": True}
+
+    Note: Without IMC subscribed at runtime, this event never fires. See
+    `create_input_mapping_context` + `add_mapping_to_imc` + manual IMC subscribe.
+    """
+    return _send_command({
+        "command": "add_enhanced_input_node",
+        "blueprint": blueprint,
+        "action_path": action_path,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
 def add_macro(
     blueprint: str,
     macro_type: str,
@@ -518,7 +716,10 @@ def add_input_key(
         blueprint: Full Blueprint asset path.
         key: UE FKey name. Examples:
             - Letter keys: "P", "Q", "A", ...
-            - "Space", "Enter", "Escape", "Tab", "BackSpace"
+            - "Space" (auto-aliased to UE's "SpaceBar"), "Enter", "Escape" (or "Esc"),
+              "Tab", "BackSpace", "Delete"
+            - Modifier shortcuts (auto-aliased to Left variant): "Ctrl", "Alt", "Shift", "Cmd"
+              — pass "LeftControl" / "RightControl" explicitly for the right-side modifier
             - "LeftMouseButton", "RightMouseButton", "MiddleMouseButton"
             - "Up", "Down", "Left", "Right" (arrow keys)
             - "F1" through "F12"
@@ -803,9 +1004,11 @@ def add_variable(
     Args:
         blueprint: Full Blueprint asset path.
         name: Variable name (e.g., "MyTimerHandle"). Must be unique in this BP.
-        variable_type: v1 whitelist (case-insensitive):
+        variable_type: v1+v5 whitelist (case-insensitive):
             - `bool` / `int` / `float` (alias: `double`, `real`) / `string` / `name` / `text`
             - **`TimerHandle`** — the FTimerHandle struct (essential for timer cancellation)
+            - **v5 arrays:** append `[]` to any primitive — `int[]`, `float[]`, `string[]`,
+              `bool[]`, `name[]`. (TimerHandle[] is not supported.)
         default_value: Optional initial value as string (e.g., "true", "5.0", "hello").
             For TimerHandle and other structs, leave empty (will be a default-constructed struct).
 

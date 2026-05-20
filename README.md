@@ -5,8 +5,8 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v4](https://img.shields.io/badge/version-v4-brightgreen)](#status)
-[![21 tools](https://img.shields.io/badge/tools-21-blue)](#tools)
+[![v5](https://img.shields.io/badge/version-v5-brightgreen)](#status)
+[![27 tools](https://img.shields.io/badge/tools-27-blue)](#tools)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -41,8 +41,9 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v2** | ✅ `get_blueprint` — full BP introspection (anchors / connections / variables / components) so LLMs stop blind-writing |
 | **v3** | ✅ `add_branch` (K2Node_IfThenElse) + `add_cast` (K2Node_DynamicCast) — conditional & type-narrowing flow |
 | **v4** | ✅ `add_macro` (ForEachLoop / WhileLoop / FlipFlop / DoOnce / Gate / ...) + `add_self_reference` + `add_input_key` + `delete_node` + `disconnect_pins` + struct types in `set_pin_default` (Vector / Rotator / Color) |
-| **Unit tests** | 48 passing, 7 integration tests gated on a running UE editor |
-| **Plugin binary** | ~466 KB dylib on macOS / UE 5.4.4 |
+| **v5** | ✅ Enhanced Input (`create_input_action` + `create_input_mapping_context` + `add_mapping_to_imc` + `add_enhanced_input_node`) + `add_function` + `call_blueprint_function` + **array variable types** + **+30 math/system/array short-names** in `add_node` whitelist |
+| **Unit tests** | 57 passing, 7 integration tests gated on a running UE editor |
+| **Plugin binary** | ~545 KB dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -125,9 +126,15 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`add_cast`** (v3) | Add a `K2Node_DynamicCast` (Cast To X) — type narrowing |
 | **`add_macro`** (v4) | Add a `K2Node_MacroInstance` — ForEachLoop / ForLoop / WhileLoop / FlipFlop / DoOnce / Gate / IsValid |
 | **`add_self_reference`** (v4) | Add a `K2Node_Self` — self reference |
-| **`add_input_key`** (v4) | Add a `K2Node_InputKey` — keyboard / mouse / gamepad key event |
+| **`add_input_key`** (v4) | Add a `K2Node_InputKey` — keyboard / mouse / gamepad key event (legacy) |
 | **`delete_node`** (v4) | Delete a node and break all its connections |
 | **`disconnect_pins`** (v4) | Break a single pin link (inverse of `connect_pins`) |
+| **`add_function`** (v5) | Create an empty user function graph in the BP |
+| **`call_blueprint_function`** (v5) | Call a function on another class — native or BP class path |
+| **`create_input_action`** (v5) | Create a UInputAction asset (Boolean / Axis1D / Axis2D / Axis3D) |
+| **`create_input_mapping_context`** (v5) | Create a UInputMappingContext asset |
+| **`add_mapping_to_imc`** (v5) | Bind a key (with aliases like Space → SpaceBar) to a UInputAction in an IMC |
+| **`add_enhanced_input_node`** (v5) | Add a `K2Node_EnhancedInputAction` event listener — modern UE input system |
 | `set_pin_default` | Override a pin's default value (primitives + **Vector / Rotator / Color** since v4) |
 | `connect_pins` | Wire two pins; **auto-spawns well-known events on demand** |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |

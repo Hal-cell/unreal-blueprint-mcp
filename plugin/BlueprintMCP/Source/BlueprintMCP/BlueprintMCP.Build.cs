@@ -32,6 +32,10 @@ public class BlueprintMCP : ModuleRules
             "EditorScriptingUtilities",
             // v4: FKey for K2Node_InputKey
             "InputCore",
+            // v5: Enhanced Input (UInputAction, UInputMappingContext)
+            "EnhancedInput",
+            // v5: K2Node_EnhancedInputAction lives in this module
+            "InputBlueprintNodes",
         });
     }
 }

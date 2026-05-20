@@ -1001,6 +1001,121 @@ def test_disconnect_pins_handles_not_connected() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v5 — add_function, call_blueprint_function, Enhanced Input (4 tools)
+# ---------------------------------------------------------------------------
+
+
+def test_add_function_success() -> None:
+    response = b'{"ok":true,"command":"add_function","function_name":"DoThing","saved":true}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_function(blueprint="/Game/X", name="DoThing")
+    assert r["ok"] is True
+    assert r["function_name"] == "DoThing"
+
+
+def test_add_function_exists() -> None:
+    response = b'{"ok":false,"command":"add_function","error":"function_exists","detail":"DoThing"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_function(blueprint="/Game/X", name="DoThing")
+    assert r["ok"] is False
+    assert r["error"] == "function_exists"
+
+
+def test_call_blueprint_function_success() -> None:
+    response = (
+        b'{"ok":true,"command":"call_blueprint_function","anchor_name":"call_dothing",'
+        b'"node_guid":"G","target_class":"BP_Manager_C","function":"DoThing",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.call_blueprint_function(
+            blueprint="/Game/Blueprints/BP_B",
+            target_class="BP_Manager",
+            function_name="DoThing",
+            anchor_name="call_dothing",
+        )
+    assert r["ok"] is True
+    assert r["target_class"] == "BP_Manager_C"
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "call_blueprint_function"
+    assert sent_dict["function_name"] == "DoThing"
+
+
+def test_call_blueprint_function_handles_class_not_found() -> None:
+    response = b'{"ok":false,"command":"call_blueprint_function","error":"target_class_not_found","detail":"BP_DoesNotExist"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.call_blueprint_function(
+            blueprint="/Game/X", target_class="BP_DoesNotExist",
+            function_name="X", anchor_name="x",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "target_class_not_found"
+
+
+def test_create_input_action_success() -> None:
+    response = b'{"ok":true,"command":"create_input_action","action_path":"/Game/Input/Actions/IA_Jump","value_type":"Boolean","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_input_action(name="IA_Jump", value_type="Boolean")
+    assert r["ok"] is True
+    assert r["action_path"].endswith("IA_Jump")
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["name"] == "IA_Jump"
+    assert sent_dict["value_type"] == "Boolean"
+
+
+def test_create_input_action_handles_unknown_value_type() -> None:
+    response = b'{"ok":false,"command":"create_input_action","error":"unknown_value_type","detail":"WeirdType (use: ...)"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_input_action(name="x", value_type="WeirdType")
+    assert r["ok"] is False
+    assert r["error"] == "unknown_value_type"
+
+
+def test_create_input_mapping_context_success() -> None:
+    response = b'{"ok":true,"command":"create_input_mapping_context","imc_path":"/Game/Input/IMC_Default","saved":true}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_input_mapping_context(name="IMC_Default")
+    assert r["ok"] is True
+
+
+def test_add_mapping_to_imc_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_mapping_to_imc","imc_path":"/Game/Input/IMC_Default",'
+        b'"action_path":"/Game/Input/Actions/IA_Jump","key":"Space","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_mapping_to_imc(
+            imc_path="/Game/Input/IMC_Default",
+            action_path="/Game/Input/Actions/IA_Jump",
+            key="Space",
+        )
+    assert r["ok"] is True
+    assert r["key"] == "Space"
+
+
+def test_add_enhanced_input_node_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_enhanced_input_node","anchor_name":"on_jump","node_guid":"G",'
+        b'"action_path":"/Game/Input/Actions/IA_Jump",'
+        b'"pins":[{"name":"Triggered","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_enhanced_input_node(
+            blueprint="/Game/Blueprints/BP_Player",
+            action_path="/Game/Input/Actions/IA_Jump",
+            anchor_name="on_jump",
+        )
+    assert r["ok"] is True
+    assert any(p["name"] == "Triggered" for p in r["pins"])
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (require a real UE editor + plugin)
 # ---------------------------------------------------------------------------
 

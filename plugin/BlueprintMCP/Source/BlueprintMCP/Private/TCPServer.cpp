@@ -92,6 +92,13 @@
 #include "K2Node_InputKey.h"
 #include "InputCoreTypes.h"
 
+// v5 — Enhanced Input + user functions + BP-to-BP
+#include "InputAction.h"
+#include "InputMappingContext.h"
+#include "EnhancedInputComponent.h"
+#include "K2Node_EnhancedInputAction.h"
+#include "Kismet2/KismetEditorUtilities.h"  // already included earlier but harmless
+
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
 
 namespace
@@ -136,16 +143,60 @@ namespace
 
     // ----- Spike B2 helpers -----
 
-    /** Resolve a bare function short-name to (ClassName, FunctionName). v0+v1 whitelist. */
+    /** Resolve a bare function short-name to (ClassName, FunctionName). v0..v5 whitelist. */
     bool ResolveFunctionShortName(const FString& ShortName, FString& OutClassName, FString& OutFuncName)
     {
         // Whitelist — extend as we go. Add new entries to BOTH this map and the Python docstring.
         static const TMap<FString, TPair<FString, FString>> kMap = {
+            // --- v0+v1 ---
             { TEXT("PrintString"),                    { TEXT("KismetSystemLibrary"), TEXT("PrintString") } },
             { TEXT("Delay"),                          { TEXT("KismetSystemLibrary"), TEXT("Delay") } },
-            // v1 additions for collision-timer demo
             { TEXT("SetTimerByEvent"),                { TEXT("KismetSystemLibrary"), TEXT("K2_SetTimerDelegate") } },
             { TEXT("ClearAndInvalidateTimerByHandle"),{ TEXT("KismetSystemLibrary"), TEXT("K2_ClearAndInvalidateTimerHandle") } },
+            // --- v5 math (KismetMathLibrary) ---
+            { TEXT("MakeVector"),                     { TEXT("KismetMathLibrary"), TEXT("MakeVector") } },
+            { TEXT("BreakVector"),                    { TEXT("KismetMathLibrary"), TEXT("BreakVector") } },
+            { TEXT("MakeRotator"),                    { TEXT("KismetMathLibrary"), TEXT("MakeRotator") } },
+            { TEXT("BreakRotator"),                   { TEXT("KismetMathLibrary"), TEXT("BreakRotator") } },
+            { TEXT("VectorLength"),                   { TEXT("KismetMathLibrary"), TEXT("VSize") } },
+            { TEXT("VectorDistance"),                 { TEXT("KismetMathLibrary"), TEXT("Vector_Distance") } },
+            { TEXT("NormalizeVector"),                { TEXT("KismetMathLibrary"), TEXT("Normal") } },
+            { TEXT("GetForwardVector"),               { TEXT("KismetMathLibrary"), TEXT("GetForwardVector") } },
+            { TEXT("GetRightVector"),                 { TEXT("KismetMathLibrary"), TEXT("GetRightVector") } },
+            { TEXT("GetUpVector"),                    { TEXT("KismetMathLibrary"), TEXT("GetUpVector") } },
+            { TEXT("VectorLerp"),                     { TEXT("KismetMathLibrary"), TEXT("VLerp") } },
+            { TEXT("RotatorLerp"),                    { TEXT("KismetMathLibrary"), TEXT("RLerp") } },
+            { TEXT("FloatLerp"),                      { TEXT("KismetMathLibrary"), TEXT("Lerp") } },
+            { TEXT("VInterpTo"),                      { TEXT("KismetMathLibrary"), TEXT("VInterpTo") } },
+            { TEXT("RInterpTo"),                      { TEXT("KismetMathLibrary"), TEXT("RInterpTo") } },
+            { TEXT("FInterpTo"),                      { TEXT("KismetMathLibrary"), TEXT("FInterpTo") } },
+            { TEXT("RandomFloat"),                    { TEXT("KismetMathLibrary"), TEXT("RandomFloat") } },
+            { TEXT("RandomFloatInRange"),             { TEXT("KismetMathLibrary"), TEXT("RandomFloatInRange") } },
+            { TEXT("RandomInt"),                      { TEXT("KismetMathLibrary"), TEXT("RandomInteger") } },
+            { TEXT("Abs"),                            { TEXT("KismetMathLibrary"), TEXT("Abs") } },
+            { TEXT("Min"),                            { TEXT("KismetMathLibrary"), TEXT("FMin") } },
+            { TEXT("Max"),                            { TEXT("KismetMathLibrary"), TEXT("FMax") } },
+            // --- v5 system ---
+            { TEXT("IsValid"),                        { TEXT("KismetSystemLibrary"), TEXT("IsValid") } },
+            { TEXT("GetDisplayName"),                 { TEXT("KismetSystemLibrary"), TEXT("GetDisplayName") } },
+            { TEXT("PrintText"),                      { TEXT("KismetSystemLibrary"), TEXT("PrintText") } },
+            { TEXT("GetGameTimeInSeconds"),           { TEXT("KismetSystemLibrary"), TEXT("GetGameTimeInSeconds") } },
+            // --- v5 gameplay (GameplayStatics) ---
+            { TEXT("GetPlayerPawn"),                  { TEXT("GameplayStatics"),    TEXT("GetPlayerPawn") } },
+            { TEXT("GetPlayerController"),            { TEXT("GameplayStatics"),    TEXT("GetPlayerController") } },
+            { TEXT("GetPlayerCharacter"),             { TEXT("GameplayStatics"),    TEXT("GetPlayerCharacter") } },
+            { TEXT("GetGameMode"),                    { TEXT("GameplayStatics"),    TEXT("GetGameMode") } },
+            { TEXT("GetWorldDeltaSeconds"),           { TEXT("GameplayStatics"),    TEXT("GetWorldDeltaSeconds") } },
+            { TEXT("ApplyDamage"),                    { TEXT("GameplayStatics"),    TEXT("ApplyDamage") } },
+            { TEXT("OpenLevel"),                      { TEXT("GameplayStatics"),    TEXT("OpenLevel") } },
+            // --- v5 array (KismetArrayLibrary) ---
+            { TEXT("ArrayLength"),                    { TEXT("KismetArrayLibrary"), TEXT("Array_Length") } },
+            { TEXT("ArrayAdd"),                       { TEXT("KismetArrayLibrary"), TEXT("Array_Add") } },
+            { TEXT("ArrayGet"),                       { TEXT("KismetArrayLibrary"), TEXT("Array_Get") } },
+            { TEXT("ArraySet"),                       { TEXT("KismetArrayLibrary"), TEXT("Array_Set") } },
+            { TEXT("ArrayClear"),                     { TEXT("KismetArrayLibrary"), TEXT("Array_Clear") } },
+            { TEXT("ArrayContains"),                  { TEXT("KismetArrayLibrary"), TEXT("Array_Contains") } },
+            { TEXT("ArrayRemove"),                    { TEXT("KismetArrayLibrary"), TEXT("Array_RemoveItem") } },
         };
         if (const TPair<FString, FString>* Found = kMap.Find(ShortName))
         {
@@ -187,47 +238,85 @@ namespace
 
     // ----- Spike B9 helpers -----
 
-    /** Build an FEdGraphPinType for a user-friendly variable type key. v1 whitelist. */
+    /**
+     * Resolve a user-friendly key name to UE's FKey, applying common aliases.
+     * v5.0.1: LLMs / humans say "Space" but UE wants "SpaceBar". Same for Esc/Escape etc.
+     */
+    FKey ResolveFKeyWithAliases(const FString& Name)
+    {
+        // Lowercase alias map for common day-to-day key names → UE's canonical FName
+        static const TMap<FString, FString> kAliases = {
+            { TEXT("space"),      TEXT("SpaceBar") },
+            { TEXT("esc"),        TEXT("Escape") },
+            { TEXT("return"),     TEXT("Enter") },
+            { TEXT("ctrl"),       TEXT("LeftControl") },     // ambiguous; default to Left
+            { TEXT("control"),    TEXT("LeftControl") },
+            { TEXT("alt"),        TEXT("LeftAlt") },
+            { TEXT("shift"),      TEXT("LeftShift") },
+            { TEXT("cmd"),        TEXT("LeftCommand") },
+            { TEXT("command"),    TEXT("LeftCommand") },
+            { TEXT("win"),        TEXT("LeftCommand") },
+            { TEXT("delete"),     TEXT("Delete") },           // UE accepts this; no-op
+            { TEXT("backspace"),  TEXT("BackSpace") },
+        };
+
+        const FString Lower = Name.ToLower();
+        const FString* Mapped = kAliases.Find(Lower);
+        const FString& Resolved = Mapped ? *Mapped : Name;
+        return FKey(*Resolved);
+    }
+
+    /** Build an FEdGraphPinType for a user-friendly variable type key. v1+v5 whitelist. */
     bool ResolveVariablePinType(const FString& TypeKey, FEdGraphPinType& OutType)
     {
         OutType = FEdGraphPinType();
-        if (TypeKey.Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+
+        // v5: array types — "int[]" / "float[]" / "string[]" / "bool[]" / "name[]"
+        FString BaseType = TypeKey;
+        if (BaseType.EndsWith(TEXT("[]")))
+        {
+            BaseType = BaseType.LeftChop(2);  // strip "[]"
+            OutType.ContainerType = EPinContainerType::Array;
+        }
+
+        if (BaseType.Equals(TEXT("bool"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
             return true;
         }
-        if (TypeKey.Equals(TEXT("int"), ESearchCase::IgnoreCase) ||
-            TypeKey.Equals(TEXT("integer"), ESearchCase::IgnoreCase))
+        if (BaseType.Equals(TEXT("int"), ESearchCase::IgnoreCase) ||
+            BaseType.Equals(TEXT("integer"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_Int;
             return true;
         }
-        if (TypeKey.Equals(TEXT("float"), ESearchCase::IgnoreCase) ||
-            TypeKey.Equals(TEXT("double"), ESearchCase::IgnoreCase) ||
-            TypeKey.Equals(TEXT("real"), ESearchCase::IgnoreCase))
+        if (BaseType.Equals(TEXT("float"), ESearchCase::IgnoreCase) ||
+            BaseType.Equals(TEXT("double"), ESearchCase::IgnoreCase) ||
+            BaseType.Equals(TEXT("real"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_Real;
             OutType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
             return true;
         }
-        if (TypeKey.Equals(TEXT("string"), ESearchCase::IgnoreCase))
+        if (BaseType.Equals(TEXT("string"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_String;
             return true;
         }
-        if (TypeKey.Equals(TEXT("name"), ESearchCase::IgnoreCase))
+        if (BaseType.Equals(TEXT("name"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_Name;
             return true;
         }
-        if (TypeKey.Equals(TEXT("text"), ESearchCase::IgnoreCase))
+        if (BaseType.Equals(TEXT("text"), ESearchCase::IgnoreCase))
         {
             OutType.PinCategory = UEdGraphSchema_K2::PC_Text;
             return true;
         }
-        // ⭐ TimerHandle — for B9 v1 demo
-        if (TypeKey.Equals(TEXT("TimerHandle"), ESearchCase::IgnoreCase))
+        // ⭐ TimerHandle — for B9 v1 demo (no array form supported)
+        if (BaseType.Equals(TEXT("TimerHandle"), ESearchCase::IgnoreCase))
         {
+            if (OutType.ContainerType == EPinContainerType::Array) return false;  // no TimerHandle[]
             OutType.PinCategory = UEdGraphSchema_K2::PC_Struct;
             OutType.PinSubCategoryObject = TBaseStructure<FTimerHandle>::Get();
             return true;
@@ -1018,6 +1107,281 @@ namespace
         return nullptr;
     }
 
+    // ===== v5 — add_function (create user function graph) =====
+
+    FString AddFunctionOnGameThread(const FString& BlueprintPath, const FString& FunctionName)
+    {
+        check(IsInGameThread());
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint) return JsonError(TEXT("add_function"), TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName FuncFName(*FunctionName);
+        // Check for name collision with existing function graphs
+        for (const UEdGraph* G : Blueprint->FunctionGraphs)
+        {
+            if (G && G->GetFName() == FuncFName)
+            {
+                return JsonError(TEXT("add_function"), TEXT("function_exists"), FunctionName);
+            }
+        }
+
+        UEdGraph* NewFuncGraph = FBlueprintEditorUtils::CreateNewGraph(
+            Blueprint, FuncFName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+        if (!NewFuncGraph)
+        {
+            return JsonError(TEXT("add_function"), TEXT("graph_create_failed"), FunctionName);
+        }
+
+        FBlueprintEditorUtils::AddFunctionGraph<UClass>(
+            Blueprint, NewFuncGraph, /*bIsUserCreated*/ true, /*SignatureClass*/ nullptr);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_function\",\"function_name\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FunctionName), bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v5 — call_blueprint_function (cross-BP function call) =====
+
+    /** Resolve a target class for cross-BP calls. Tries native, then BP class paths. */
+    UClass* ResolveCallTargetClass(const FString& Name)
+    {
+        // Try as native class name first
+        if (UClass* Native = FindUClassByName(Name)) return Native;
+
+        // Try as BP path. Normalize:
+        //   "BP_X"                    → "/Game/Blueprints/BP_X.BP_X_C"
+        //   "/Game/X/BP_Y"            → "/Game/X/BP_Y.BP_Y_C"
+        //   "/Game/X/BP_Y.BP_Y_C"     → as-is
+        FString BPPath = Name;
+        if (!BPPath.StartsWith(TEXT("/Game/")))
+        {
+            BPPath = FString::Printf(TEXT("/Game/Blueprints/%s"), *Name);
+        }
+        // First try to load as Blueprint asset and get GeneratedClass
+        UBlueprint* TargetBP = LoadObject<UBlueprint>(nullptr, *BPPath);
+        if (TargetBP && TargetBP->GeneratedClass) return TargetBP->GeneratedClass;
+
+        // Last resort: try loading as a class directly (with _C suffix)
+        FString ClassPath = BPPath + TEXT(".") + FPaths::GetBaseFilename(BPPath) + TEXT("_C");
+        if (UClass* DirectClass = LoadObject<UClass>(nullptr, *ClassPath)) return DirectClass;
+
+        return nullptr;
+    }
+
+    FString CallBlueprintFunctionOnGameThread(
+        const FString& BlueprintPath,
+        const FString& TargetClassStr,
+        const FString& FunctionName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint) return JsonError(TEXT("call_blueprint_function"), TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(TEXT("call_blueprint_function"), TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName))
+            return JsonError(TEXT("call_blueprint_function"), TEXT("anchor_name_exists"), AnchorName);
+
+        UClass* TargetClass = ResolveCallTargetClass(TargetClassStr);
+        if (!TargetClass)
+            return JsonError(TEXT("call_blueprint_function"), TEXT("target_class_not_found"), TargetClassStr);
+
+        UFunction* TargetFunc = TargetClass->FindFunctionByName(FName(*FunctionName));
+        if (!TargetFunc)
+            return JsonError(TEXT("call_blueprint_function"), TEXT("function_not_found"),
+                FString::Printf(TEXT("%s on %s"), *FunctionName, *TargetClass->GetName()));
+
+        UK2Node_CallFunction* NewNode = NewObject<UK2Node_CallFunction>(EventGraph);
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->FunctionReference.SetExternalMember(TargetFunc->GetFName(), TargetClass);
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+
+        EventGraph->AddNode(NewNode, false, false);
+        NewNode->CreateNewGuid();
+        NewNode->PostPlacedNewNode();
+        NewNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"call_blueprint_function\",\"anchor_name\":%s,\"node_guid\":%s,\"target_class\":%s,\"function\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName), *EscapeJsonString(GuidStr),
+            *EscapeJsonString(TargetClass->GetName()), *EscapeJsonString(FunctionName),
+            *PinsJson, bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v5 — Enhanced Input =====
+
+    bool ResolveInputActionValueType(const FString& Key, EInputActionValueType& OutType)
+    {
+        if (Key.Equals(TEXT("Boolean"), ESearchCase::IgnoreCase) ||
+            Key.Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+        {
+            OutType = EInputActionValueType::Boolean; return true;
+        }
+        if (Key.Equals(TEXT("Axis1D"), ESearchCase::IgnoreCase) ||
+            Key.Equals(TEXT("float"), ESearchCase::IgnoreCase))
+        {
+            OutType = EInputActionValueType::Axis1D; return true;
+        }
+        if (Key.Equals(TEXT("Axis2D"), ESearchCase::IgnoreCase) ||
+            Key.Equals(TEXT("Vector2D"), ESearchCase::IgnoreCase))
+        {
+            OutType = EInputActionValueType::Axis2D; return true;
+        }
+        if (Key.Equals(TEXT("Axis3D"), ESearchCase::IgnoreCase) ||
+            Key.Equals(TEXT("Vector"), ESearchCase::IgnoreCase))
+        {
+            OutType = EInputActionValueType::Axis3D; return true;
+        }
+        return false;
+    }
+
+    FString CreateInputActionOnGameThread(const FString& Name, const FString& ValueTypeStr, const FString& Path)
+    {
+        check(IsInGameThread());
+
+        EInputActionValueType ValueType;
+        if (!ResolveInputActionValueType(ValueTypeStr, ValueType))
+        {
+            return JsonError(TEXT("create_input_action"), TEXT("unknown_value_type"),
+                FString::Printf(TEXT("%s (use: Boolean, Axis1D, Axis2D, Axis3D)"), *ValueTypeStr));
+        }
+
+        const FString FullPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullPath))
+        {
+            return JsonError(TEXT("create_input_action"), TEXT("asset_exists"), FullPath);
+        }
+
+        FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(Name, Path, UInputAction::StaticClass(), nullptr);
+        if (!NewAsset)
+        {
+            return JsonError(TEXT("create_input_action"), TEXT("creation_failed"), FullPath);
+        }
+        UInputAction* IA = Cast<UInputAction>(NewAsset);
+        if (!IA)
+        {
+            return JsonError(TEXT("create_input_action"), TEXT("not_input_action"), FullPath);
+        }
+        IA->ValueType = ValueType;
+        IA->MarkPackageDirty();
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullPath, false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_input_action\",\"action_path\":%s,\"value_type\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FullPath), *EscapeJsonString(ValueTypeStr),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString CreateInputMappingContextOnGameThread(const FString& Name, const FString& Path)
+    {
+        check(IsInGameThread());
+
+        const FString FullPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullPath))
+        {
+            return JsonError(TEXT("create_input_mapping_context"), TEXT("asset_exists"), FullPath);
+        }
+
+        FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(Name, Path, UInputMappingContext::StaticClass(), nullptr);
+        if (!NewAsset)
+        {
+            return JsonError(TEXT("create_input_mapping_context"), TEXT("creation_failed"), FullPath);
+        }
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullPath, false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_input_mapping_context\",\"imc_path\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FullPath), bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddMappingToImcOnGameThread(const FString& IMCPath, const FString& ActionPath, const FString& KeyName)
+    {
+        check(IsInGameThread());
+
+        UInputMappingContext* IMC = LoadObject<UInputMappingContext>(nullptr, *IMCPath);
+        if (!IMC) return JsonError(TEXT("add_mapping_to_imc"), TEXT("imc_not_found"), IMCPath);
+
+        UInputAction* IA = LoadObject<UInputAction>(nullptr, *ActionPath);
+        if (!IA) return JsonError(TEXT("add_mapping_to_imc"), TEXT("action_not_found"), ActionPath);
+
+        const FKey Key = ResolveFKeyWithAliases(KeyName);
+        if (!Key.IsValid())
+            return JsonError(TEXT("add_mapping_to_imc"), TEXT("invalid_key"),
+                FString::Printf(TEXT("%s (try: P, SpaceBar/Space, LeftMouseButton, F1, etc.)"), *KeyName));
+
+        IMC->MapKey(IA, Key);
+        IMC->MarkPackageDirty();
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(IMCPath, false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_mapping_to_imc\",\"imc_path\":%s,\"action_path\":%s,\"key\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(IMCPath), *EscapeJsonString(ActionPath),
+            *EscapeJsonString(Key.ToString()), bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddEnhancedInputNodeOnGameThread(
+        const FString& BlueprintPath,
+        const FString& ActionPath,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+
+        UInputAction* IA = LoadObject<UInputAction>(nullptr, *ActionPath);
+        if (!IA) return JsonError(TEXT("add_enhanced_input_node"), TEXT("action_not_found"), ActionPath);
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (!Blueprint) return JsonError(TEXT("add_enhanced_input_node"), TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName))
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_EnhancedInputAction* NewNode = NewObject<UK2Node_EnhancedInputAction>(EventGraph);
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->InputAction = IA;
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+
+        EventGraph->AddNode(NewNode, false, false);
+        NewNode->CreateNewGuid();
+        NewNode->PostPlacedNewNode();
+        NewNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_enhanced_input_node\",\"anchor_name\":%s,\"node_guid\":%s,\"action_path\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName), *EscapeJsonString(GuidStr),
+            *EscapeJsonString(ActionPath), *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     // ===== v4 — add_macro (K2Node_MacroInstance) =====
 
     FString AddMacroOnGameThread(
@@ -1123,11 +1487,11 @@ namespace
     {
         check(IsInGameThread());
 
-        const FKey Key(*KeyName);
+        const FKey Key = ResolveFKeyWithAliases(KeyName);
         if (!Key.IsValid())
         {
             return JsonError(TEXT("add_input_key"), TEXT("invalid_key"),
-                FString::Printf(TEXT("%s (try: P, Space, LeftMouseButton, F1, etc.)"), *KeyName));
+                FString::Printf(TEXT("%s (try: P, SpaceBar/Space, LeftMouseButton, F1, etc.)"), *KeyName));
         }
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
@@ -2108,6 +2472,130 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_function (v5) ---
+    if (Command.Equals(TEXT("add_function"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, FunctionName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_function"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("name"), FunctionName) || FunctionName.IsEmpty())
+            return JsonError(TEXT("add_function"), TEXT("missing_field"), TEXT("name"));
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, FunctionName]() mutable
+            { Promise.SetValue(AddFunctionOnGameThread(Blueprint, FunctionName)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_function"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- call_blueprint_function (v5) ---
+    if (Command.Equals(TEXT("call_blueprint_function"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, TargetClass, FunctionName, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("target_class"), TargetClass) || TargetClass.IsEmpty())
+            return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("target_class"));
+        if (!JsonObject->TryGetStringField(TEXT("function_name"), FunctionName) || FunctionName.IsEmpty())
+            return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("function_name"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("call_blueprint_function"), TEXT("missing_field"), TEXT("anchor_name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY]() mutable
+            { Promise.SetValue(CallBlueprintFunctionOnGameThread(Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("call_blueprint_function"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- create_input_action (v5) ---
+    if (Command.Equals(TEXT("create_input_action"), ESearchCase::IgnoreCase))
+    {
+        FString Name, ValueType, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_input_action"), TEXT("missing_field"), TEXT("name"));
+        if (!JsonObject->TryGetStringField(TEXT("value_type"), ValueType) || ValueType.IsEmpty())
+            ValueType = TEXT("Boolean");
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/Input/Actions");
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, ValueType, Path]() mutable
+            { Promise.SetValue(CreateInputActionOnGameThread(Name, ValueType, Path)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_input_action"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- create_input_mapping_context (v5) ---
+    if (Command.Equals(TEXT("create_input_mapping_context"), ESearchCase::IgnoreCase))
+    {
+        FString Name, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_input_mapping_context"), TEXT("missing_field"), TEXT("name"));
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/Input");
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, Path]() mutable
+            { Promise.SetValue(CreateInputMappingContextOnGameThread(Name, Path)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_input_mapping_context"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_mapping_to_imc (v5) ---
+    if (Command.Equals(TEXT("add_mapping_to_imc"), ESearchCase::IgnoreCase))
+    {
+        FString IMCPath, ActionPath, KeyName;
+        if (!JsonObject->TryGetStringField(TEXT("imc_path"), IMCPath) || IMCPath.IsEmpty())
+            return JsonError(TEXT("add_mapping_to_imc"), TEXT("missing_field"), TEXT("imc_path"));
+        if (!JsonObject->TryGetStringField(TEXT("action_path"), ActionPath) || ActionPath.IsEmpty())
+            return JsonError(TEXT("add_mapping_to_imc"), TEXT("missing_field"), TEXT("action_path"));
+        if (!JsonObject->TryGetStringField(TEXT("key"), KeyName) || KeyName.IsEmpty())
+            return JsonError(TEXT("add_mapping_to_imc"), TEXT("missing_field"), TEXT("key"));
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), IMCPath, ActionPath, KeyName]() mutable
+            { Promise.SetValue(AddMappingToImcOnGameThread(IMCPath, ActionPath, KeyName)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_mapping_to_imc"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_enhanced_input_node (v5) ---
+    if (Command.Equals(TEXT("add_enhanced_input_node"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, ActionPath, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("action_path"), ActionPath) || ActionPath.IsEmpty())
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("missing_field"), TEXT("action_path"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("missing_field"), TEXT("anchor_name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+        TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, ActionPath, AnchorName, PosX, PosY]() mutable
+            { Promise.SetValue(AddEnhancedInputNodeOnGameThread(Blueprint, ActionPath, AnchorName, PosX, PosY)); });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_enhanced_input_node"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

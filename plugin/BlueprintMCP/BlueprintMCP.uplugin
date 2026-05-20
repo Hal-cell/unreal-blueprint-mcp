@@ -25,6 +25,10 @@
         {
             "Name": "EditorScriptingUtilities",
             "Enabled": true
+        },
+        {
+            "Name": "EnhancedInput",
+            "Enabled": true
         }
     ]
 }
