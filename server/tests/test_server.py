@@ -741,6 +741,78 @@ def test_add_variable_get_handles_var_not_found() -> None:
 
 
 # ---------------------------------------------------------------------------
+# get_blueprint (v2)
+# ---------------------------------------------------------------------------
+
+
+def test_get_blueprint_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"get_blueprint","path":"/Game/Blueprints/BP_X",'
+        b'"parent_class":"Actor","compiled":true,"status":"up_to_date",'
+        b'"anchors":{"begin_play":{"k2_node_class":"K2Node_Event","position":[-300,0],'
+        b'"event_name":"ReceiveBeginPlay","pins":[{"name":"then","direction":"output","type":"exec","linked":true}]},'
+        b'"print_hello":{"k2_node_class":"K2Node_CallFunction","position":[200,100],'
+        b'"function":"PrintString","owning_class":"KismetSystemLibrary",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec","linked":true},'
+        b'{"name":"InString","direction":"input","type":"string","default":"hello world"}]}},'
+        b'"connections":[{"from":"begin_play.then","to":"print_hello.execute"}],'
+        b'"variables":[{"name":"MyTimer","type":"struct","subcategory":"TimerHandle"}],'
+        b'"components":[{"name":"TriggerBox","class":"BoxComponent"}]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(fake_response, sent)):
+        r = server.get_blueprint(name="/Game/Blueprints/BP_X")
+
+    assert r["ok"] is True
+    assert r["path"] == "/Game/Blueprints/BP_X"
+    assert r["parent_class"] == "Actor"
+    assert r["compiled"] is True
+
+    # Anchors structure
+    assert "begin_play" in r["anchors"]
+    assert r["anchors"]["begin_play"]["k2_node_class"] == "K2Node_Event"
+    assert "print_hello" in r["anchors"]
+    assert r["anchors"]["print_hello"]["function"] == "PrintString"
+
+    # Pin with default surfaced
+    print_pins = r["anchors"]["print_hello"]["pins"]
+    in_string_pin = next(p for p in print_pins if p["name"] == "InString")
+    assert in_string_pin["default"] == "hello world"
+
+    # Connections + variables + components
+    assert {"from": "begin_play.then", "to": "print_hello.execute"} in r["connections"]
+    assert any(v["name"] == "MyTimer" and v["subcategory"] == "TimerHandle" for v in r["variables"])
+    assert any(c["name"] == "TriggerBox" and c["class"] == "BoxComponent" for c in r["components"])
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "get_blueprint", "name": "/Game/Blueprints/BP_X"}
+
+
+def test_get_blueprint_handles_not_found() -> None:
+    fake_response = b'{"ok":false,"command":"get_blueprint","error":"blueprint_not_found","detail":"/Game/X"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(fake_response)):
+        r = server.get_blueprint(name="/Game/X")
+    assert r["ok"] is False
+    assert r["error"] == "blueprint_not_found"
+
+
+def test_get_blueprint_handles_empty_bp() -> None:
+    """A fresh BP with no nodes, vars, or components — still valid response with empty arrays/dicts."""
+    fake_response = (
+        b'{"ok":true,"command":"get_blueprint","path":"/Game/X","parent_class":"Actor",'
+        b'"compiled":true,"status":"up_to_date","anchors":{},"connections":[],"variables":[],"components":[]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(fake_response)):
+        r = server.get_blueprint(name="/Game/X")
+    assert r["ok"] is True
+    assert r["anchors"] == {}
+    assert r["connections"] == []
+    assert r["variables"] == []
+    assert r["components"] == []
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (require a real UE editor + plugin)
 # ---------------------------------------------------------------------------
 

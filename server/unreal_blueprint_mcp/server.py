@@ -128,6 +128,67 @@ def ping_ue() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_blueprint(name: str) -> dict[str, Any]:
+    """Get a snapshot of a Blueprint's current state. **Call this BEFORE writing.**
+
+    This is the "look before you leap" tool. Use it to:
+        - Avoid anchor-name collisions (you can see what anchors already exist)
+        - Use the EXACT pin name UE has (not your guess, e.g. "InString" not "in_string")
+        - Avoid recreating existing variables / components
+        - See current connections so you don't double-wire
+        - Check if compiled status before spawn_actor
+
+    Args:
+        name: Full Blueprint asset path (e.g., "/Game/Blueprints/BP_X").
+
+    Returns:
+        On success: snapshot dict with this shape:
+        ```
+        {
+          "ok": true,
+          "path": "/Game/Blueprints/BP_X",
+          "parent_class": "Actor",
+          "compiled": true,
+          "status": "up_to_date" | "warnings" | "error" | "dirty" | ...,
+          "anchors": {
+            "<anchor_name>": {
+              "k2_node_class": "K2Node_Event" | "K2Node_CallFunction" | "K2Node_CustomEvent" |
+                                "K2Node_VariableGet" | "K2Node_VariableSet" | ...,
+              "position": [x, y],
+              "pins": [
+                {"name": "...", "direction": "input" | "output", "type": "exec" | "string" | ...,
+                 "default": "...",          # only if input pin has a default
+                 "linked": true}            # only if pin has links
+              ],
+              # node-type-specific extra fields:
+              "event_name": "..." (events / custom events),
+              "function": "...", "owning_class": "..." (K2Node_CallFunction),
+              "variable_name": "..." (K2Node_VariableGet / VariableSet)
+            },
+            ...
+          },
+          "connections": [{"from": "anchor.pin", "to": "anchor.pin"}, ...],
+          "variables": [{"name": "...", "type": "...", "subcategory": "..."}],
+          "components": [{"name": "TriggerBox", "class": "BoxComponent"}, ...]
+        }
+        ```
+
+    Anchor derivation rules (so you can predict what anchors look like):
+        1. NodeComment if set (i.e., the anchor_name you gave to add_node / add_*)
+        2. K2Node_Event: well-known short name (begin_play / tick / actor_end_overlap / ...)
+        3. Fallback: "node_<8-char-guid>" — stable across sessions
+
+    Common errors:
+        blueprint_not_found  - path doesn't exist
+        game_thread_timeout  - 10s deadline exceeded (rare; large BPs)
+    """
+    return _send_command({
+        "command": "get_blueprint",
+        "name": name,
+    })
+
+
+@mcp.tool()
 def add_node(
     blueprint: str,
     node_type: str,

@@ -74,6 +74,9 @@
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 
+// v2 get_blueprint: snapshot serialization
+#include "Policies/CondensedJsonPrintPolicy.h"
+
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
 
 namespace
@@ -874,6 +877,269 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v2 — get_blueprint =====
+
+    /**
+     * Derive a stable, human-readable anchor for a node when describing it
+     * back to the LLM.
+     *
+     * Priority (revised after v2.0.1 bugs):
+     *   - K2Node_CustomEvent (checked FIRST since CustomEvent IS-A Event):
+     *       NodeComment (anchor_name from add_custom_event) → CustomFunctionName → guid
+     *   - K2Node_Event (non-custom):
+     *       reverse-map well-known events FIRST (avoids picking up UE's
+     *       garbage instructional NodeComment on disabled Tick placeholders)
+     *       → fallback: stripped-receive lowercase
+     *   - All other nodes:
+     *       NodeComment (the anchor_name from add_node / add_variable_*) → guid
+     */
+    FString DeriveAnchorForNode(const UEdGraphNode* Node)
+    {
+        // Custom event: NodeComment (anchor_name) > CustomFunctionName > guid
+        if (const UK2Node_CustomEvent* CE = Cast<UK2Node_CustomEvent>(Node))
+        {
+            if (!Node->NodeComment.IsEmpty())
+            {
+                return Node->NodeComment;
+            }
+            if (CE->CustomFunctionName != NAME_None)
+            {
+                return CE->CustomFunctionName.ToString();
+            }
+            // fall through to guid
+        }
+        // Regular Event: reverse-map FIRST (skip possibly-garbage NodeComment)
+        else if (const UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+        {
+            const FName Fn = EventNode->EventReference.GetMemberName();
+            // Reverse map well-known events
+            if (Fn == TEXT("ReceiveBeginPlay"))         return TEXT("begin_play");
+            if (Fn == TEXT("ReceiveTick"))              return TEXT("tick");
+            if (Fn == TEXT("ReceiveEndPlay"))           return TEXT("end_play");
+            if (Fn == TEXT("ReceiveActorBeginOverlap")) return TEXT("actor_begin_overlap");
+            if (Fn == TEXT("ReceiveActorEndOverlap"))   return TEXT("actor_end_overlap");
+            if (Fn == TEXT("ReceiveHit"))               return TEXT("hit");
+            if (Fn == TEXT("ReceiveDestroyed"))         return TEXT("destroyed");
+            // Generic event: strip "Receive" prefix, lowercase
+            if (Fn != NAME_None)
+            {
+                FString FnStr = Fn.ToString();
+                if (FnStr.StartsWith(TEXT("Receive")))
+                {
+                    FnStr = FnStr.RightChop(7);
+                }
+                return FnStr.ToLower();
+            }
+            // fall through (no event ref — unusual)
+        }
+
+        // Non-event nodes (add_node / add_variable_* / etc.) or events without identifying info
+        if (!Node->NodeComment.IsEmpty())
+        {
+            return Node->NodeComment;
+        }
+
+        // Fallback: short guid label, stable across sessions
+        const FString GuidStr = Node->NodeGuid.ToString(EGuidFormats::DigitsLower);
+        return FString::Printf(TEXT("node_%s"), *GuidStr.Left(8));
+    }
+
+    /** Write a single node's anchor entry into the JSON writer (caller has set the object key). */
+    template <typename WriterRef>
+    void WriteNodeAnchor(WriterRef Writer, const UEdGraphNode* Node)
+    {
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("k2_node_class"), Node->GetClass()->GetName());
+        Writer->WriteArrayStart(TEXT("position"));
+        Writer->WriteValue(static_cast<double>(Node->NodePosX));
+        Writer->WriteValue(static_cast<double>(Node->NodePosY));
+        Writer->WriteArrayEnd();
+
+        // Node-type-specific fields — IMPORTANT: cast CustomEvent FIRST because
+        // UK2Node_CustomEvent IS-A UK2Node_Event. v2.0.1 bug fix.
+        if (const UK2Node_CustomEvent* CE = Cast<UK2Node_CustomEvent>(Node))
+        {
+            Writer->WriteValue(TEXT("event_name"), CE->CustomFunctionName.ToString());
+        }
+        else if (const UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+        {
+            Writer->WriteValue(TEXT("event_name"), EventNode->EventReference.GetMemberName().ToString());
+        }
+        else if (const UK2Node_CallFunction* CallFn = Cast<UK2Node_CallFunction>(Node))
+        {
+            Writer->WriteValue(TEXT("function"), CallFn->FunctionReference.GetMemberName().ToString());
+            const UClass* OwningClass = CallFn->FunctionReference.GetMemberParentClass();
+            Writer->WriteValue(TEXT("owning_class"), OwningClass ? OwningClass->GetName() : TEXT(""));
+        }
+        else if (const UK2Node_VariableGet* VarGet = Cast<UK2Node_VariableGet>(Node))
+        {
+            Writer->WriteValue(TEXT("variable_name"), VarGet->VariableReference.GetMemberName().ToString());
+        }
+        else if (const UK2Node_VariableSet* VarSet = Cast<UK2Node_VariableSet>(Node))
+        {
+            Writer->WriteValue(TEXT("variable_name"), VarSet->VariableReference.GetMemberName().ToString());
+        }
+
+        // Pins
+        Writer->WriteArrayStart(TEXT("pins"));
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), Pin->PinName.ToString());
+            Writer->WriteValue(TEXT("direction"),
+                Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+            Writer->WriteValue(TEXT("type"), Pin->PinType.PinCategory.ToString());
+            // Default value for primitive input pins
+            if (Pin->Direction == EGPD_Input
+                && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
+                && !Pin->DefaultValue.IsEmpty())
+            {
+                Writer->WriteValue(TEXT("default"), Pin->DefaultValue);
+            }
+            // Linked flag — useful for LLM to know what's already wired
+            if (Pin->LinkedTo.Num() > 0)
+            {
+                Writer->WriteValue(TEXT("linked"), true);
+            }
+            Writer->WriteObjectEnd();
+        }
+        Writer->WriteArrayEnd();
+
+        Writer->WriteObjectEnd();
+    }
+
+    /**
+     * Snapshot a Blueprint. MUST run on the game thread.
+     * Returns a complete JSON response line (with trailing \n).
+     */
+    FString GetBlueprintOnGameThread(const FString& BlueprintPath)
+    {
+        check(IsInGameThread());
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+        {
+            return JsonError(TEXT("get_blueprint"), TEXT("blueprint_not_found"), BlueprintPath);
+        }
+
+        // Build per-node anchor lookup first (so connections can reference by anchor)
+        TMap<const UEdGraphNode*, FString> NodeToAnchor;
+        UEdGraph* EventGraph = (Blueprint->UbergraphPages.Num() > 0) ? Blueprint->UbergraphPages[0] : nullptr;
+        if (EventGraph != nullptr)
+        {
+            for (UEdGraphNode* Node : EventGraph->Nodes)
+            {
+                if (Node != nullptr)
+                {
+                    NodeToAnchor.Add(Node, DeriveAnchorForNode(Node));
+                }
+            }
+        }
+
+        // Determine BP status string
+        FString StatusStr;
+        switch (Blueprint->Status)
+        {
+            case BS_UpToDate:             StatusStr = TEXT("up_to_date"); break;
+            case BS_UpToDateWithWarnings: StatusStr = TEXT("warnings");   break;
+            case BS_Error:                StatusStr = TEXT("error");     break;
+            case BS_Dirty:                StatusStr = TEXT("dirty");     break;
+            case BS_Unknown:              StatusStr = TEXT("unknown");   break;
+            case BS_BeingCreated:         StatusStr = TEXT("being_created"); break;
+            default:                      StatusStr = TEXT("unknown");   break;
+        }
+
+        // Write JSON with TJsonWriter (auto-escapes; no double-quote bug)
+        FString OutputJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutputJson);
+
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), TEXT("get_blueprint"));
+        Writer->WriteValue(TEXT("path"), BlueprintPath);
+        Writer->WriteValue(TEXT("parent_class"),
+            Blueprint->ParentClass ? Blueprint->ParentClass->GetName() : TEXT(""));
+        Writer->WriteValue(TEXT("compiled"),
+            Blueprint->Status == BS_UpToDate || Blueprint->Status == BS_UpToDateWithWarnings);
+        Writer->WriteValue(TEXT("status"), StatusStr);
+
+        // anchors {anchor_name: {...}}
+        Writer->WriteObjectStart(TEXT("anchors"));
+        if (EventGraph != nullptr)
+        {
+            for (const TPair<const UEdGraphNode*, FString>& Kvp : NodeToAnchor)
+            {
+                Writer->WriteIdentifierPrefix(*Kvp.Value);
+                WriteNodeAnchor(Writer, Kvp.Key);
+            }
+        }
+        Writer->WriteObjectEnd();
+
+        // connections [{from, to}]
+        Writer->WriteArrayStart(TEXT("connections"));
+        if (EventGraph != nullptr)
+        {
+            for (const UEdGraphNode* Node : EventGraph->Nodes)
+            {
+                if (Node == nullptr) continue;
+                const FString FromAnchor = NodeToAnchor.FindRef(Node);
+                for (const UEdGraphPin* Pin : Node->Pins)
+                {
+                    if (Pin->Direction != EGPD_Output) continue;  // emit from output side only
+                    for (const UEdGraphPin* Linked : Pin->LinkedTo)
+                    {
+                        if (Linked == nullptr || Linked->GetOwningNode() == nullptr) continue;
+                        const FString ToAnchor = NodeToAnchor.FindRef(Linked->GetOwningNode());
+                        if (ToAnchor.IsEmpty()) continue;
+                        Writer->WriteObjectStart();
+                        Writer->WriteValue(TEXT("from"),
+                            FString::Printf(TEXT("%s.%s"), *FromAnchor, *Pin->PinName.ToString()));
+                        Writer->WriteValue(TEXT("to"),
+                            FString::Printf(TEXT("%s.%s"), *ToAnchor, *Linked->PinName.ToString()));
+                        Writer->WriteObjectEnd();
+                    }
+                }
+            }
+        }
+        Writer->WriteArrayEnd();
+
+        // variables [{name, type, subcategory}]
+        Writer->WriteArrayStart(TEXT("variables"));
+        for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), Var.VarName.ToString());
+            Writer->WriteValue(TEXT("type"), Var.VarType.PinCategory.ToString());
+            if (Var.VarType.PinSubCategoryObject.IsValid())
+            {
+                Writer->WriteValue(TEXT("subcategory"), Var.VarType.PinSubCategoryObject->GetName());
+            }
+            Writer->WriteObjectEnd();
+        }
+        Writer->WriteArrayEnd();
+
+        // components [{name, class}]
+        Writer->WriteArrayStart(TEXT("components"));
+        if (Blueprint->SimpleConstructionScript != nullptr)
+        {
+            for (const USCS_Node* SCSNode : Blueprint->SimpleConstructionScript->GetAllNodes())
+            {
+                if (SCSNode == nullptr || SCSNode->ComponentClass == nullptr) continue;
+                Writer->WriteObjectStart();
+                Writer->WriteValue(TEXT("name"), SCSNode->GetVariableName().ToString());
+                Writer->WriteValue(TEXT("class"), SCSNode->ComponentClass->GetName());
+                Writer->WriteObjectEnd();
+            }
+        }
+        Writer->WriteArrayEnd();
+
+        Writer->WriteObjectEnd();
+        Writer->Close();
+
+        return OutputJson + TEXT("\n");
+    }
+
     /**
      * Spawn a Blueprint instance into the current level. MUST run on the game thread.
      * Returns a complete JSON response line (with trailing \n).
@@ -1375,6 +1641,26 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- get_blueprint (v2) ---
+    if (Command.Equals(TEXT("get_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Name;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+        {
+            return JsonError(TEXT("get_blueprint"), TEXT("missing_field"), TEXT("name"));
+        }
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name]() mutable
+            {
+                Promise.SetValue(GetBlueprintOnGameThread(Name));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_blueprint"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
