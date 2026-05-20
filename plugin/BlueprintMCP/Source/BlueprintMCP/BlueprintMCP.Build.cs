@@ -30,6 +30,8 @@ public class BlueprintMCP : ModuleRules
             "AssetTools",
             // Spike B1+: editor-scripting helpers (UEditorAssetLibrary, etc.)
             "EditorScriptingUtilities",
+            // v4: FKey for K2Node_InputKey
+            "InputCore",
         });
     }
 }

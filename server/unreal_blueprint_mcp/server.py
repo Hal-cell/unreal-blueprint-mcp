@@ -398,6 +398,9 @@ def set_pin_default(
             - int / int64 / byte: parsed as integer
             - real (float / double): parsed as float
             - bool: "true" / "false" (case-insensitive)
+            - **Vector** (v4): "1.0,2.0,3.0" or "(X=1,Y=2,Z=3)"
+            - **Rotator** (v4): "P,Y,R" e.g. "0,90,0" or "(P=0,Y=90,R=0)"
+            - **Color / LinearColor** (v4): "R,G,B" (A=1) or "R,G,B,A" or "(R=...,G=...,B=...,A=...)"
 
     Returns:
         On success: {"ok": True, "anchor_name": ..., "pin_name": ...,
@@ -421,6 +424,187 @@ def set_pin_default(
         "blueprint": blueprint,
         "pin_ref": pin_ref,
         "value": value,
+    })
+
+
+@mcp.tool()
+def add_macro(
+    blueprint: str,
+    macro_type: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a macro node from UE's StandardMacros library (loops, gates, etc.).
+
+    Use for iteration (ForEachLoop / ForLoop / WhileLoop) and flow control
+    (FlipFlop / DoOnce / Gate / IsValid).
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        macro_type: One of (case-insensitive):
+            - "ForEachLoop"  — iterate array; pins: execute / Array / LoopBody / Array Element / Array Index / Completed
+            - "ForLoop"      — N times; pins: execute / FirstIndex / LastIndex / LoopBody / Index / Completed
+            - "WhileLoop"    — while bool; pins: execute / Condition / LoopBody / Completed
+            - "FlipFlop"     — alternates between A and B exec outs each call
+            - "DoOnce"       — fires once then blocks until Reset
+            - "Gate"         — Open / Close / Toggle / Enter inputs; gated exec output
+            - "IsValid"      — bool branch on input ref (IsValid / IsNotValid)
+        anchor_name: User-given label (unique within EventGraph).
+        position_x, position_y: Graph position.
+
+    Returns:
+        On success: {"ok": True, "anchor_name", "node_guid", "macro_type", "pins": [...], "saved": True}
+
+    Common errors:
+        unknown_macro_type     - not in v4 whitelist
+        macro_graph_not_found  - StandardMacros library missing (engine install issue?)
+        anchor_name_exists     - anchor already used
+    """
+    return _send_command({
+        "command": "add_macro",
+        "blueprint": blueprint,
+        "macro_type": macro_type,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_self_reference(
+    blueprint: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a `K2Node_Self` node — outputs a "self" reference to the owning Blueprint.
+
+    Use when the user needs to pass `this` to a function (e.g., "OnHit, register
+    self with a manager"). It's a single-output node, no inputs.
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        anchor_name: User-given label.
+        position_x, position_y: Graph position.
+
+    Returns:
+        On success: {"ok": True, "anchor_name", "node_guid", "pins": [{"name": "self", "direction": "output", ...}], "saved": True}
+    """
+    return _send_command({
+        "command": "add_self_reference",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_input_key(
+    blueprint: str,
+    key: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a `K2Node_InputKey` node — fires when a specific keyboard / mouse / gamepad key is pressed.
+
+    This is the **legacy** input system (works in any BP that captures input).
+    For modern UE projects, EnhancedInput is preferred but requires more setup
+    (UInputAction assets + IMC) — not covered here in v4.
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        key: UE FKey name. Examples:
+            - Letter keys: "P", "Q", "A", ...
+            - "Space", "Enter", "Escape", "Tab", "BackSpace"
+            - "LeftMouseButton", "RightMouseButton", "MiddleMouseButton"
+            - "Up", "Down", "Left", "Right" (arrow keys)
+            - "F1" through "F12"
+            - Gamepad: "Gamepad_FaceButton_Bottom", "Gamepad_LeftThumbstick_X", ...
+        anchor_name: User-given label.
+        position_x, position_y: Graph position.
+
+    Returns:
+        On success: {"ok": True, "anchor_name", "node_guid", "key": "...",
+                     "pins": [
+                       {"name": "Pressed", "direction": "output", "type": "exec"},
+                       {"name": "Released", "direction": "output", "type": "exec"},
+                       {"name": "Key", "direction": "output", "type": "struct"}
+                     ], "saved": True}
+
+    Common errors:
+        invalid_key  - FKey constructor rejected the name; check spelling
+    """
+    return _send_command({
+        "command": "add_input_key",
+        "blueprint": blueprint,
+        "key": key,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def delete_node(
+    blueprint: str,
+    anchor_name: str,
+) -> dict[str, Any]:
+    """Delete a node from a Blueprint's EventGraph (breaks all its pin links).
+
+    Use for refactoring: "remove the print node", "delete the timer call".
+    Auto-spawned well-known events (begin_play / tick / ...) can be re-summoned
+    later by `connect_pins` or `set_pin_default` referencing the same short
+    name (auto-spawn-on-demand re-creates them).
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        anchor_name: The anchor of the node to delete.
+
+    Returns:
+        On success: {"ok": True, "anchor_name": "...", "node_type": "K2Node_...", "saved": True}
+
+    Common errors:
+        anchor_not_found  - the anchor doesn't match any existing node (strict lookup; no auto-spawn here)
+    """
+    return _send_command({
+        "command": "delete_node",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+    })
+
+
+@mcp.tool()
+def disconnect_pins(
+    blueprint: str,
+    from_pin: str,
+    to_pin: str,
+) -> dict[str, Any]:
+    """Break the connection between two pins. Inverse of `connect_pins`.
+
+    Use when refactoring graph topology: "disconnect that wire" / "unwire
+    BeginPlay from Print" / "remove this connection".
+
+    Args:
+        blueprint: Full Blueprint asset path.
+        from_pin: Source pin "<anchor>.<pin>". Same syntax as connect_pins.
+        to_pin: Target pin "<anchor>.<pin>".
+
+    Returns:
+        On success: {"ok": True, "from": "...", "to": "...", "saved": True}
+
+    Common errors:
+        anchor_not_found  - either anchor doesn't exist
+        pin_not_found     - pin name typo on one side
+        not_connected     - the pins were never connected to begin with
+    """
+    return _send_command({
+        "command": "disconnect_pins",
+        "blueprint": blueprint,
+        "from_pin": from_pin,
+        "to_pin": to_pin,
     })
 
 

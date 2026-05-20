@@ -887,6 +887,120 @@ def test_add_cast_handles_unknown_class() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v4 — add_macro / add_self_reference / add_input_key / delete_node /
+#      disconnect_pins / set_pin_default for struct types
+# ---------------------------------------------------------------------------
+
+
+def test_add_macro_for_each_loop_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_macro","anchor_name":"iter","node_guid":"G",'
+        b'"macro_type":"ForEachLoop",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"},'
+        b'{"name":"Array","direction":"input","type":"wildcard"},'
+        b'{"name":"LoopBody","direction":"output","type":"exec"},'
+        b'{"name":"Array Element","direction":"output","type":"wildcard"},'
+        b'{"name":"Array Index","direction":"output","type":"int"},'
+        b'{"name":"Completed","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_macro(blueprint="/Game/X", macro_type="ForEachLoop", anchor_name="iter")
+    assert r["ok"] is True
+    assert r["macro_type"] == "ForEachLoop"
+    pin_names = {p["name"] for p in r["pins"]}
+    assert "LoopBody" in pin_names
+    assert "Array Element" in pin_names
+
+
+def test_add_macro_handles_unknown_type() -> None:
+    response = b'{"ok":false,"command":"add_macro","error":"unknown_macro_type","detail":"FooBar (known: ...)"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_macro(blueprint="/Game/X", macro_type="FooBar", anchor_name="x")
+    assert r["ok"] is False
+    assert r["error"] == "unknown_macro_type"
+
+
+def test_add_self_reference_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_self_reference","anchor_name":"me","node_guid":"G",'
+        b'"pins":[{"name":"self","direction":"output","type":"object"}],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_self_reference(blueprint="/Game/X", anchor_name="me")
+    assert r["ok"] is True
+    assert any(p["name"] == "self" and p["direction"] == "output" for p in r["pins"])
+
+
+def test_add_input_key_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_input_key","anchor_name":"on_p","node_guid":"G","key":"P",'
+        b'"pins":[{"name":"Pressed","direction":"output","type":"exec"},'
+        b'{"name":"Released","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_input_key(blueprint="/Game/X", key="P", anchor_name="on_p")
+    assert r["ok"] is True
+    assert r["key"] == "P"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["key"] == "P"
+
+
+def test_add_input_key_handles_invalid() -> None:
+    response = b'{"ok":false,"command":"add_input_key","error":"invalid_key","detail":"NotAKey (try: P, Space, ...)"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_input_key(blueprint="/Game/X", key="NotAKey", anchor_name="x")
+    assert r["ok"] is False
+    assert r["error"] == "invalid_key"
+
+
+def test_delete_node_success() -> None:
+    response = b'{"ok":true,"command":"delete_node","anchor_name":"print_hello","node_type":"K2Node_CallFunction","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_node(blueprint="/Game/X", anchor_name="print_hello")
+    assert r["ok"] is True
+    assert r["node_type"] == "K2Node_CallFunction"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "delete_node", "blueprint": "/Game/X", "anchor_name": "print_hello"}
+
+
+def test_delete_node_handles_not_found() -> None:
+    response = b'{"ok":false,"command":"delete_node","error":"anchor_not_found","detail":"missing"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_node(blueprint="/Game/X", anchor_name="missing")
+    assert r["ok"] is False
+    assert r["error"] == "anchor_not_found"
+
+
+def test_disconnect_pins_success() -> None:
+    response = b'{"ok":true,"command":"disconnect_pins","from":"begin_play.then","to":"print_hello.execute","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.disconnect_pins(blueprint="/Game/X",
+                                   from_pin="begin_play.then", to_pin="print_hello.execute")
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["from_pin"] == "begin_play.then"
+    assert sent_dict["to_pin"] == "print_hello.execute"
+
+
+def test_disconnect_pins_handles_not_connected() -> None:
+    response = b'{"ok":false,"command":"disconnect_pins","error":"not_connected","detail":"a.b -> c.d"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.disconnect_pins(blueprint="/Game/X", from_pin="a.b", to_pin="c.d")
+    assert r["ok"] is False
+    assert r["error"] == "not_connected"
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (require a real UE editor + plugin)
 # ---------------------------------------------------------------------------
 

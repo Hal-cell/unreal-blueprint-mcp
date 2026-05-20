@@ -5,8 +5,8 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v3](https://img.shields.io/badge/version-v3-brightgreen)](#status)
-[![16 tools](https://img.shields.io/badge/tools-16-blue)](#tools)
+[![v4](https://img.shields.io/badge/version-v4-brightgreen)](#status)
+[![21 tools](https://img.shields.io/badge/tools-21-blue)](#tools)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -40,8 +40,9 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v1** | ✅ Components, custom events, variables, variable get/set, auto-spawn well-known events — full collision-timer demo working |
 | **v2** | ✅ `get_blueprint` — full BP introspection (anchors / connections / variables / components) so LLMs stop blind-writing |
 | **v3** | ✅ `add_branch` (K2Node_IfThenElse) + `add_cast` (K2Node_DynamicCast) — conditional & type-narrowing flow |
-| **Unit tests** | 39 passing, 7 integration tests gated on a running UE editor |
-| **Plugin binary** | ~413 KB dylib on macOS / UE 5.4.4 |
+| **v4** | ✅ `add_macro` (ForEachLoop / WhileLoop / FlipFlop / DoOnce / Gate / ...) + `add_self_reference` + `add_input_key` + `delete_node` + `disconnect_pins` + struct types in `set_pin_default` (Vector / Rotator / Color) |
+| **Unit tests** | 48 passing, 7 integration tests gated on a running UE editor |
+| **Plugin binary** | ~466 KB dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -122,7 +123,12 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | `add_variable_get` / `add_variable_set` | Read/write nodes for BP variables |
 | **`add_branch`** (v3) | Add a `K2Node_IfThenElse` (Branch) — if/else flow |
 | **`add_cast`** (v3) | Add a `K2Node_DynamicCast` (Cast To X) — type narrowing |
-| `set_pin_default` | Override a pin's default value (primitives only) |
+| **`add_macro`** (v4) | Add a `K2Node_MacroInstance` — ForEachLoop / ForLoop / WhileLoop / FlipFlop / DoOnce / Gate / IsValid |
+| **`add_self_reference`** (v4) | Add a `K2Node_Self` — self reference |
+| **`add_input_key`** (v4) | Add a `K2Node_InputKey` — keyboard / mouse / gamepad key event |
+| **`delete_node`** (v4) | Delete a node and break all its connections |
+| **`disconnect_pins`** (v4) | Break a single pin link (inverse of `connect_pins`) |
+| `set_pin_default` | Override a pin's default value (primitives + **Vector / Rotator / Color** since v4) |
 | `connect_pins` | Wire two pins; **auto-spawns well-known events on demand** |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |
 | `spawn_actor` | Place a compiled BP instance into the current level |
