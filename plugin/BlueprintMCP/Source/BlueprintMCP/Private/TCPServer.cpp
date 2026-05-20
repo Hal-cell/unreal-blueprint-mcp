@@ -141,6 +141,8 @@ namespace
     // v7.4: ResolveVariablePinType uses ResolveCastTargetClass for object/class ref types,
     // but the latter is defined further down. Forward-declare here.
     UClass* ResolveCastTargetClass(const FString& Name);
+    // v7.7 fix: JsonGraphNotFound (below) calls JsonError, which is defined at L202.
+    FString JsonError(const FString& Command, const FString& Error, const FString& Detail);
 
     /**
      * v7.7: Resolve which graph a graph-writing tool should target.
@@ -3046,7 +3048,10 @@ namespace
             if (Enum == nullptr)
                 return JsonError(CmdName, TEXT("enum_not_found"), EnumClass);
             UK2Node_SwitchEnum* EnumSwitch = SpawnK2NodeBare<UK2Node_SwitchEnum>(EventGraph, AnchorName, PosX, PosY);
-            EnumSwitch->SetEnum(Enum);
+            // v6-style workaround: SetEnum(UEnum*) is not BLUEPRINTGRAPH_API exported in UE 5.4,
+            // so direct-assign the public Enum field. AllocateDefaultPins (in FinalizeK2Node)
+            // calls CreateCasePins which reads Enum to generate one case pin per enum value.
+            EnumSwitch->Enum = Enum;
             NewNode = EnumSwitch;
             NodeTypeName = TEXT("K2Node_SwitchEnum");
         }
@@ -3185,7 +3190,8 @@ namespace
         if (Name.Equals(TEXT("LinearColor"), ESearchCase::IgnoreCase)) return TBaseStructure<FLinearColor>::Get();
         if (Name.Equals(TEXT("Color"), ESearchCase::IgnoreCase))       return TBaseStructure<FColor>::Get();
         if (Name.Equals(TEXT("Quat"), ESearchCase::IgnoreCase))        return TBaseStructure<FQuat>::Get();
-        if (Name.Equals(TEXT("Box"), ESearchCase::IgnoreCase))         return TBaseStructure<FBox>::Get();
+        // Note: FBox has no TBaseStructure specialization in UE 5.4. Use the qualified
+        // path "/Script/CoreUObject.Box" if you need it (handled by the path fallback below).
 
         // Engine-defined structs (load by /Script/Engine path)
         if (Name.Equals(TEXT("HitResult"), ESearchCase::IgnoreCase))
@@ -3475,11 +3481,17 @@ namespace
         UK2Node_Select* NewNode = SpawnK2NodeBare<UK2Node_Select>(EventGraph, AnchorName, PosX, PosY);
         FinalizeK2Node(EventGraph, NewNode);
 
-        // Default Select has 2 option pins. Add more to reach NumOptions.
-        const int32 DefaultNumOptions = 2;
-        for (int32 i = DefaultNumOptions; i < NumOptions; ++i)
+        // Note: UE 5.4 UK2Node_Select has no public AddOptionPinToNode() — only
+        // RemoveOptionPinToNode(). Default node has 2 option pins; adding more requires
+        // the BP editor's "Add Option" context-menu action. Param NumOptions is ignored
+        // when > 2 (logged so the user knows). v7.2.x candidate: implement via
+        // ReconstructNode + direct NumOptionPins mutation.
+        const int32 ActualNumOptions = 2;
+        if (NumOptions > ActualNumOptions)
         {
-            NewNode->AddOptionPinToNode();
+            UE_LOG(LogBlueprintMCP_TCP, Warning,
+                TEXT("add_select: requested num_options=%d but UE 5.4 K2Node_Select has no public AddOption — defaulting to 2"),
+                NumOptions);
         }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
@@ -3491,7 +3503,7 @@ namespace
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"add_select\",\"anchor_name\":%s,\"num_options\":%d,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName),
-            FMath::Max(NumOptions, DefaultNumOptions),
+            ActualNumOptions,
             *EscapeJsonString(GuidStr),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
