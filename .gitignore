@@ -1,0 +1,51 @@
+# =========================
+# Unreal Engine generated
+# =========================
+plugin/BlueprintMCP/Binaries/
+plugin/BlueprintMCP/Intermediate/
+plugin/BlueprintMCP/Saved/
+plugin/BlueprintMCP/DerivedDataCache/
+*.opensdf
+*.sdf
+*.suo
+*.xcodeproj/
+*.xcworkspace/
+*.sln
+.vs/
+.vscode/
+.idea/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.uv-cache/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Editor / personal
+# =========================
+*.swp
+*.swo
+.envrc
+.direnv/
