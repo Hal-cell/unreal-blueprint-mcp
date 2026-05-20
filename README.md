@@ -5,8 +5,8 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v0: complete](https://img.shields.io/badge/v0-complete-brightgreen)](#status)
-[![v1: collision-timer demo working](https://img.shields.io/badge/v1-collision--timer-blue)](#v1-collision-timer-demo)
+[![v3](https://img.shields.io/badge/version-v3-brightgreen)](#status)
+[![16 tools](https://img.shields.io/badge/tools-16-blue)](#tools)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -38,8 +38,10 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 |---|---|
 | **v0** | ✅ End-to-end: BP creation → node ops → pin wiring → compile → spawn → PIE prints "hello world" |
 | **v1** | ✅ Components, custom events, variables, variable get/set, auto-spawn well-known events — full collision-timer demo working |
-| **Unit tests** | 32 passing, 7 integration tests gated on a running UE editor |
-| **Plugin binary** | ~340 KB dylib on macOS / UE 5.4.4 |
+| **v2** | ✅ `get_blueprint` — full BP introspection (anchors / connections / variables / components) so LLMs stop blind-writing |
+| **v3** | ✅ `add_branch` (K2Node_IfThenElse) + `add_cast` (K2Node_DynamicCast) — conditional & type-narrowing flow |
+| **Unit tests** | 39 passing, 7 integration tests gated on a running UE editor |
+| **Plugin binary** | ~413 KB dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -105,20 +107,23 @@ Use absolute path to `uv` — macOS GUI processes don't inherit shell PATH.
 
 Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 
-## Tools (v1)
+## Tools
 
 | Tool | What it does |
 |------|--------------|
 | `ping_ue` | Health check: are UE + the plugin alive? |
 | `echo` | MCP stdio plumbing sanity test |
+| **`get_blueprint`** (v2) | **Snapshot of a BP: anchors / pins / connections / variables / components — call this BEFORE writing** |
 | `create_blueprint` | New BP asset in `/Game/...`, parent class from whitelist |
 | `add_component` | Add a component to the BP's SCS (BoxCollision, StaticMesh, Camera, ...) |
 | `add_node` | Add a `K2Node_CallFunction` node (whitelist or fully qualified) |
 | `add_custom_event` | Add a `K2Node_CustomEvent` (red node) for delegate targets |
 | `add_variable` | Add a member variable (incl. **TimerHandle** for timer cancel patterns) |
 | `add_variable_get` / `add_variable_set` | Read/write nodes for BP variables |
-| `set_pin_default` | Override a pin's default value (primitives only in v1) |
-| `connect_pins` | Wire two pins; auto-spawns well-known events on demand |
+| **`add_branch`** (v3) | Add a `K2Node_IfThenElse` (Branch) — if/else flow |
+| **`add_cast`** (v3) | Add a `K2Node_DynamicCast` (Cast To X) — type narrowing |
+| `set_pin_default` | Override a pin's default value (primitives only) |
+| `connect_pins` | Wire two pins; **auto-spawns well-known events on demand** |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |
 | `spawn_actor` | Place a compiled BP instance into the current level |
 

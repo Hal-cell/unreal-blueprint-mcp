@@ -813,6 +813,80 @@ def test_get_blueprint_handles_empty_bp() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v3 — add_branch / add_cast
+# ---------------------------------------------------------------------------
+
+
+def test_add_branch_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_branch","anchor_name":"check_alive",'
+        b'"node_guid":"G","node_type":"K2Node_IfThenElse",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"},'
+        b'{"name":"Condition","direction":"input","type":"bool"},'
+        b'{"name":"then","direction":"output","type":"exec"},'
+        b'{"name":"else","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_branch(blueprint="/Game/X", anchor_name="check_alive", position_x=300, position_y=0)
+    assert r["ok"] is True
+    assert r["anchor_name"] == "check_alive"
+    assert r["node_type"] == "K2Node_IfThenElse"
+    pin_names = {p["name"] for p in r["pins"]}
+    assert {"execute", "Condition", "then", "else"} <= pin_names
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_branch"
+
+
+def test_add_branch_anchor_exists() -> None:
+    response = b'{"ok":false,"command":"add_branch","error":"anchor_name_exists","detail":"check_alive"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_branch(blueprint="/Game/X", anchor_name="check_alive")
+    assert r["ok"] is False
+    assert r["error"] == "anchor_name_exists"
+
+
+def test_add_cast_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_cast","anchor_name":"cast_to_pawn",'
+        b'"node_guid":"G","node_type":"K2Node_DynamicCast","target_class":"Pawn",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"},'
+        b'{"name":"Object","direction":"input","type":"object"},'
+        b'{"name":"then","direction":"output","type":"exec"},'
+        b'{"name":"AsPawn","direction":"output","type":"object"},'
+        b'{"name":"CastFailed","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_cast(
+            blueprint="/Game/X",
+            target_class="Pawn",
+            anchor_name="cast_to_pawn",
+            position_x=600,
+        )
+    assert r["ok"] is True
+    assert r["target_class"] == "Pawn"
+    pin_names = {p["name"] for p in r["pins"]}
+    assert "AsPawn" in pin_names
+    assert "CastFailed" in pin_names
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_cast"
+    assert sent_dict["target_class"] == "Pawn"
+
+
+def test_add_cast_handles_unknown_class() -> None:
+    response = b'{"ok":false,"command":"add_cast","error":"unknown_target_class","detail":"FooBar"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_cast(blueprint="/Game/X", target_class="FooBar", anchor_name="bad")
+    assert r["ok"] is False
+    assert r["error"] == "unknown_target_class"
+
+
+# ---------------------------------------------------------------------------
 # Integration tests (require a real UE editor + plugin)
 # ---------------------------------------------------------------------------
 
