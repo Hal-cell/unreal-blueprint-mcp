@@ -1,0 +1,813 @@
+"""Smoke + unit tests for the MCP server.
+
+The TCP integration tests (real UE plugin) are skipped by default — they only
+make sense with UE Editor running. Un-skip and run manually during spike phases.
+"""
+
+from __future__ import annotations
+
+import socket
+from unittest import mock
+
+import pytest
+
+from unreal_blueprint_mcp import server
+
+
+# ---------------------------------------------------------------------------
+# echo
+# ---------------------------------------------------------------------------
+
+
+def test_echo_returns_message() -> None:
+    # FastMCP 1.27 @mcp.tool() registers the function but returns it unchanged,
+    # so we call it directly.
+    result = server.echo(message="hello")
+    assert result == {"ok": True, "echo": "hello"}
+
+
+# ---------------------------------------------------------------------------
+# _send_command error paths
+# ---------------------------------------------------------------------------
+
+
+def test_send_command_handles_connection_refused() -> None:
+    with mock.patch.object(
+        socket,
+        "create_connection",
+        side_effect=ConnectionRefusedError("nope"),
+    ):
+        result = server._send_command({"command": "ping"})
+    assert result["ok"] is False
+    assert result["error"] == "connection_refused"
+    assert "hint" in result
+
+
+def test_send_command_handles_timeout() -> None:
+    with mock.patch.object(
+        socket,
+        "create_connection",
+        side_effect=socket.timeout("slow"),
+    ):
+        result = server._send_command({"command": "ping"})
+    assert result["ok"] is False
+    assert result["error"] == "tcp_error"
+
+
+def test_send_command_handles_invalid_response_json() -> None:
+    fake_response = b"not-json-at-all"
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server._send_command({"command": "ping"})
+    assert result["ok"] is False
+    assert result["error"] == "invalid_response_json"
+    assert result["raw"] == "not-json-at-all"
+
+
+# ---------------------------------------------------------------------------
+# ping_ue (just verifies it composes _send_command correctly)
+# ---------------------------------------------------------------------------
+
+
+def test_ping_ue_parses_plugin_success_response() -> None:
+    fake_response = b'{"ok":true,"command":"ping","version":"0.0.1","timestamp":"2026-05-20T00:00:00.000Z"}\n'
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.ping_ue()
+
+    assert result["ok"] is True
+    assert result["version"] == "0.0.1"
+    assert "timestamp" in result
+
+
+# ---------------------------------------------------------------------------
+# create_blueprint
+# ---------------------------------------------------------------------------
+
+
+def test_create_blueprint_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"create_blueprint","blueprint_path":"/Game/Blueprints/BP_Test",'
+        b'"parent_class":"Actor","saved":true}\n'
+    )
+    sent_payload: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent_payload["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.create_blueprint(name="BP_Test", parent_class="Actor", path="/Game/Blueprints")
+
+    # response shape
+    assert result["ok"] is True
+    assert result["blueprint_path"] == "/Game/Blueprints/BP_Test"
+    assert result["parent_class"] == "Actor"
+
+    # request shape — verify what we sent over the wire
+    import json
+    sent_dict = json.loads(sent_payload["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "create_blueprint",
+        "name": "BP_Test",
+        "parent_class": "Actor",
+        "path": "/Game/Blueprints",
+    }
+
+
+def test_create_blueprint_handles_ue_error_response() -> None:
+    fake_response = (
+        b'{"ok":false,"command":"create_blueprint","error":"unknown_parent_class",'
+        b'"detail":"FooBar"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.create_blueprint(name="BP_Bad", parent_class="FooBar")
+
+    assert result["ok"] is False
+    assert result["error"] == "unknown_parent_class"
+    assert result["detail"] == "FooBar"
+
+
+def test_create_blueprint_uses_defaults() -> None:
+    """parent_class defaults to Actor; path defaults to /Game/Blueprints."""
+    fake_response = (
+        b'{"ok":true,"command":"create_blueprint","blueprint_path":"/Game/Blueprints/BP_X",'
+        b'"parent_class":"Actor","saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        server.create_blueprint(name="BP_X")
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["parent_class"] == "Actor"
+    assert sent_dict["path"] == "/Game/Blueprints"
+
+
+# ---------------------------------------------------------------------------
+# add_node (Spike B2)
+# ---------------------------------------------------------------------------
+
+
+def test_add_node_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"add_node","anchor_name":"print_hello",'
+        b'"node_guid":"AABBCCDD-EEFF-0011-2233-445566778899",'
+        b'"node_type":"K2Node_CallFunction","function":"PrintString",'
+        b'"owning_class":"KismetSystemLibrary",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"},'
+        b'{"name":"then","direction":"output","type":"exec"},'
+        b'{"name":"InString","direction":"input","type":"string"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.add_node(
+            blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+            node_type="K2Node_CallFunction:PrintString",
+            anchor_name="print_hello",
+            position_x=200,
+            position_y=100,
+        )
+
+    # response shape
+    assert result["ok"] is True
+    assert result["anchor_name"] == "print_hello"
+    assert result["function"] == "PrintString"
+    assert isinstance(result["pins"], list)
+    assert any(p["name"] == "InString" and p["type"] == "string" for p in result["pins"])
+
+    # wire format
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_node",
+        "blueprint": "/Game/Blueprints/BP_TestSpikeB1_v2",
+        "node_type": "K2Node_CallFunction:PrintString",
+        "anchor_name": "print_hello",
+        "position_x": 200,
+        "position_y": 100,
+    }
+
+
+def test_add_node_handles_unknown_function() -> None:
+    fake_response = (
+        b'{"ok":false,"command":"add_node","error":"unknown_function","detail":"FooBar"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.add_node(
+            blueprint="/Game/Blueprints/BP_X",
+            node_type="K2Node_CallFunction:FooBar",
+            anchor_name="bad",
+        )
+    assert result["ok"] is False
+    assert result["error"] == "unknown_function"
+    assert result["detail"] == "FooBar"
+
+
+def test_add_node_uses_position_defaults() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"add_node","anchor_name":"a","node_guid":"x",'
+        b'"node_type":"K2Node_CallFunction","function":"PrintString",'
+        b'"owning_class":"KismetSystemLibrary","pins":[],"saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        server.add_node(
+            blueprint="/Game/Blueprints/BP_X",
+            node_type="K2Node_CallFunction:PrintString",
+            anchor_name="a",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["position_x"] == 0
+    assert sent_dict["position_y"] == 0
+
+
+# ---------------------------------------------------------------------------
+# set_pin_default (Spike B3)
+# ---------------------------------------------------------------------------
+
+
+def test_set_pin_default_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"set_pin_default","anchor_name":"print_hello",'
+        b'"pin_name":"InString","value":"hello world","pin_type":"string","saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.set_pin_default(
+            blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+            pin_ref="print_hello.InString",
+            value="hello world",
+        )
+
+    assert result["ok"] is True
+    assert result["anchor_name"] == "print_hello"
+    assert result["pin_name"] == "InString"
+    assert result["value"] == "hello world"
+    assert result["pin_type"] == "string"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_pin_default",
+        "blueprint": "/Game/Blueprints/BP_TestSpikeB1_v2",
+        "pin_ref": "print_hello.InString",
+        "value": "hello world",
+    }
+
+
+def test_set_pin_default_handles_anchor_not_found() -> None:
+    fake_response = (
+        b'{"ok":false,"command":"set_pin_default","error":"anchor_not_found","detail":"nope"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.set_pin_default(
+            blueprint="/Game/Blueprints/BP_X",
+            pin_ref="nope.InString",
+            value="x",
+        )
+    assert result["ok"] is False
+    assert result["error"] == "anchor_not_found"
+
+
+def test_set_pin_default_handles_invalid_pin_ref() -> None:
+    """pin_ref missing the dot separator should return invalid_pin_ref."""
+    fake_response = (
+        b'{"ok":false,"command":"set_pin_default","error":"invalid_pin_ref",'
+        b'"detail":"NoDot (expected anchor.pin)"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.set_pin_default(
+            blueprint="/Game/Blueprints/BP_X",
+            pin_ref="NoDot",
+            value="x",
+        )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_pin_ref"
+
+
+# ---------------------------------------------------------------------------
+# connect_pins (Spike B4)
+# ---------------------------------------------------------------------------
+
+
+def test_connect_pins_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"connect_pins","from":"begin_play.then",'
+        b'"to":"print_hello.execute","saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.connect_pins(
+            blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+            from_pin="begin_play.then",
+            to_pin="print_hello.execute",
+        )
+
+    assert result["ok"] is True
+    assert result["from"] == "begin_play.then"
+    assert result["to"] == "print_hello.execute"
+    assert result["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "connect_pins",
+        "blueprint": "/Game/Blueprints/BP_TestSpikeB1_v2",
+        "from_pin": "begin_play.then",
+        "to_pin": "print_hello.execute",
+    }
+
+
+def test_connect_pins_handles_anchor_not_found() -> None:
+    fake_response = (
+        b'{"ok":false,"command":"connect_pins","error":"anchor_not_found",'
+        b'"detail":"nope"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.connect_pins(
+            blueprint="/Game/Blueprints/BP_X",
+            from_pin="nope.then",
+            to_pin="print_hello.execute",
+        )
+    assert result["ok"] is False
+    assert result["error"] == "anchor_not_found"
+
+
+def test_connect_pins_handles_incompatible_pins() -> None:
+    """When K2 schema rejects (e.g., string → bool), incompatible_pins with UE's reason."""
+    fake_response = (
+        b'{"ok":false,"command":"connect_pins","error":"incompatible_pins",'
+        b'"detail":"Boolean is not compatible with String"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.connect_pins(
+            blueprint="/Game/Blueprints/BP_X",
+            from_pin="some.string_out",
+            to_pin="other.bool_in",
+        )
+    assert result["ok"] is False
+    assert result["error"] == "incompatible_pins"
+    # UE's reason text bubbled up in detail
+    assert "compatible" in result["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# compile_blueprint (Spike B5)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_blueprint_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"compile_blueprint","status":"up_to_date","saved":true}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.compile_blueprint(name="/Game/Blueprints/BP_TestSpikeB1_v2")
+
+    assert result["ok"] is True
+    assert result["status"] == "up_to_date"
+    assert result["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "compile_blueprint", "name": "/Game/Blueprints/BP_TestSpikeB1_v2"}
+
+
+def test_compile_blueprint_handles_warnings() -> None:
+    """Compile succeeds but with warnings — still ok=true."""
+    fake_response = (
+        b'{"ok":true,"command":"compile_blueprint","status":"warnings","saved":true}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.compile_blueprint(name="/Game/Blueprints/BP_X")
+    assert result["ok"] is True
+    assert result["status"] == "warnings"
+
+
+def test_compile_blueprint_handles_error() -> None:
+    fake_response = (
+        b'{"ok":false,"command":"compile_blueprint","error":"compile_failed",'
+        b'"status":"error","hint":"See UE Editor Message Log...","saved":false}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.compile_blueprint(name="/Game/Blueprints/BP_Broken")
+    assert result["ok"] is False
+    assert result["error"] == "compile_failed"
+    assert result["status"] == "error"
+    assert "hint" in result
+
+
+# ---------------------------------------------------------------------------
+# spawn_actor (Spike B6)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_actor_success() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"spawn_actor",'
+        b'"blueprint_path":"/Game/Blueprints/BP_TestSpikeB1_v2",'
+        b'"actor_name":"BP_TestSpikeB1_v2_C_1","location":[0.000000,0.000000,0.000000]}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
+
+    assert result["ok"] is True
+    assert result["actor_name"] == "BP_TestSpikeB1_v2_C_1"
+    assert result["location"] == [0.0, 0.0, 0.0]
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "spawn_actor",
+        "blueprint": "/Game/Blueprints/BP_TestSpikeB1_v2",
+        "location_x": 0.0,
+        "location_y": 0.0,
+        "location_z": 0.0,
+    }
+
+
+def test_spawn_actor_handles_no_generated_class() -> None:
+    """BP wasn't compiled yet → no_generated_class."""
+    fake_response = (
+        b'{"ok":false,"command":"spawn_actor","error":"no_generated_class",'
+        b'"detail":"Blueprint must be compiled first (call compile_blueprint)"}\n'
+    )
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data): pass
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        result = server.spawn_actor(blueprint="/Game/Blueprints/BP_NotCompiled")
+    assert result["ok"] is False
+    assert result["error"] == "no_generated_class"
+
+
+def test_spawn_actor_passes_location() -> None:
+    fake_response = (
+        b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/X",'
+        b'"actor_name":"X_C_1","location":[100.000000,200.000000,50.000000]}\n'
+    )
+    sent: dict[str, bytes] = {}
+
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            sent["data"] = data
+        def recv(self, n): return fake_response
+
+    with mock.patch.object(socket, "create_connection", return_value=FakeSock()):
+        server.spawn_actor(
+            blueprint="/Game/X",
+            location_x=100.0,
+            location_y=200.0,
+            location_z=50.0,
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["location_x"] == 100.0
+    assert sent_dict["location_y"] == 200.0
+    assert sent_dict["location_z"] == 50.0
+
+
+# ---------------------------------------------------------------------------
+# v1 — add_component / add_custom_event / add_variable / add_variable_get/set
+# ---------------------------------------------------------------------------
+
+
+def _fake_sock(response_bytes: bytes, sent_record: dict | None = None):
+    class FakeSock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def sendall(self, data):
+            if sent_record is not None:
+                sent_record["data"] = data
+        def recv(self, n): return response_bytes
+    return FakeSock()
+
+
+# --- B7 add_component ---
+
+
+def test_add_component_success() -> None:
+    response = b'{"ok":true,"command":"add_component","component_name":"TriggerBox","component_class":"BoxComponent","saved":true}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component(blueprint="/Game/Blueprints/BP_X", component_class="BoxCollision", name="TriggerBox")
+    assert r["ok"] is True
+    assert r["component_name"] == "TriggerBox"
+    assert "Box" in r["component_class"]
+
+
+def test_add_component_handles_parent_not_actor() -> None:
+    response = b'{"ok":false,"command":"add_component","error":"parent_not_actor","detail":"..."}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component(blueprint="/Game/Blueprints/BP_X", component_class="BoxCollision", name="x")
+    assert r["ok"] is False
+    assert r["error"] == "parent_not_actor"
+
+
+# --- B8 add_custom_event ---
+
+
+def test_add_custom_event_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_custom_event","anchor_name":"my_timer_cb",'
+        b'"event_name":"OnTimerElapsed","node_guid":"GUID","pins":[{"name":"then","direction":"output","type":"exec"}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_custom_event(blueprint="/Game/Blueprints/BP_X", event_name="OnTimerElapsed",
+                                    anchor_name="my_timer_cb", position_x=500, position_y=0)
+    assert r["ok"] is True
+    assert r["event_name"] == "OnTimerElapsed"
+    assert any(p["name"] == "then" and p["type"] == "exec" for p in r["pins"])
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_custom_event"
+    assert sent_dict["event_name"] == "OnTimerElapsed"
+
+
+def test_add_custom_event_handles_duplicate_name() -> None:
+    response = b'{"ok":false,"command":"add_custom_event","error":"event_name_exists","detail":"OnTimerElapsed"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_custom_event(blueprint="/Game/X", event_name="OnTimerElapsed", anchor_name="x")
+    assert r["ok"] is False
+    assert r["error"] == "event_name_exists"
+
+
+# --- B9 add_variable ---
+
+
+def test_add_variable_success_timer_handle() -> None:
+    response = b'{"ok":true,"command":"add_variable","variable_name":"MyTimer","variable_type":"TimerHandle","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable(blueprint="/Game/X", name="MyTimer", variable_type="TimerHandle")
+    assert r["ok"] is True
+    assert r["variable_type"] == "TimerHandle"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_variable",
+        "blueprint": "/Game/X",
+        "name": "MyTimer",
+        "variable_type": "TimerHandle",
+        "default_value": "",
+    }
+
+
+def test_add_variable_handles_unknown_type() -> None:
+    response = b'{"ok":false,"command":"add_variable","error":"unknown_variable_type","detail":"WeirdType"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_variable(blueprint="/Game/X", name="x", variable_type="WeirdType")
+    assert r["ok"] is False
+    assert r["error"] == "unknown_variable_type"
+
+
+# --- B10 add_variable_get / add_variable_set ---
+
+
+def test_add_variable_get_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_variable_get","anchor_name":"read_timer",'
+        b'"variable_name":"MyTimer","node_guid":"G","pins":[{"name":"MyTimer","direction":"output","type":"struct"}],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_variable_get(blueprint="/Game/X", variable_name="MyTimer", anchor_name="read_timer")
+    assert r["ok"] is True
+    assert r["variable_name"] == "MyTimer"
+
+
+def test_add_variable_set_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_variable_set","anchor_name":"write_timer",'
+        b'"variable_name":"MyTimer","node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable_set(blueprint="/Game/X", variable_name="MyTimer", anchor_name="write_timer")
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_variable_set"
+    assert sent_dict["variable_name"] == "MyTimer"
+
+
+def test_add_variable_get_handles_var_not_found() -> None:
+    response = b'{"ok":false,"command":"add_variable_get","error":"variable_not_found","detail":"NoSuchVar (call add_variable first)"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_variable_get(blueprint="/Game/X", variable_name="NoSuchVar", anchor_name="x")
+    assert r["ok"] is False
+    assert r["error"] == "variable_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require a real UE editor + plugin)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin loaded")
+def test_ping_ue_against_real_plugin() -> None:
+    result = server.ping_ue()
+    assert result["ok"] is True
+    assert "version" in result
+
+
+@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin loaded")
+def test_create_blueprint_against_real_plugin() -> None:
+    """Manual spike test: creates an asset in the running editor. Un-skip in spike B1."""
+    result = server.create_blueprint(name="BP_TestSpikeB1", parent_class="Actor")
+    assert result["ok"] is True
+    assert result["blueprint_path"].endswith("BP_TestSpikeB1")
+
+
+@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin + a Blueprint to add to")
+def test_add_node_against_real_plugin() -> None:
+    """Manual spike test: adds a PrintString node to BP_TestSpikeB1_v2. Un-skip in spike B2."""
+    result = server.add_node(
+        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+        node_type="K2Node_CallFunction:PrintString",
+        anchor_name="print_hello_b2_test",
+        position_x=400,
+        position_y=200,
+    )
+    assert result["ok"] is True
+    assert result["function"] == "PrintString"
+
+
+@pytest.mark.skip(reason="Requires UE editor + plugin + a node with anchor 'print_hello' on it")
+def test_set_pin_default_against_real_plugin() -> None:
+    """Manual spike test: changes print_hello.InString default to 'hello world'."""
+    result = server.set_pin_default(
+        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+        pin_ref="print_hello.InString",
+        value="hello world",
+    )
+    assert result["ok"] is True
+    assert result["value"] == "hello world"
+
+
+@pytest.mark.skip(reason="Requires UE editor + plugin + BP with begin_play and print_hello nodes")
+def test_connect_pins_against_real_plugin() -> None:
+    """Manual spike test: wires BeginPlay.then -> print_hello.execute."""
+    result = server.connect_pins(
+        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
+        from_pin="begin_play.then",
+        to_pin="print_hello.execute",
+    )
+    assert result["ok"] is True
+
+
+@pytest.mark.skip(reason="Requires UE editor + plugin + a complete wired BP to compile")
+def test_compile_blueprint_against_real_plugin() -> None:
+    """Manual spike test: compiles BP_TestSpikeB1_v2 (should be wired by B4)."""
+    result = server.compile_blueprint(name="/Game/Blueprints/BP_TestSpikeB1_v2")
+    assert result["ok"] is True
+    assert result["status"] in ("up_to_date", "warnings")
+
+
+@pytest.mark.skip(reason="Requires UE editor + plugin + a compiled Actor BP")
+def test_spawn_actor_against_real_plugin() -> None:
+    """Manual spike test: spawns BP_TestSpikeB1_v2 into current level."""
+    result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
+    assert result["ok"] is True
+    assert "actor_name" in result

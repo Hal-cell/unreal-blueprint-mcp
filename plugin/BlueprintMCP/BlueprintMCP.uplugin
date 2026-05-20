@@ -1,0 +1,30 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.0.1",
+    "FriendlyName": "BlueprintMCP",
+    "Description": "MCP server endpoint for AI-driven Blueprint editing. Listens on TCP for JSON commands from the unreal-blueprint-mcp Python MCP server.",
+    "Category": "Editor",
+    "CreatedBy": "Hal Xu",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "CanContainContent": false,
+    "IsBetaVersion": true,
+    "Installed": false,
+    "EnabledByDefault": true,
+    "Modules": [
+        {
+            "Name": "BlueprintMCP",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "EditorScriptingUtilities",
+            "Enabled": true
+        }
+    ]
+}
