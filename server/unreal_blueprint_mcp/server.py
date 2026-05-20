@@ -141,6 +141,519 @@ def ping_ue() -> dict[str, Any]:
 
 
 @mcp.tool()
+def set_component_property(
+    blueprint: str,
+    component_name: str,
+    property_name: str,
+    value: str = "",
+) -> dict[str, Any]:
+    """Set a property on a component's template instance inside a Blueprint.
+
+    This is the v7.1 escape hatch for component-level defaults that aren't K2Node
+    pins — things like ``StaticMeshComponent::StaticMesh`` (which mesh asset),
+    ``BoxComponent::BoxExtent`` (trigger volume size), ``PrimitiveComponent::BodyInstance``
+    (collision preset, generate overlap events).
+
+    Property categories supported:
+    - **Object reference** (StaticMesh, Material, Texture, …): pass an asset path
+      like ``/Engine/BasicShapes/Cube`` or full ``/Engine/BasicShapes/Cube.Cube``.
+      Pass ``""`` or ``"None"`` to clear the reference.
+    - **Class reference** (``TSubclassOf<X>``): pass a class path like
+      ``/Script/Engine.Actor`` or a BP class path like ``/Game/BP_X.BP_X_C``.
+    - **Struct** (FVector, FRotator, FColor, FBodyInstance, …): pass an FString-style
+      literal like ``(X=200,Y=200,Z=200)``. For Vector / Rotator / Color you can also
+      pass shorthand ``200,200,200`` (auto-normalized).
+    - **Primitive** (int, float, bool, FName, enum, FString): pass a stringified value
+      like ``True``, ``42``, ``OverlapAllDynamic``.
+
+    Dot-separated paths supported for nested struct fields::
+
+        property_name="BodyInstance.CollisionProfileName"  value="OverlapAllDynamic"
+        property_name="BodyInstance.bGenerateOverlapEvents"  value="True"
+
+    Examples::
+
+        # Make a StaticMeshComponent visible
+        set_component_property(
+            blueprint="/Game/BP_TargetDummy", component_name="VisualMesh",
+            property_name="StaticMesh", value="/Engine/BasicShapes/Cube",
+        )
+
+        # Resize a BoxCollision trigger so the player can walk into it
+        set_component_property(
+            blueprint="/Game/BP_TargetDummy", component_name="TriggerBox",
+            property_name="BoxExtent", value="(X=200,Y=200,Z=200)",
+        )
+
+        # Set collision preset so overlap events fire
+        set_component_property(
+            blueprint="/Game/BP_TargetDummy", component_name="TriggerBox",
+            property_name="BodyInstance.CollisionProfileName", value="OverlapAllDynamic",
+        )
+
+    Args:
+        blueprint: Asset path of the Blueprint (e.g. ``/Game/BP_TargetDummy``).
+        component_name: Variable name of the component (same name passed to
+            ``add_component``, case-sensitive).
+        property_name: Property name on the component template, or dot-separated
+            path for nested struct fields.
+        value: Stringified new value. Empty string clears object/class refs to None.
+
+    Returns:
+        On success: ``{"ok": True, "blueprint": "...", "component": "...",
+        "property": "...", "resolved_value": "...", "saved": True}``
+        On error:   ``{"ok": False, "error": "...", "detail": "..."}``
+
+    Common errors:
+        blueprint_not_found  — BP path doesn't exist
+        parent_not_actor     — BP parent class isn't AActor (no SCS)
+        component_not_found  — no component with that name in the BP's SCS
+        property_not_found   — component class has no property by that name (or a
+                               mid-path token isn't a struct field)
+        set_failed           — asset/class lookup failed, or struct/primitive literal
+                               couldn't be parsed by FProperty::ImportText
+    """
+    if not blueprint or not component_name or not property_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_component_property",
+        "blueprint": blueprint,
+        "component_name": component_name,
+        "property_name": property_name,
+        "value": value,
+    })
+
+
+@mcp.tool()
+def add_switch(
+    blueprint: str,
+    anchor_name: str,
+    switch_type: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    enum_class: str = "",
+    case_count: int = 2,
+    case_labels: str = "",
+) -> dict[str, Any]:
+    """Add a Switch node (multi-way branch) — v7.2.
+
+    Four flavors keyed by ``switch_type``:
+    - ``"int"`` / ``"integer"`` → ``K2Node_SwitchInteger``. Use ``case_count`` for
+      total number of case pins (will be labelled ``0, 1, …, case_count-1``).
+    - ``"string"`` → ``K2Node_SwitchString``. Use ``case_labels`` (comma-separated)
+      for the case labels, e.g. ``"red,green,blue"``.
+    - ``"name"`` → ``K2Node_SwitchName``. Same ``case_labels`` convention.
+    - ``"enum"`` → ``K2Node_SwitchEnum``. ``enum_class`` REQUIRED; e.g.
+      ``"/Script/Engine.EAxis"`` or a custom enum's asset path. AllocateDefaultPins
+      generates one case pin per enum value automatically (no case_count needed).
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label for the node.
+        switch_type: One of ``"int" | "string" | "name" | "enum"``.
+        enum_class: Required when ``switch_type="enum"``; ignored otherwise.
+        case_count: For int switch — total case pins. Default 2.
+        case_labels: For string/name switch — comma-separated case labels.
+            Ignored for int/enum.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        {"ok": True, "anchor_name": ..., "switch_type": ..., "node_type": ...,
+         "node_guid": ..., "pins": [...], "saved": True}
+    """
+    if not blueprint or not anchor_name or not switch_type:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_switch",
+        "blueprint": blueprint,
+        "switch_type": switch_type,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+        "enum_class": enum_class,
+        "case_count": case_count,
+        "case_labels": case_labels,
+    })
+
+
+@mcp.tool()
+def add_sequence(
+    blueprint: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    then_count: int = 2,
+) -> dict[str, Any]:
+    """Add an Execution Sequence node (``K2Node_ExecutionSequence``) — v7.2.
+
+    One input exec fires N output exec pins in order (``Then 0``, ``Then 1``, …).
+    Use this when you want a single trigger to drive multiple independent action
+    chains.
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label.
+        then_count: Total number of "Then N" output exec pins. Default 2.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON with ``pins`` array (one ``execute`` input plus
+        ``Then 0``, ``Then 1``, … outputs).
+    """
+    if not blueprint or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_sequence",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+        "then_count": then_count,
+    })
+
+
+@mcp.tool()
+def add_make_array(
+    blueprint: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    num_inputs: int = 1,
+) -> dict[str, Any]:
+    """Add a Make Array node (``K2Node_MakeArray``) — v7.2.
+
+    Constructs an array literal from N input pins. Element type is wildcard
+    until you connect the first input — UE then infers the array element type.
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label.
+        num_inputs: Number of element input pins (``[0]``, ``[1]``, …). Default 1.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON.
+    """
+    if not blueprint or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_make_array",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+        "num_inputs": num_inputs,
+    })
+
+
+@mcp.tool()
+def add_make_struct(
+    blueprint: str,
+    anchor_name: str,
+    struct_type: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a Make Struct node (``K2Node_MakeStruct``) — v7.3.
+
+    Constructs a struct value from its member fields. Pins are generated
+    dynamically based on the struct type's visible (BlueprintReadWrite) members.
+
+    Struct type whitelist:
+    - ``"Vector"`` (FVector) — X, Y, Z
+    - ``"Vector2D"`` (FVector2D) — X, Y
+    - ``"Rotator"`` (FRotator) — Pitch, Yaw, Roll
+    - ``"Transform"`` (FTransform) — Location, Rotation, Scale
+    - ``"LinearColor"`` / ``"Color"`` — RGBA
+    - ``"Quat"`` (FQuat)
+    - ``"Box"`` (FBox)
+    - ``"HitResult"`` (FHitResult, engine struct)
+    - ``"OverlapResult"`` (FOverlapResult)
+    - ``"CollisionQueryParams"``
+    - Or any fully qualified path: ``/Script/Engine.HitResult``, or BP-defined struct
+      ``/Game/Structs/MyStruct``
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label.
+        struct_type: Short name (from whitelist) or qualified struct path.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON. ``pins`` array contains one input pin per
+        struct member plus one output pin of the struct type.
+    """
+    if not blueprint or not anchor_name or not struct_type:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_make_struct",
+        "blueprint": blueprint,
+        "struct_type": struct_type,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_break_struct(
+    blueprint: str,
+    anchor_name: str,
+    struct_type: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a Break Struct node (``K2Node_BreakStruct``) — v7.3.
+
+    Decomposes a struct value into its member fields. Inverse of ``add_make_struct``.
+    Common pattern: connect a ``HitResult`` output from a trace function into
+    this node's input, then read individual fields (Location, ImpactNormal, etc).
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label.
+        struct_type: See ``add_make_struct`` for whitelist + path syntax.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON. ``pins`` array contains one input pin of
+        the struct type plus one output pin per struct member.
+    """
+    if not blueprint or not anchor_name or not struct_type:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_break_struct",
+        "blueprint": blueprint,
+        "struct_type": struct_type,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_select(
+    blueprint: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    num_options: int = 2,
+) -> dict[str, Any]:
+    """Add a Select node (``K2Node_Select``) — v7.2.
+
+    Three-way+ chooser: ``Index`` picks one of N option inputs and outputs its
+    value. Value type is wildcard until you connect the first option.
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: Unique label.
+        num_options: Number of option input pins (``Option 0``, ``Option 1``, …).
+            Default 2.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON.
+    """
+    if not blueprint or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_select",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+        "num_options": num_options,
+    })
+
+
+@mcp.tool()
+def save_blueprint(blueprint: str) -> dict[str, Any]:
+    """Explicitly save a Blueprint asset to disk — v7.8.
+
+    All v7 write tools (``add_node``, ``set_pin_default``, etc.) already call
+    ``UEditorAssetLibrary::SaveAsset`` after each mutation, so the typical
+    workflow doesn't NEED this. Use it when:
+        - You want to be absolutely sure changes are on disk before closing UE
+        - You're in a session where ``MarkBlueprintAsModified`` was called by
+          third-party code and you want a forced save
+        - Debugging "did my changes persist?" questions
+
+    Args:
+        blueprint: Full Blueprint asset path.
+
+    Returns:
+        On success: ``{"ok": True, "blueprint": "...", "package": "...", "saved": True}``
+        The ``saved`` boolean reflects ``UEditorAssetLibrary::SaveAsset``'s return value.
+        If False, check UE Output Log — typically means the package is read-only or
+        source-control checked out by another user.
+    """
+    if not blueprint:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "save_blueprint", "blueprint": blueprint})
+
+
+@mcp.tool()
+def add_event_dispatcher(
+    blueprint: str,
+    dispatcher_name: str,
+    params: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Create an event dispatcher (multicast delegate) on a Blueprint — v7.6.
+
+    Editor equivalent: "Event Dispatchers" panel → "+". The dispatcher becomes
+    available as a delegate property on instances of this BP; other BPs (or this
+    BP itself) can call it (``add_call_dispatcher``), bind to it
+    (``add_bind_dispatcher``), or unbind (``add_unbind_dispatcher``).
+
+    Params use the same syntax as ``add_custom_event``::
+
+        params=[
+            {"name": "Damage", "type": "float"},
+            {"name": "Source", "type": "object:Actor"},
+        ]
+
+    When binding a custom event to this dispatcher, the custom event's parameter
+    list MUST match this signature exactly (name + order + types).
+
+    Args:
+        blueprint: BP asset path.
+        dispatcher_name: Logical name (must be unique among this BP's dispatchers).
+        params: Optional list of ``{"name", "type"}`` dicts defining the
+            multicast delegate signature.
+
+    Returns:
+        {"ok": True, "dispatcher_name": ..., "param_count": N, "saved": True}
+    """
+    if not blueprint or not dispatcher_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_event_dispatcher",
+        "blueprint": blueprint,
+        "dispatcher_name": dispatcher_name,
+    }
+    if params:
+        payload["params"] = [
+            {"name": str(p["name"]), "type": str(p["type"])}
+            for p in params
+            if "name" in p and "type" in p
+        ]
+    return _send_command(payload)
+
+
+@mcp.tool()
+def add_call_dispatcher(
+    blueprint: str,
+    dispatcher_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a ``K2Node_CallDelegate`` — broadcasts a dispatcher to all bound listeners — v7.6.
+
+    Targets a dispatcher defined on ``self`` (this BP). To call a dispatcher
+    on another actor, after creating this node connect that actor to its
+    ``self`` input pin via ``connect_pins``.
+
+    Args:
+        blueprint: BP asset path.
+        dispatcher_name: Name of the dispatcher to call (must exist on self by
+            default — created via ``add_event_dispatcher``).
+        anchor_name: Unique label.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON. Output pins include ``execute`` exec input,
+        ``then`` exec output, plus one input pin per dispatcher param.
+    """
+    if not blueprint or not dispatcher_name or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_call_dispatcher",
+        "blueprint": blueprint,
+        "dispatcher_name": dispatcher_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_bind_dispatcher(
+    blueprint: str,
+    dispatcher_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a ``K2Node_AddDelegate`` — binds a custom event to a dispatcher — v7.6.
+
+    Workflow:
+        1. ``add_event_dispatcher(name="OnDeath", params=[{...}])``
+        2. ``add_custom_event(event_name="HandleDeath", anchor_name="...",
+           params=[same signature as dispatcher])``
+        3. ``add_bind_dispatcher(dispatcher_name="OnDeath", anchor_name="bind_death")``
+        4. ``connect_pins("HandleDeath.delegate", "bind_death.Event")``
+
+    The bind node has a ``self`` input pin defaulting to the current BP. To
+    bind on a different actor, wire that actor to ``self``.
+
+    Args:
+        blueprint: BP asset path.
+        dispatcher_name: Name of the dispatcher to bind to.
+        anchor_name: Unique label.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON. Pins include ``execute``, ``then``,
+        ``self`` (input), and ``Event`` (delegate input).
+    """
+    if not blueprint or not dispatcher_name or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_bind_dispatcher",
+        "blueprint": blueprint,
+        "dispatcher_name": dispatcher_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def add_unbind_dispatcher(
+    blueprint: str,
+    dispatcher_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a ``K2Node_RemoveDelegate`` — unbinds an event from a dispatcher — v7.6.
+
+    Inverse of ``add_bind_dispatcher``. Must reference the same dispatcher +
+    event pair used at bind time.
+
+    Args:
+        blueprint: BP asset path.
+        dispatcher_name: Name of the dispatcher to unbind from.
+        anchor_name: Unique label.
+        position_x, position_y: Graph coordinates.
+
+    Returns:
+        Standard node-creation JSON.
+    """
+    if not blueprint or not dispatcher_name or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_unbind_dispatcher",
+        "blueprint": blueprint,
+        "dispatcher_name": dispatcher_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
 def get_blueprint(name: str) -> dict[str, Any]:
     """Get a snapshot of a Blueprint's current state. **Call this BEFORE writing.**
 
@@ -208,13 +721,18 @@ def add_node(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
-    """Add a `K2Node_CallFunction` node to a Blueprint's EventGraph.
+    """Add a `K2Node_CallFunction` node to a Blueprint graph.
 
     **Scope:** Use this ONLY for function-call nodes (calling existing UE/BP functions).
     For other node kinds, use the specialized tools:
         - Custom events (red nodes)        → `add_custom_event`
         - Variable get/set                  → `add_variable_get` / `add_variable_set`
+
+    **v7.7 — graph targeting**: by default, nodes go into the BP's EventGraph.
+    Pass ``graph_name="MyFunc"`` (the user-function created by ``add_function``)
+    to put the node inside that function's body graph instead.
 
     Use this after `create_blueprint`, when the user asks to "add a print node",
     "spawn a function call", etc.
@@ -227,8 +745,11 @@ def add_node(
             - Fully qualified: `K2Node_CallFunction:KismetSystemLibrary.PrintString`
         anchor_name: User-given label. **Stored as the node's comment in the editor**
             and used to reference this node in subsequent tools (set_pin_default,
-            connect_pins, ...). Must be unique within the Blueprint.
+            connect_pins, ...). Must be unique within the target graph.
         position_x, position_y: Graph position (default 0, 0).
+        graph_name: v7.7 — name of the function/macro graph to add the node to
+            (default = EventGraph). The graph must already exist (use ``add_function``
+            first for user functions).
 
     Returns:
         On success: {"ok": True, "anchor_name": "...", "node_guid": "...",
@@ -240,23 +761,26 @@ def add_node(
 
     Common errors:
         blueprint_not_found    - blueprint path doesn't exist
-        no_event_graph         - Blueprint has no UbergraphPages
+        graph_not_found        - graph_name doesn't match any graph in this BP (v7.7)
         invalid_node_type      - node_type missing the ":" separator
         unknown_function       - bare function name not in v0 whitelist
         class_not_found        - qualified ClassName doesn't resolve to a UClass
         function_not_found     - FunctionName not found on that class
         unsupported_node_class - K2NodeClass not yet supported (v0: only K2Node_CallFunction)
-        anchor_name_exists     - another node in the same EventGraph already has this anchor
+        anchor_name_exists     - another node in the same graph already has this anchor
         game_thread_timeout    - 10s deadline exceeded
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_node",
         "blueprint": blueprint,
         "node_type": node_type,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -337,6 +861,7 @@ def connect_pins(
     blueprint: str,
     from_pin: str,
     to_pin: str,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Connect two pins in a Blueprint's EventGraph.
 
@@ -382,12 +907,15 @@ def connect_pins(
         connection_failed     - schema allowed but TryCreateConnection returned false (rare)
         game_thread_timeout   - 10s deadline exceeded
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "connect_pins",
         "blueprint": blueprint,
         "from_pin": from_pin,
         "to_pin": to_pin,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -395,6 +923,7 @@ def set_pin_default(
     blueprint: str,
     pin_ref: str,
     value: str,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Set the default value of an input pin on a Blueprint node.
 
@@ -432,12 +961,15 @@ def set_pin_default(
         anchor_not_found, pin_not_found, pin_not_input,
         exec_pin_no_default, unsupported_pin_type, game_thread_timeout
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "set_pin_default",
         "blueprint": blueprint,
         "pin_ref": pin_ref,
         "value": value,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -895,6 +1427,7 @@ def add_branch(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_IfThenElse` (Branch) node — the if/else of Blueprints.
 
@@ -921,13 +1454,16 @@ def add_branch(
         connect_pins(bp, "my_branch.then",         "do_if_true.execute")
         connect_pins(bp, "my_branch.else",         "do_if_false.execute")
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_branch",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -937,6 +1473,7 @@ def add_cast(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_DynamicCast` (Cast To <Class>) node.
 
@@ -969,14 +1506,17 @@ def add_cast(
         unknown_target_class  - not in v3 whitelist + not a loaded UClass name
         anchor_name_exists    - anchor already used
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_cast",
         "blueprint": blueprint,
         "target_class": target_class,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1032,6 +1572,7 @@ def add_custom_event(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    params: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Add a `K2Node_CustomEvent` (the **red event** node) to the EventGraph.
 
@@ -1042,6 +1583,18 @@ def add_custom_event(
     Use this when the user asks to "make a custom event", "define a callback",
     or when wiring `Set Timer by Event` / delegate pins that need a target event.
 
+    **v7.5 — parameters**: pass ``params`` to add typed output pins that downstream
+    nodes can read. Param ``type`` uses the same syntax as ``add_variable``::
+
+        params=[
+            {"name": "Damage", "type": "float"},
+            {"name": "HitActor", "type": "object:Actor"},
+            {"name": "WasCrit", "type": "bool"},
+        ]
+
+    For event-dispatcher binding (v7.6), the param list MUST match the dispatcher's
+    delegate signature exactly (name + order + types).
+
     Args:
         blueprint: Full Blueprint asset path.
         event_name: The custom event's logical name (becomes its `CustomFunctionName`).
@@ -1049,23 +1602,37 @@ def add_custom_event(
         anchor_name: User-given label (visible as NodeComment). Must be unique
             across all nodes in the EventGraph.
         position_x, position_y: Graph position (default 0, 0).
+        params: Optional list of ``{"name": str, "type": str}`` dicts. Param ``type``
+            supports primitives (``bool``, ``int``, ``float``, ``string``, ``name``),
+            ``TimerHandle``, object refs (``object:Actor``), class refs (``class:Pawn``),
+            and arrays (``int[]``, ``object:Actor[]``).
 
     Returns:
         On success: {"ok": True, "anchor_name": ..., "event_name": ...,
-                     "node_guid": ..., "pins": [...], "saved": True}
+                     "node_guid": ..., "param_count": N, "pins": [...], "saved": True}
 
     Common errors:
-        anchor_name_exists   - another node already uses this anchor
-        event_name_exists    - another custom event in this BP has the same name
+        anchor_name_exists       - another node already uses this anchor
+        event_name_exists        - another custom event in this BP has the same name
+        param_arity_mismatch     - (shouldn't happen via Python; only via direct JSON)
+        unknown_param_type       - a param's ``type`` is unknown
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_custom_event",
         "blueprint": blueprint,
         "event_name": event_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if params:
+        # Normalize each param dict to ensure only name/type keys hit the wire
+        payload["params"] = [
+            {"name": str(p["name"]), "type": str(p["type"])}
+            for p in params
+            if "name" in p and "type" in p
+        ]
+    return _send_command(payload)
 
 
 @mcp.tool()

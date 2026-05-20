@@ -1319,3 +1319,910 @@ def test_spawn_actor_against_real_plugin() -> None:
     result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
     assert result["ok"] is True
     assert "actor_name" in result
+
+
+# ---------------------------------------------------------------------------
+# v7.1 — set_component_property
+# ---------------------------------------------------------------------------
+
+
+def test_set_component_property_success_object_ref() -> None:
+    """Setting StaticMesh asset (FObjectProperty) on a StaticMeshComponent template."""
+    response = (
+        b'{"ok":true,"command":"set_component_property",'
+        b'"blueprint":"/Game/BP_TargetDummy","component":"VisualMesh",'
+        b'"property":"StaticMesh","resolved_value":"/Engine/BasicShapes/Cube.Cube",'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_TargetDummy",
+            component_name="VisualMesh",
+            property_name="StaticMesh",
+            value="/Engine/BasicShapes/Cube",
+        )
+    assert r["ok"] is True
+    assert r["resolved_value"] == "/Engine/BasicShapes/Cube.Cube"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_component_property",
+        "blueprint": "/Game/BP_TargetDummy",
+        "component_name": "VisualMesh",
+        "property_name": "StaticMesh",
+        "value": "/Engine/BasicShapes/Cube",
+    }
+
+
+def test_set_component_property_success_struct_literal() -> None:
+    """Setting BoxExtent (FStructProperty / FVector) via (X=,Y=,Z=) literal."""
+    response = (
+        b'{"ok":true,"command":"set_component_property",'
+        b'"resolved_value":"(X=200,Y=200,Z=200)","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_X",
+            component_name="TriggerBox",
+            property_name="BoxExtent",
+            value="(X=200,Y=200,Z=200)",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["value"] == "(X=200,Y=200,Z=200)"
+
+
+def test_set_component_property_success_nested_path() -> None:
+    """Dot-notation: walk BodyInstance.CollisionProfileName (FStructProperty → FNameProperty)."""
+    response = (
+        b'{"ok":true,"command":"set_component_property",'
+        b'"resolved_value":"OverlapAllDynamic","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_X",
+            component_name="TriggerBox",
+            property_name="BodyInstance.CollisionProfileName",
+            value="OverlapAllDynamic",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["property_name"] == "BodyInstance.CollisionProfileName"
+
+
+def test_set_component_property_handles_property_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"set_component_property","error":"property_not_found",'
+        b'"detail":"Component VisualMesh has no property Foo"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_X",
+            component_name="VisualMesh",
+            property_name="Foo",
+            value="bar",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "property_not_found"
+
+
+def test_set_component_property_handles_component_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"set_component_property",'
+        b'"error":"component_not_found","detail":"NoSuchComponent"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_X",
+            component_name="NoSuchComponent",
+            property_name="StaticMesh",
+            value="/Engine/X",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "component_not_found"
+
+
+def test_set_component_property_local_validation_missing_args() -> None:
+    """Missing required arg short-circuits before any TCP call."""
+    r = server.set_component_property(
+        blueprint="", component_name="", property_name="", value=""
+    )
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+def test_set_component_property_empty_value_allowed() -> None:
+    """Empty value is allowed (clears object refs to None on UE side)."""
+    response = (
+        b'{"ok":true,"command":"set_component_property",'
+        b'"resolved_value":"None","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_component_property(
+            blueprint="/Game/BP_X",
+            component_name="VisualMesh",
+            property_name="StaticMesh",
+            value="",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["value"] == ""
+
+
+@pytest.mark.skip(reason="Requires UE editor + BP_TargetDummy with VisualMesh + TriggerBox")
+def test_set_component_property_against_real_plugin() -> None:
+    """Manual integration: assign Cube mesh + grow box + set collision preset."""
+    r1 = server.set_component_property(
+        blueprint="/Game/Blueprints/BP_TargetDummy",
+        component_name="VisualMesh",
+        property_name="StaticMesh",
+        value="/Engine/BasicShapes/Cube",
+    )
+    assert r1["ok"] is True
+    assert "Cube" in r1["resolved_value"]
+
+    r2 = server.set_component_property(
+        blueprint="/Game/Blueprints/BP_TargetDummy",
+        component_name="TriggerBox",
+        property_name="BoxExtent",
+        value="(X=200,Y=200,Z=200)",
+    )
+    assert r2["ok"] is True
+
+    r3 = server.set_component_property(
+        blueprint="/Game/Blueprints/BP_TargetDummy",
+        component_name="TriggerBox",
+        property_name="BodyInstance.CollisionProfileName",
+        value="OverlapAllDynamic",
+    )
+    assert r3["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# v7.2 — add_switch / add_sequence / add_make_array / add_select
+# ---------------------------------------------------------------------------
+
+
+def test_add_switch_int_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_switch","anchor_name":"my_switch",'
+        b'"switch_type":"int","node_type":"K2Node_SwitchInteger",'
+        b'"node_guid":"G","pins":[{"name":"Selection","direction":"input","type":"int"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_switch(
+            blueprint="/Game/BP_X",
+            anchor_name="my_switch",
+            switch_type="int",
+            case_count=4,
+        )
+    assert r["ok"] is True
+    assert r["node_type"] == "K2Node_SwitchInteger"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_switch"
+    assert sent_dict["switch_type"] == "int"
+    assert sent_dict["case_count"] == 4
+
+
+def test_add_switch_string_passes_case_labels() -> None:
+    response = (
+        b'{"ok":true,"command":"add_switch","anchor_name":"color_switch",'
+        b'"switch_type":"string","node_type":"K2Node_SwitchString",'
+        b'"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_switch(
+            blueprint="/Game/BP_X",
+            anchor_name="color_switch",
+            switch_type="string",
+            case_labels="red,green,blue",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["case_labels"] == "red,green,blue"
+
+
+def test_add_switch_enum_requires_enum_class() -> None:
+    """enum_class missing → server returns missing_field on UE side OR plugin returns error."""
+    response = (
+        b'{"ok":false,"command":"add_switch","error":"missing_field",'
+        b'"detail":"enum_class is required when switch_type=\\"enum\\""}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_switch(
+            blueprint="/Game/BP_X",
+            anchor_name="x",
+            switch_type="enum",
+            enum_class="",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "missing_field"
+
+
+def test_add_switch_handles_unknown_type() -> None:
+    response = (
+        b'{"ok":false,"command":"add_switch","error":"unknown_switch_type",'
+        b'"detail":"\'bool\' is not one of: int, string, name, enum"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_switch(
+            blueprint="/Game/BP_X",
+            anchor_name="x",
+            switch_type="bool",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "unknown_switch_type"
+
+
+def test_add_sequence_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_sequence","anchor_name":"after_overlap",'
+        b'"then_count":3,"node_guid":"G",'
+        b'"pins":[{"name":"execute","direction":"input","type":"exec"},'
+        b'{"name":"then_0","direction":"output","type":"exec"},'
+        b'{"name":"then_1","direction":"output","type":"exec"},'
+        b'{"name":"then_2","direction":"output","type":"exec"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_sequence(
+            blueprint="/Game/BP_X",
+            anchor_name="after_overlap",
+            then_count=3,
+        )
+    assert r["ok"] is True
+    assert r["then_count"] == 3
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_sequence"
+    assert sent_dict["then_count"] == 3
+
+
+def test_add_make_array_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_make_array","anchor_name":"vectors",'
+        b'"num_inputs":3,"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_make_array(
+            blueprint="/Game/BP_X",
+            anchor_name="vectors",
+            num_inputs=3,
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_make_array"
+    assert sent_dict["num_inputs"] == 3
+
+
+def test_add_select_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_select","anchor_name":"pick_one",'
+        b'"num_options":2,"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_select(
+            blueprint="/Game/BP_X",
+            anchor_name="pick_one",
+        )
+    assert r["ok"] is True
+    assert r["num_options"] == 2
+
+
+def test_v72_local_validation_missing_args() -> None:
+    """Each v7.2 tool short-circuits on empty required args."""
+    assert server.add_switch(blueprint="", anchor_name="", switch_type="")["error"] == "missing_argument"
+    assert server.add_sequence(blueprint="", anchor_name="")["error"] == "missing_argument"
+    assert server.add_make_array(blueprint="", anchor_name="")["error"] == "missing_argument"
+    assert server.add_select(blueprint="", anchor_name="")["error"] == "missing_argument"
+
+
+@pytest.mark.skip(reason="Requires UE editor + a BP to add nodes to")
+def test_v72_against_real_plugin() -> None:
+    """Manual integration: spawn each v7.2 node type into a fresh BP."""
+    bp = "/Game/Blueprints/BP_V72_Smoke"
+    server.create_blueprint(name="BP_V72_Smoke")
+    assert server.add_switch(blueprint=bp, anchor_name="sw", switch_type="int", case_count=3)["ok"]
+    assert server.add_sequence(blueprint=bp, anchor_name="seq", then_count=3)["ok"]
+    assert server.add_make_array(blueprint=bp, anchor_name="arr", num_inputs=3)["ok"]
+    assert server.add_select(blueprint=bp, anchor_name="sel", num_options=3)["ok"]
+    assert server.compile_blueprint(name=bp)["ok"]
+
+
+# ---------------------------------------------------------------------------
+# v7.3 — add_make_struct / add_break_struct
+# ---------------------------------------------------------------------------
+
+
+def test_add_make_struct_vector_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_make_struct","anchor_name":"mv",'
+        b'"struct_type":"Vector","node_guid":"G",'
+        b'"pins":[{"name":"X","direction":"input","type":"real"},'
+        b'{"name":"Y","direction":"input","type":"real"},'
+        b'{"name":"Z","direction":"input","type":"real"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_make_struct(
+            blueprint="/Game/BP_X", anchor_name="mv", struct_type="Vector"
+        )
+    assert r["ok"] is True
+    assert r["struct_type"] == "Vector"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_make_struct",
+        "blueprint": "/Game/BP_X",
+        "struct_type": "Vector",
+        "anchor_name": "mv",
+        "position_x": 0,
+        "position_y": 0,
+    }
+
+
+def test_add_make_struct_handles_unknown_struct() -> None:
+    response = (
+        b'{"ok":false,"command":"add_make_struct","error":"unknown_struct_type",'
+        b'"detail":"NotAStruct"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_make_struct(
+            blueprint="/Game/BP_X", anchor_name="x", struct_type="NotAStruct"
+        )
+    assert r["ok"] is False
+    assert r["error"] == "unknown_struct_type"
+
+
+def test_add_break_struct_hit_result_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_break_struct","anchor_name":"bh",'
+        b'"struct_type":"HitResult","node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_break_struct(
+            blueprint="/Game/BP_X", anchor_name="bh", struct_type="HitResult"
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_break_struct"
+    assert sent_dict["struct_type"] == "HitResult"
+
+
+def test_v73_qualified_path_struct_type() -> None:
+    """Qualified path is passed through as struct_type."""
+    response = (
+        b'{"ok":true,"command":"add_make_struct","anchor_name":"x",'
+        b'"struct_type":"Transform","node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_make_struct(
+            blueprint="/Game/BP_X", anchor_name="x",
+            struct_type="/Script/CoreUObject.Transform",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["struct_type"] == "/Script/CoreUObject.Transform"
+
+
+def test_v73_local_validation_missing_args() -> None:
+    assert server.add_make_struct(blueprint="", anchor_name="", struct_type="")["error"] == "missing_argument"
+    assert server.add_break_struct(blueprint="", anchor_name="", struct_type="")["error"] == "missing_argument"
+
+
+# ---------------------------------------------------------------------------
+# v7.4 — Object/Class ref variable types (extends add_variable)
+# ---------------------------------------------------------------------------
+
+
+def test_add_variable_object_ref_actor() -> None:
+    """variable_type='object:Actor' → PC_Object with AActor subcategory."""
+    response = (
+        b'{"ok":true,"command":"add_variable","variable_name":"Target",'
+        b'"variable_type":"object:Actor","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable(
+            blueprint="/Game/BP_X", name="Target", variable_type="object:Actor"
+        )
+    assert r["ok"] is True
+    assert r["variable_type"] == "object:Actor"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["variable_type"] == "object:Actor"
+
+
+def test_add_variable_class_ref_pawn() -> None:
+    """variable_type='class:Pawn' → PC_Class with APawn subcategory."""
+    response = (
+        b'{"ok":true,"command":"add_variable","variable_name":"SpawnClass",'
+        b'"variable_type":"class:Pawn","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable(
+            blueprint="/Game/BP_X", name="SpawnClass", variable_type="class:Pawn"
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["variable_type"] == "class:Pawn"
+
+
+def test_add_variable_object_ref_array() -> None:
+    """variable_type='object:Actor[]' → TArray<AActor*>."""
+    response = (
+        b'{"ok":true,"command":"add_variable","variable_name":"Targets",'
+        b'"variable_type":"object:Actor[]","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable(
+            blueprint="/Game/BP_X", name="Targets", variable_type="object:Actor[]"
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["variable_type"] == "object:Actor[]"
+
+
+def test_add_variable_object_ref_handles_unknown_class() -> None:
+    """object:NotARealClass → server returns unknown_variable_type."""
+    response = (
+        b'{"ok":false,"command":"add_variable","error":"unknown_variable_type",'
+        b'"detail":"object:NotARealClass"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_variable(
+            blueprint="/Game/BP_X", name="X", variable_type="object:NotARealClass"
+        )
+    assert r["ok"] is False
+    assert r["error"] == "unknown_variable_type"
+
+
+@pytest.mark.skip(reason="Requires UE editor + a BP")
+def test_v74_object_ref_against_real_plugin() -> None:
+    """Manual integration: add Actor ref + Pawn class ref vars to a BP."""
+    bp = "/Game/Blueprints/BP_V74_Smoke"
+    server.create_blueprint(name="BP_V74_Smoke")
+    assert server.add_variable(blueprint=bp, name="Target", variable_type="object:Actor")["ok"]
+    assert server.add_variable(blueprint=bp, name="SpawnClass", variable_type="class:Pawn")["ok"]
+    assert server.compile_blueprint(name=bp)["ok"]
+
+
+# ---------------------------------------------------------------------------
+# v7.5 — Custom event parameters (extends add_custom_event)
+# ---------------------------------------------------------------------------
+
+
+def test_add_custom_event_with_params() -> None:
+    """params list is forwarded as JSON array."""
+    response = (
+        b'{"ok":true,"command":"add_custom_event","anchor_name":"on_hit",'
+        b'"event_name":"OnHit","node_guid":"G","param_count":2,'
+        b'"pins":[{"name":"then","direction":"output","type":"exec"},'
+        b'{"name":"Damage","direction":"output","type":"real"},'
+        b'{"name":"HitActor","direction":"output","type":"object"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_custom_event(
+            blueprint="/Game/BP_X",
+            event_name="OnHit",
+            anchor_name="on_hit",
+            params=[
+                {"name": "Damage", "type": "float"},
+                {"name": "HitActor", "type": "object:Actor"},
+            ],
+        )
+    assert r["ok"] is True
+    assert r["param_count"] == 2
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["params"] == [
+        {"name": "Damage", "type": "float"},
+        {"name": "HitActor", "type": "object:Actor"},
+    ]
+
+
+def test_add_custom_event_no_params_omits_field() -> None:
+    """params=None should NOT add 'params' to the payload."""
+    response = b'{"ok":true,"command":"add_custom_event","param_count":0,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_custom_event(
+            blueprint="/Game/BP_X", event_name="Foo", anchor_name="x"
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "params" not in sent_dict
+
+
+def test_add_custom_event_handles_unknown_param_type() -> None:
+    response = (
+        b'{"ok":false,"command":"add_custom_event","error":"unknown_param_type",'
+        b'"detail":"param \'X\' has unknown type \'WeirdType\'"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_custom_event(
+            blueprint="/Game/BP_X", event_name="Foo", anchor_name="x",
+            params=[{"name": "X", "type": "WeirdType"}],
+        )
+    assert r["ok"] is False
+    assert r["error"] == "unknown_param_type"
+
+
+def test_add_custom_event_params_filters_malformed() -> None:
+    """Params missing 'name' or 'type' are silently dropped."""
+    response = b'{"ok":true,"param_count":1,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_custom_event(
+            blueprint="/Game/BP_X", event_name="Foo", anchor_name="x",
+            params=[
+                {"name": "Valid", "type": "int"},
+                {"name": "MissingType"},          # dropped
+                {"type": "float"},                # dropped
+                {"weird": "key"},                 # dropped
+            ],
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert len(sent_dict["params"]) == 1
+    assert sent_dict["params"][0]["name"] == "Valid"
+
+
+# ---------------------------------------------------------------------------
+# v7.6 — event dispatchers (add / call / bind / unbind)
+# ---------------------------------------------------------------------------
+
+
+def test_add_event_dispatcher_with_params() -> None:
+    response = (
+        b'{"ok":true,"command":"add_event_dispatcher","dispatcher_name":"OnDeath",'
+        b'"param_count":2,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_event_dispatcher(
+            blueprint="/Game/BP_X",
+            dispatcher_name="OnDeath",
+            params=[
+                {"name": "Damage", "type": "float"},
+                {"name": "Source", "type": "object:Actor"},
+            ],
+        )
+    assert r["ok"] is True
+    assert r["param_count"] == 2
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_event_dispatcher"
+    assert sent_dict["dispatcher_name"] == "OnDeath"
+    assert sent_dict["params"] == [
+        {"name": "Damage", "type": "float"},
+        {"name": "Source", "type": "object:Actor"},
+    ]
+
+
+def test_add_event_dispatcher_paramless() -> None:
+    response = (
+        b'{"ok":true,"command":"add_event_dispatcher","dispatcher_name":"OnPing",'
+        b'"param_count":0,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_event_dispatcher(
+            blueprint="/Game/BP_X", dispatcher_name="OnPing"
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "params" not in sent_dict
+
+
+def test_add_event_dispatcher_handles_duplicate() -> None:
+    response = (
+        b'{"ok":false,"command":"add_event_dispatcher","error":"dispatcher_exists",'
+        b'"detail":"OnDeath"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_event_dispatcher(blueprint="/Game/BP_X", dispatcher_name="OnDeath")
+    assert r["ok"] is False
+    assert r["error"] == "dispatcher_exists"
+
+
+def test_add_call_dispatcher_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_call_dispatcher","anchor_name":"broadcast_death",'
+        b'"dispatcher_name":"OnDeath","node_type":"K2Node_CallDelegate",'
+        b'"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_call_dispatcher(
+            blueprint="/Game/BP_X",
+            dispatcher_name="OnDeath",
+            anchor_name="broadcast_death",
+        )
+    assert r["ok"] is True
+    assert r["node_type"] == "K2Node_CallDelegate"
+
+
+def test_add_bind_dispatcher_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_bind_dispatcher","anchor_name":"bind_death",'
+        b'"dispatcher_name":"OnDeath","node_type":"K2Node_AddDelegate",'
+        b'"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_bind_dispatcher(
+            blueprint="/Game/BP_X",
+            dispatcher_name="OnDeath",
+            anchor_name="bind_death",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_bind_dispatcher"
+
+
+def test_add_unbind_dispatcher_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_unbind_dispatcher","node_type":"K2Node_RemoveDelegate",'
+        b'"node_guid":"G","pins":[],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_unbind_dispatcher(
+            blueprint="/Game/BP_X",
+            dispatcher_name="OnDeath",
+            anchor_name="unbind_death",
+        )
+    assert r["ok"] is True
+    assert r["node_type"] == "K2Node_RemoveDelegate"
+
+
+def test_v76_local_validation_missing_args() -> None:
+    assert server.add_event_dispatcher(blueprint="", dispatcher_name="")["error"] == "missing_argument"
+    assert server.add_call_dispatcher(blueprint="", dispatcher_name="", anchor_name="")["error"] == "missing_argument"
+    assert server.add_bind_dispatcher(blueprint="", dispatcher_name="", anchor_name="")["error"] == "missing_argument"
+    assert server.add_unbind_dispatcher(blueprint="", dispatcher_name="", anchor_name="")["error"] == "missing_argument"
+
+
+@pytest.mark.skip(reason="Requires UE editor + BP with event dispatcher pattern")
+def test_v76_full_dispatcher_loop_against_real_plugin() -> None:
+    """Manual integration: define dispatcher, custom event matching it, bind+call+unbind."""
+    bp = "/Game/Blueprints/BP_V76_Dispatcher"
+    server.create_blueprint(name="BP_V76_Dispatcher")
+    assert server.add_event_dispatcher(
+        blueprint=bp, dispatcher_name="OnDeath",
+        params=[{"name": "Damage", "type": "float"}],
+    )["ok"]
+    assert server.add_custom_event(
+        blueprint=bp, event_name="HandleDeath", anchor_name="handle_death",
+        params=[{"name": "Damage", "type": "float"}],
+    )["ok"]
+    assert server.add_bind_dispatcher(blueprint=bp, dispatcher_name="OnDeath", anchor_name="bind_death")["ok"]
+    assert server.add_call_dispatcher(blueprint=bp, dispatcher_name="OnDeath", anchor_name="broadcast_death")["ok"]
+    assert server.compile_blueprint(name=bp)["ok"]
+
+
+# ---------------------------------------------------------------------------
+# v7.7 — graph_name parameter on add_node / connect_pins / set_pin_default /
+#        add_branch / add_cast (function-body editing)
+# ---------------------------------------------------------------------------
+
+
+def test_add_node_with_graph_name() -> None:
+    """graph_name='MyFunc' routes to the function graph."""
+    response = b'{"ok":true,"command":"add_node","anchor_name":"print_x","saved":true,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_node(
+            blueprint="/Game/BP_X",
+            node_type="PrintString",
+            anchor_name="print_x",
+            graph_name="MyFunc",
+        )
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_add_node_without_graph_name_omits_field() -> None:
+    """graph_name='' (default) should NOT add the field to the payload."""
+    response = b'{"ok":true,"command":"add_node","saved":true,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_node(blueprint="/Game/BP_X", node_type="PrintString", anchor_name="x")
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "graph_name" not in sent_dict
+
+
+def test_connect_pins_with_graph_name() -> None:
+    response = b'{"ok":true,"command":"connect_pins","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.connect_pins(
+            blueprint="/Game/BP_X",
+            from_pin="a.then",
+            to_pin="b.execute",
+            graph_name="MyFunc",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_set_pin_default_with_graph_name() -> None:
+    response = b'{"ok":true,"command":"set_pin_default","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.set_pin_default(
+            blueprint="/Game/BP_X",
+            pin_ref="print_x.InString",
+            value="hello from func",
+            graph_name="MyFunc",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_add_branch_with_graph_name() -> None:
+    response = b'{"ok":true,"command":"add_branch","saved":true,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_branch(
+            blueprint="/Game/BP_X",
+            anchor_name="check",
+            graph_name="ComputeDamage",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "ComputeDamage"
+
+
+def test_add_cast_with_graph_name() -> None:
+    response = b'{"ok":true,"command":"add_cast","saved":true,"pins":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_cast(
+            blueprint="/Game/BP_X",
+            target_class="Pawn",
+            anchor_name="cast_pawn",
+            graph_name="HandleHit",
+        )
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "HandleHit"
+
+
+def test_add_node_handles_graph_not_found() -> None:
+    """graph_not_found error is propagated."""
+    response = (
+        b'{"ok":false,"command":"add_node","error":"graph_not_found",'
+        b'"detail":"NoSuchFunc"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_node(
+            blueprint="/Game/BP_X",
+            node_type="PrintString",
+            anchor_name="x",
+            graph_name="NoSuchFunc",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "graph_not_found"
+
+
+@pytest.mark.skip(reason="Requires UE editor + BP with a user function 'MyFunc'")
+def test_v77_function_body_against_real_plugin() -> None:
+    """Manual integration: add_function then write nodes inside its graph."""
+    bp = "/Game/Blueprints/BP_V77_FuncBody"
+    server.create_blueprint(name="BP_V77_FuncBody")
+    assert server.add_function(blueprint=bp, name="MyFunc")["ok"]
+    # All graph-writing tools below route into MyFunc, not EventGraph
+    assert server.add_node(
+        blueprint=bp, node_type="PrintString",
+        anchor_name="print_in_func", graph_name="MyFunc",
+    )["ok"]
+    assert server.set_pin_default(
+        blueprint=bp, pin_ref="print_in_func.InString",
+        value="hello from inside MyFunc", graph_name="MyFunc",
+    )["ok"]
+    assert server.compile_blueprint(name=bp)["ok"]
+
+
+# ---------------------------------------------------------------------------
+# v7.8 — save_blueprint
+# ---------------------------------------------------------------------------
+
+
+def test_save_blueprint_success() -> None:
+    response = (
+        b'{"ok":true,"command":"save_blueprint","blueprint":"/Game/BP_X",'
+        b'"package":"/Game/BP_X","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.save_blueprint(blueprint="/Game/BP_X")
+    assert r["ok"] is True
+    assert r["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "save_blueprint", "blueprint": "/Game/BP_X"}
+
+
+def test_save_blueprint_handles_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"save_blueprint","error":"blueprint_not_found",'
+        b'"detail":"/Game/NoSuchBP"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.save_blueprint(blueprint="/Game/NoSuchBP")
+    assert r["ok"] is False
+    assert r["error"] == "blueprint_not_found"
+
+
+def test_save_blueprint_local_validation_missing_arg() -> None:
+    r = server.save_blueprint(blueprint="")
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+@pytest.mark.skip(reason="Requires UE editor + a modified BP")
+def test_save_blueprint_against_real_plugin() -> None:
+    r = server.save_blueprint(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
+    assert r["ok"] is True
+    assert r["saved"] is True

@@ -106,6 +106,29 @@
 // We call the BP function directly to avoid depending on the (non-exported) K2Node.
 #include "Subsystems/SubsystemBlueprintLibrary.h"
 
+// v7.1 — set_component_property (FProperty reflection for component template defaults)
+#include "UObject/UnrealType.h"        // FObjectProperty / FStructProperty / FClassProperty
+
+// v7.2 — switch / sequence / make_array / select K2Nodes
+#include "K2Node_Switch.h"
+#include "K2Node_SwitchInteger.h"
+#include "K2Node_SwitchString.h"
+#include "K2Node_SwitchName.h"
+#include "K2Node_SwitchEnum.h"
+#include "K2Node_ExecutionSequence.h"
+#include "K2Node_MakeArray.h"
+#include "K2Node_Select.h"
+
+// v7.3 — make_struct / break_struct
+#include "K2Node_MakeStruct.h"
+#include "K2Node_BreakStruct.h"
+
+// v7.6 — event dispatchers (multicast delegates)
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_CallDelegate.h"
+#include "K2Node_AddDelegate.h"
+#include "K2Node_RemoveDelegate.h"
+
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
 
 namespace
@@ -115,6 +138,47 @@ namespace
     // (C++ requires either forward decl or definition-before-use.)
     FString FormatStructDefault(UScriptStruct* StructType, const FString& UserInput);
     bool IsSupportedStructForDefault(UScriptStruct* StructType);
+    // v7.4: ResolveVariablePinType uses ResolveCastTargetClass for object/class ref types,
+    // but the latter is defined further down. Forward-declare here.
+    UClass* ResolveCastTargetClass(const FString& Name);
+
+    /**
+     * v7.7: Resolve which graph a graph-writing tool should target.
+     * Empty GraphName → EventGraph (Blueprint->UbergraphPages[0]).
+     * Otherwise look up by FName in FunctionGraphs / MacroGraphs / UbergraphPages.
+     * Returns nullptr if not found.
+     */
+    UEdGraph* ResolveTargetGraph(UBlueprint* Blueprint, const FString& GraphName)
+    {
+        if (Blueprint == nullptr) return nullptr;
+        if (GraphName.IsEmpty() || GraphName.Equals(TEXT("EventGraph"), ESearchCase::IgnoreCase))
+        {
+            return (Blueprint->UbergraphPages.Num() > 0) ? Blueprint->UbergraphPages[0] : nullptr;
+        }
+        const FName Name(*GraphName);
+        for (UEdGraph* G : Blueprint->FunctionGraphs)
+        {
+            if (G != nullptr && G->GetFName() == Name) return G;
+        }
+        for (UEdGraph* G : Blueprint->MacroGraphs)
+        {
+            if (G != nullptr && G->GetFName() == Name) return G;
+        }
+        for (UEdGraph* G : Blueprint->UbergraphPages)
+        {
+            if (G != nullptr && G->GetFName() == Name) return G;
+        }
+        return nullptr;
+    }
+
+    /** v7.7 helper: build the standard "graph_not_found" JSON error for a tool. */
+    FString JsonGraphNotFound(const TCHAR* CmdName, const FString& GraphName)
+    {
+        return JsonError(CmdName, TEXT("graph_not_found"),
+            GraphName.IsEmpty()
+                ? FString(TEXT("EventGraph (Blueprint has no UbergraphPages)"))
+                : GraphName);
+    }
 
     constexpr int32 kReceiveBufferSize = 8192;
     constexpr int32 kGameThreadTimeoutSeconds = 10;
@@ -280,17 +344,38 @@ namespace
         return Result;
     }
 
-    /** Build an FEdGraphPinType for a user-friendly variable type key. v1+v5 whitelist. */
+    /** Build an FEdGraphPinType for a user-friendly variable type key. v1+v5+v7.4 whitelist. */
     bool ResolveVariablePinType(const FString& TypeKey, FEdGraphPinType& OutType)
     {
         OutType = FEdGraphPinType();
 
-        // v5: array types — "int[]" / "float[]" / "string[]" / "bool[]" / "name[]"
+        // v5: array types — "int[]" / "float[]" / "string[]" / "bool[]" / "name[]" / "object:Actor[]"
         FString BaseType = TypeKey;
         if (BaseType.EndsWith(TEXT("[]")))
         {
             BaseType = BaseType.LeftChop(2);  // strip "[]"
             OutType.ContainerType = EPinContainerType::Array;
+        }
+
+        // v7.4: object reference types — "object:Actor", "object:/Script/Engine.Pawn", "object:BP_X"
+        if (BaseType.StartsWith(TEXT("object:"), ESearchCase::IgnoreCase))
+        {
+            const FString ClassName = BaseType.Mid(7);  // strip "object:"
+            UClass* TargetClass = ResolveCastTargetClass(ClassName);
+            if (TargetClass == nullptr) return false;
+            OutType.PinCategory = UEdGraphSchema_K2::PC_Object;
+            OutType.PinSubCategoryObject = TargetClass;
+            return true;
+        }
+        // v7.4: class reference types — "class:Actor", "class:/Script/Engine.Pawn"
+        if (BaseType.StartsWith(TEXT("class:"), ESearchCase::IgnoreCase))
+        {
+            const FString ClassName = BaseType.Mid(6);  // strip "class:"
+            UClass* TargetClass = ResolveCastTargetClass(ClassName);
+            if (TargetClass == nullptr) return false;
+            OutType.PinCategory = UEdGraphSchema_K2::PC_Class;
+            OutType.PinSubCategoryObject = TargetClass;
+            return true;
         }
 
         if (BaseType.Equals(TEXT("bool"), ESearchCase::IgnoreCase))
@@ -365,7 +450,8 @@ namespace
     }
 
     /**
-     * Add a node to a Blueprint's EventGraph. MUST run on the game thread.
+     * Add a node to a Blueprint graph. MUST run on the game thread.
+     * v7.7: defaults to EventGraph; pass GraphName="MyFunc" to target a function graph.
      * Returns a complete JSON response line (with trailing \n).
      */
     FString AddNodeOnGameThread(
@@ -373,7 +459,8 @@ namespace
         const FString& NodeType,
         const FString& AnchorName,
         int32 PosX,
-        int32 PosY)
+        int32 PosY,
+        const FString& GraphName = FString())   // v7.7: optional target graph
     {
         check(IsInGameThread());
 
@@ -384,12 +471,12 @@ namespace
             return JsonError(TEXT("add_node"), TEXT("blueprint_not_found"), BlueprintPath);
         }
 
-        // 2. Get EventGraph (first ubergraph page is "EventGraph" by convention)
-        if (Blueprint->UbergraphPages.Num() == 0)
+        // 2. Resolve target graph (EventGraph or function/macro graph)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("add_node"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("add_node"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         // 3. Check anchor_name uniqueness within this graph
         for (const UEdGraphNode* Existing : EventGraph->Nodes)
@@ -698,7 +785,8 @@ namespace
     FString SetPinDefaultOnGameThread(
         const FString& BlueprintPath,
         const FString& PinRef,        // "<anchor_name>.<pin_name>"
-        const FString& Value)
+        const FString& Value,
+        const FString& GraphName = FString())   // v7.7
     {
         check(IsInGameThread());
 
@@ -709,12 +797,12 @@ namespace
             return JsonError(TEXT("set_pin_default"), TEXT("blueprint_not_found"), BlueprintPath);
         }
 
-        // 2. Get EventGraph
-        if (Blueprint->UbergraphPages.Num() == 0)
+        // 2. Resolve target graph (v7.7: EventGraph by default, named function/macro graph if requested)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("set_pin_default"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("set_pin_default"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         // 3. Parse pin_ref: "anchor.pin"
         FString AnchorName, PinName;
@@ -898,13 +986,238 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
-    // ===== Spike B8 — add_custom_event =====
+    // ===== v7.1 — set_component_property (FProperty reflection) =====
+
+    /**
+     * Walk a dot-separated property path on a UStruct/UObject container.
+     * Returns the leaf FProperty + sets OutValuePtr to its storage location.
+     *
+     * Examples:
+     *   "StaticMesh"                        → top-level FObjectProperty
+     *   "BoxExtent"                         → top-level FStructProperty (FVector)
+     *   "BodyInstance.CollisionProfileName" → nested FNameProperty inside FBodyInstance
+     *
+     * Returns nullptr if any token doesn't resolve or a mid-path token isn't a struct.
+     */
+    FProperty* WalkPropertyPath(
+        UStruct* RootStruct,
+        void* RootContainer,
+        const FString& PropertyPath,
+        void*& OutValuePtr)
+    {
+        OutValuePtr = nullptr;
+        TArray<FString> Tokens;
+        PropertyPath.ParseIntoArray(Tokens, TEXT("."), /*InCullEmpty*/ true);
+        if (Tokens.Num() == 0 || RootStruct == nullptr || RootContainer == nullptr)
+        {
+            return nullptr;
+        }
+
+        UStruct* CurrentStruct = RootStruct;
+        void* CurrentContainer = RootContainer;
+
+        for (int32 i = 0; i < Tokens.Num(); ++i)
+        {
+            FProperty* Prop = FindFProperty<FProperty>(CurrentStruct, *Tokens[i]);
+            if (Prop == nullptr) return nullptr;
+
+            if (i == Tokens.Num() - 1)
+            {
+                OutValuePtr = Prop->ContainerPtrToValuePtr<void>(CurrentContainer);
+                return Prop;
+            }
+
+            // Intermediate token must be a struct field — descend into it
+            FStructProperty* StructProp = CastField<FStructProperty>(Prop);
+            if (StructProp == nullptr) return nullptr;
+            CurrentContainer = Prop->ContainerPtrToValuePtr<void>(CurrentContainer);
+            CurrentStruct = StructProp->Struct;
+        }
+        return nullptr;
+    }
+
+    /**
+     * Set a property on a component's template instance via reflection.
+     * Dispatches by FProperty subclass:
+     *   - FObjectProperty (StaticMesh, Material, …) → LoadObject + class check + SetObjectPropertyValue
+     *   - FClassProperty  (TSubclassOf<X>)          → LoadObject<UClass> + meta-class check
+     *   - everything else (struct/primitive/FName/enum/bool/FString) → ImportText_Direct
+     *
+     * For known structs (Vector/Rotator/Color), value is pre-normalized through
+     * FormatStructDefault so users can pass shorthand "200,200,200".
+     */
+    FString SetComponentPropertyOnGameThread(
+        const FString& BlueprintPath,
+        const FString& ComponentName,
+        const FString& PropertyPath,
+        const FString& Value)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_component_property");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+        {
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        }
+        if (Blueprint->ParentClass == nullptr || !Blueprint->ParentClass->IsChildOf(AActor::StaticClass()))
+        {
+            return JsonError(CmdName, TEXT("parent_not_actor"),
+                TEXT("Component properties require an Actor-derived Blueprint"));
+        }
+
+        USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+        if (SCS == nullptr)
+        {
+            return JsonError(CmdName, TEXT("no_scs"), BlueprintPath);
+        }
+
+        const FName ComponentFName(*ComponentName);
+        USCS_Node* SCSNode = SCS->FindSCSNode(ComponentFName);
+        if (SCSNode == nullptr)
+        {
+            return JsonError(CmdName, TEXT("component_not_found"), ComponentName);
+        }
+
+        UActorComponent* Template = SCSNode->ComponentTemplate;
+        if (Template == nullptr)
+        {
+            return JsonError(CmdName, TEXT("no_component_template"), ComponentName);
+        }
+
+        void* ValuePtr = nullptr;
+        FProperty* LeafProp = WalkPropertyPath(Template->GetClass(), Template, PropertyPath, ValuePtr);
+        if (LeafProp == nullptr || ValuePtr == nullptr)
+        {
+            return JsonError(CmdName, TEXT("property_not_found"),
+                FString::Printf(TEXT("Component '%s' (class %s) has no property '%s'"),
+                    *ComponentName, *Template->GetClass()->GetName(), *PropertyPath));
+        }
+
+        Template->PreEditChange(LeafProp);
+
+        FString ResolvedValueStr;
+        FString ErrorDetail;
+        bool bSuccess = false;
+
+        // --- Object / asset reference (FObjectProperty) ---
+        if (FObjectProperty* ObjProp = CastField<FObjectProperty>(LeafProp))
+        {
+            UObject* Asset = nullptr;
+            const bool bClear = Value.IsEmpty()
+                || Value.Equals(TEXT("None"), ESearchCase::IgnoreCase)
+                || Value.Equals(TEXT("null"), ESearchCase::IgnoreCase);
+            if (!bClear)
+            {
+                Asset = LoadObject<UObject>(nullptr, *Value);
+                if (Asset == nullptr)
+                {
+                    ErrorDetail = FString::Printf(TEXT("Asset not found: %s"), *Value);
+                }
+                else if (!Asset->IsA(ObjProp->PropertyClass))
+                {
+                    ErrorDetail = FString::Printf(
+                        TEXT("Asset '%s' is %s but property expects %s"),
+                        *Value, *Asset->GetClass()->GetName(),
+                        *ObjProp->PropertyClass->GetName());
+                    Asset = nullptr;
+                }
+            }
+            if (ErrorDetail.IsEmpty())
+            {
+                ObjProp->SetObjectPropertyValue(ValuePtr, Asset);
+                ResolvedValueStr = (Asset != nullptr) ? Asset->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        // --- Class reference (FClassProperty / TSubclassOf<X>) ---
+        else if (FClassProperty* ClassProp = CastField<FClassProperty>(LeafProp))
+        {
+            UClass* Class = nullptr;
+            const bool bClear = Value.IsEmpty()
+                || Value.Equals(TEXT("None"), ESearchCase::IgnoreCase)
+                || Value.Equals(TEXT("null"), ESearchCase::IgnoreCase);
+            if (!bClear)
+            {
+                Class = LoadObject<UClass>(nullptr, *Value);
+                if (Class == nullptr)
+                {
+                    ErrorDetail = FString::Printf(TEXT("Class not found: %s"), *Value);
+                }
+                else if (ClassProp->MetaClass != nullptr && !Class->IsChildOf(ClassProp->MetaClass))
+                {
+                    ErrorDetail = FString::Printf(
+                        TEXT("Class '%s' is not a subclass of %s"),
+                        *Value, *ClassProp->MetaClass->GetName());
+                    Class = nullptr;
+                }
+            }
+            if (ErrorDetail.IsEmpty())
+            {
+                ClassProp->SetObjectPropertyValue(ValuePtr, Class);
+                ResolvedValueStr = (Class != nullptr) ? Class->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        // --- Struct / primitive / FName / enum / bool / FString — use ImportText_Direct ---
+        // For known structs (Vector/Rotator/Color), normalize shorthand "1,2,3" → "(X=1,Y=2,Z=3)" first.
+        else
+        {
+            FString NormalizedValue = Value;
+            if (FStructProperty* StructProp = CastField<FStructProperty>(LeafProp))
+            {
+                if (IsSupportedStructForDefault(StructProp->Struct))
+                {
+                    NormalizedValue = FormatStructDefault(StructProp->Struct, Value);
+                }
+            }
+
+            const TCHAR* Buffer = *NormalizedValue;
+            const TCHAR* Result = LeafProp->ImportText_Direct(
+                Buffer, ValuePtr, /*OwnerObject*/ Template, PPF_None);
+
+            if (Result == nullptr)
+            {
+                ErrorDetail = FString::Printf(
+                    TEXT("Failed to parse value '%s' for property '%s' (type %s)"),
+                    *NormalizedValue, *PropertyPath, *LeafProp->GetClass()->GetName());
+            }
+            else
+            {
+                ResolvedValueStr = NormalizedValue;
+                bSuccess = true;
+            }
+        }
+
+        if (!bSuccess)
+        {
+            return JsonError(CmdName, TEXT("set_failed"), ErrorDetail);
+        }
+
+        FPropertyChangedEvent ChangeEvent(LeafProp, EPropertyChangeType::ValueSet);
+        Template->PostEditChangeProperty(ChangeEvent);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_component_property\",\"blueprint\":%s,\"component\":%s,\"property\":%s,\"resolved_value\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(BlueprintPath),
+            *EscapeJsonString(ComponentName),
+            *EscapeJsonString(PropertyPath),
+            *EscapeJsonString(ResolvedValueStr),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== Spike B8 — add_custom_event (v7.5: with optional parameters) =====
 
     FString AddCustomEventOnGameThread(
         const FString& BlueprintPath,
         const FString& EventName,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const TArray<FString>& ParamNames,    // v7.5: parallel arrays of param specs
+        const TArray<FString>& ParamTypes)
     {
         check(IsInGameThread());
 
@@ -938,6 +1251,26 @@ namespace
             }
         }
 
+        // v7.5: pre-validate all param types BEFORE creating the node so we can fail cleanly
+        if (ParamNames.Num() != ParamTypes.Num())
+        {
+            return JsonError(TEXT("add_custom_event"), TEXT("param_arity_mismatch"),
+                FString::Printf(TEXT("params: %d names but %d types"), ParamNames.Num(), ParamTypes.Num()));
+        }
+        TArray<FEdGraphPinType> ResolvedParamTypes;
+        ResolvedParamTypes.Reserve(ParamNames.Num());
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            FEdGraphPinType PinType;
+            if (!ResolveVariablePinType(ParamTypes[i], PinType))
+            {
+                return JsonError(TEXT("add_custom_event"), TEXT("unknown_param_type"),
+                    FString::Printf(TEXT("param '%s' has unknown type '%s'"),
+                        *ParamNames[i], *ParamTypes[i]));
+            }
+            ResolvedParamTypes.Add(PinType);
+        }
+
         UK2Node_CustomEvent* NewNode = NewObject<UK2Node_CustomEvent>(EventGraph);
         NewNode->SetFlags(RF_Transactional);
         NewNode->CustomFunctionName = EventFName;
@@ -951,6 +1284,15 @@ namespace
         NewNode->PostPlacedNewNode();
         NewNode->AllocateDefaultPins();
 
+        // v7.5: add user-defined parameter pins. For CustomEvent, params are OUTPUT pins
+        // (the event emits param values into the graph). CreateUserDefinedPin both adds to
+        // UserDefinedPins TArray AND creates the actual UEdGraphPin in one call.
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            const FName ParamFName(*ParamNames[i]);
+            NewNode->CreateUserDefinedPin(ParamFName, ResolvedParamTypes[i], EGPD_Output, /*bUseUniqueName*/ false);
+        }
+
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
@@ -958,10 +1300,11 @@ namespace
         const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_custom_event\",\"anchor_name\":%s,\"event_name\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_custom_event\",\"anchor_name\":%s,\"event_name\":%s,\"node_guid\":%s,\"param_count\":%d,\"pins\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName),
             *EscapeJsonString(EventName),
             *EscapeJsonString(GuidStr),
+            ParamNames.Num(),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
     }
@@ -1977,7 +2320,8 @@ namespace
     FString AddBranchOnGameThread(
         const FString& BlueprintPath,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7
     {
         check(IsInGameThread());
 
@@ -1986,11 +2330,11 @@ namespace
         {
             return JsonError(TEXT("add_branch"), TEXT("blueprint_not_found"), BlueprintPath);
         }
-        if (Blueprint->UbergraphPages.Num() == 0)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("add_branch"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("add_branch"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
         {
@@ -2029,7 +2373,8 @@ namespace
         const FString& BlueprintPath,
         const FString& TargetClassStr,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7
     {
         check(IsInGameThread());
 
@@ -2038,11 +2383,11 @@ namespace
         {
             return JsonError(TEXT("add_cast"), TEXT("blueprint_not_found"), BlueprintPath);
         }
-        if (Blueprint->UbergraphPages.Num() == 0)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("add_cast"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("add_cast"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
         {
@@ -2502,21 +2847,22 @@ namespace
     FString ConnectPinsOnGameThread(
         const FString& BlueprintPath,
         const FString& FromPinRef,
-        const FString& ToPinRef)
+        const FString& ToPinRef,
+        const FString& GraphName = FString())   // v7.7
     {
         check(IsInGameThread());
 
-        // 1. Load BP + EventGraph
+        // 1. Load BP + target graph (v7.7)
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr)
         {
             return JsonError(TEXT("connect_pins"), TEXT("blueprint_not_found"), BlueprintPath);
         }
-        if (Blueprint->UbergraphPages.Num() == 0)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("connect_pins"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("connect_pins"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         // 2. Resolve both pins (errors come back as ready-to-return JSON)
         FString FromErrJson, ToErrJson;
@@ -2605,6 +2951,549 @@ namespace
             TEXT("{\"ok\":true,\"command\":\"create_blueprint\",\"blueprint_path\":%s,\"parent_class\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(FullAssetPath),
             *EscapeJsonString(ParentClass->GetName()),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v7.2 — add_switch / add_sequence / add_make_array / add_select =====
+
+    /**
+     * Configure common K2Node fields after construction but before AddNode/AllocateDefaultPins.
+     * Shared by v7.2 K2Node-spawn tools.
+     */
+    template<typename TNode>
+    TNode* SpawnK2NodeBare(UEdGraph* EventGraph, const FString& AnchorName, int32 PosX, int32 PosY)
+    {
+        TNode* NewNode = NewObject<TNode>(EventGraph);
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+        return NewNode;
+    }
+
+    /** Finalize: AddNode + GUID + PostPlacedNewNode + AllocateDefaultPins. Shared closing for v7.2. */
+    void FinalizeK2Node(UEdGraph* EventGraph, UEdGraphNode* Node)
+    {
+        EventGraph->AddNode(Node, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        Node->CreateNewGuid();
+        Node->PostPlacedNewNode();
+        Node->AllocateDefaultPins();
+    }
+
+    FString AddSwitchOnGameThread(
+        const FString& BlueprintPath,
+        const FString& SwitchType,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        const FString& EnumClass,
+        int32 CaseCount,
+        const FString& CaseLabels)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_switch");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_Switch* NewNode = nullptr;
+        FString NodeTypeName;
+
+        const FString LowerType = SwitchType.ToLower();
+        if (LowerType == TEXT("int") || LowerType == TEXT("integer"))
+        {
+            NewNode = SpawnK2NodeBare<UK2Node_SwitchInteger>(EventGraph, AnchorName, PosX, PosY);
+            NodeTypeName = TEXT("K2Node_SwitchInteger");
+        }
+        else if (LowerType == TEXT("string"))
+        {
+            UK2Node_SwitchString* StrSwitch = SpawnK2NodeBare<UK2Node_SwitchString>(EventGraph, AnchorName, PosX, PosY);
+            TArray<FString> Labels;
+            CaseLabels.ParseIntoArray(Labels, TEXT(","), /*InCullEmpty*/ true);
+            for (FString& L : Labels)
+            {
+                const FString Trimmed = L.TrimStartAndEnd();
+                if (!Trimmed.IsEmpty()) StrSwitch->PinNames.Add(FName(*Trimmed));
+            }
+            NewNode = StrSwitch;
+            NodeTypeName = TEXT("K2Node_SwitchString");
+        }
+        else if (LowerType == TEXT("name"))
+        {
+            UK2Node_SwitchName* NameSwitch = SpawnK2NodeBare<UK2Node_SwitchName>(EventGraph, AnchorName, PosX, PosY);
+            TArray<FString> Labels;
+            CaseLabels.ParseIntoArray(Labels, TEXT(","), /*InCullEmpty*/ true);
+            for (FString& L : Labels)
+            {
+                const FString Trimmed = L.TrimStartAndEnd();
+                if (!Trimmed.IsEmpty()) NameSwitch->PinNames.Add(FName(*Trimmed));
+            }
+            NewNode = NameSwitch;
+            NodeTypeName = TEXT("K2Node_SwitchName");
+        }
+        else if (LowerType == TEXT("enum"))
+        {
+            if (EnumClass.IsEmpty())
+                return JsonError(CmdName, TEXT("missing_field"),
+                    TEXT("enum_class is required when switch_type=\"enum\""));
+            UEnum* Enum = LoadObject<UEnum>(nullptr, *EnumClass);
+            if (Enum == nullptr)
+                return JsonError(CmdName, TEXT("enum_not_found"), EnumClass);
+            UK2Node_SwitchEnum* EnumSwitch = SpawnK2NodeBare<UK2Node_SwitchEnum>(EventGraph, AnchorName, PosX, PosY);
+            EnumSwitch->SetEnum(Enum);
+            NewNode = EnumSwitch;
+            NodeTypeName = TEXT("K2Node_SwitchEnum");
+        }
+        else
+        {
+            return JsonError(CmdName, TEXT("unknown_switch_type"),
+                FString::Printf(TEXT("'%s' is not one of: int, string, name, enum"), *SwitchType));
+        }
+
+        FinalizeK2Node(EventGraph, NewNode);
+
+        // For integer switch: add extra case pins to reach CaseCount.
+        // Default IntSwitch has 1 case ("0") after AllocateDefaultPins.
+        if (UK2Node_SwitchInteger* IntSwitch = Cast<UK2Node_SwitchInteger>(NewNode))
+        {
+            const int32 DefaultCount = 1;
+            for (int32 i = DefaultCount; i < CaseCount; ++i)
+            {
+                IntSwitch->AddPinToSwitchNode();
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_switch\",\"anchor_name\":%s,\"switch_type\":%s,\"node_type\":\"%s\",\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(SwitchType),
+            *NodeTypeName,
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddSequenceOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        int32 ThenCount)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_sequence");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_ExecutionSequence* NewNode = SpawnK2NodeBare<UK2Node_ExecutionSequence>(EventGraph, AnchorName, PosX, PosY);
+        FinalizeK2Node(EventGraph, NewNode);
+
+        // Default sequence has 2 "Then 0" / "Then 1" output exec pins.
+        // AddInputPin() is misleadingly named — it adds a new "Then N" output exec pin.
+        const int32 DefaultThenCount = 2;
+        for (int32 i = DefaultThenCount; i < ThenCount; ++i)
+        {
+            NewNode->AddInputPin();
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_sequence\",\"anchor_name\":%s,\"then_count\":%d,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            FMath::Max(ThenCount, DefaultThenCount),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddMakeArrayOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        int32 NumInputs)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_make_array");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_MakeArray* NewNode = SpawnK2NodeBare<UK2Node_MakeArray>(EventGraph, AnchorName, PosX, PosY);
+        FinalizeK2Node(EventGraph, NewNode);
+
+        // Default MakeArray has 1 input pin "[0]". Add more to reach NumInputs.
+        const int32 DefaultNumInputs = 1;
+        for (int32 i = DefaultNumInputs; i < NumInputs; ++i)
+        {
+            NewNode->AddInputPin();
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_make_array\",\"anchor_name\":%s,\"num_inputs\":%d,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            FMath::Max(NumInputs, DefaultNumInputs),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v7.3 — add_make_struct / add_break_struct =====
+
+    /** Resolve a user-friendly struct type name to UScriptStruct*. v7.3 whitelist + path fallback. */
+    UScriptStruct* ResolveScriptStruct(const FString& Name)
+    {
+        // Built-in CoreUObject structs (use TBaseStructure for reliability)
+        if (Name.Equals(TEXT("Vector"), ESearchCase::IgnoreCase))      return TBaseStructure<FVector>::Get();
+        if (Name.Equals(TEXT("Vector2D"), ESearchCase::IgnoreCase))    return TBaseStructure<FVector2D>::Get();
+        if (Name.Equals(TEXT("Rotator"), ESearchCase::IgnoreCase))     return TBaseStructure<FRotator>::Get();
+        if (Name.Equals(TEXT("Transform"), ESearchCase::IgnoreCase))   return TBaseStructure<FTransform>::Get();
+        if (Name.Equals(TEXT("LinearColor"), ESearchCase::IgnoreCase)) return TBaseStructure<FLinearColor>::Get();
+        if (Name.Equals(TEXT("Color"), ESearchCase::IgnoreCase))       return TBaseStructure<FColor>::Get();
+        if (Name.Equals(TEXT("Quat"), ESearchCase::IgnoreCase))        return TBaseStructure<FQuat>::Get();
+        if (Name.Equals(TEXT("Box"), ESearchCase::IgnoreCase))         return TBaseStructure<FBox>::Get();
+
+        // Engine-defined structs (load by /Script/Engine path)
+        if (Name.Equals(TEXT("HitResult"), ESearchCase::IgnoreCase))
+            return LoadObject<UScriptStruct>(nullptr, TEXT("/Script/Engine.HitResult"));
+        if (Name.Equals(TEXT("OverlapResult"), ESearchCase::IgnoreCase))
+            return LoadObject<UScriptStruct>(nullptr, TEXT("/Script/Engine.OverlapResult"));
+        if (Name.Equals(TEXT("CollisionQueryParams"), ESearchCase::IgnoreCase))
+            return LoadObject<UScriptStruct>(nullptr, TEXT("/Script/Engine.CollisionQueryParams"));
+
+        // Qualified path fallback (e.g., "/Script/Engine.HitResult" or "/Game/Structs/MyCustomStruct")
+        if (Name.StartsWith(TEXT("/")))
+        {
+            if (UScriptStruct* Found = LoadObject<UScriptStruct>(nullptr, *Name)) return Found;
+        }
+
+        // Last-resort bare-name lookup
+        if (UScriptStruct* Found = FindFirstObject<UScriptStruct>(*Name, EFindFirstObjectOptions::NativeFirst))
+        {
+            return Found;
+        }
+        return nullptr;
+    }
+
+    // ===== v7.8 — save_blueprint (explicit save) =====
+
+    FString SaveBlueprintOnGameThread(const FString& BlueprintPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("save_blueprint");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        // Mark modified first so SaveAsset(bOnlyIfIsDirty=true) would still write; we use
+        // bOnlyIfIsDirty=false to force the write regardless.
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        // Try to fetch the on-disk file path for the response (debug aid)
+        FString PackagePath = Blueprint->GetOutermost() ? Blueprint->GetOutermost()->GetName() : FString();
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"save_blueprint\",\"blueprint\":%s,\"package\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(BlueprintPath),
+            *EscapeJsonString(PackagePath),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddMakeStructOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StructTypeName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_make_struct");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UScriptStruct* StructType = ResolveScriptStruct(StructTypeName);
+        if (StructType == nullptr)
+            return JsonError(CmdName, TEXT("unknown_struct_type"), StructTypeName);
+
+        UK2Node_MakeStruct* NewNode = SpawnK2NodeBare<UK2Node_MakeStruct>(EventGraph, AnchorName, PosX, PosY);
+        NewNode->StructType = StructType;  // MUST set before AllocateDefaultPins so pins reflect struct fields
+        FinalizeK2Node(EventGraph, NewNode);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_make_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(StructType->GetName()),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddBreakStructOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StructTypeName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_break_struct");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UScriptStruct* StructType = ResolveScriptStruct(StructTypeName);
+        if (StructType == nullptr)
+            return JsonError(CmdName, TEXT("unknown_struct_type"), StructTypeName);
+
+        UK2Node_BreakStruct* NewNode = SpawnK2NodeBare<UK2Node_BreakStruct>(EventGraph, AnchorName, PosX, PosY);
+        NewNode->StructType = StructType;
+        FinalizeK2Node(EventGraph, NewNode);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_break_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(StructType->GetName()),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v7.6 — event dispatchers (multicast delegates) =====
+
+    /**
+     * Create a multicast delegate signature (event dispatcher) on a Blueprint.
+     * Editor equivalent: "Event Dispatchers" panel → "+" button.
+     *
+     * Implementation: creates a graph in Blueprint->DelegateSignatureGraphs with
+     * a K2Node_FunctionEntry whose user-defined pins become the delegate's params.
+     */
+    FString AddEventDispatcherOnGameThread(
+        const FString& BlueprintPath,
+        const FString& DispatcherName,
+        const TArray<FString>& ParamNames,
+        const TArray<FString>& ParamTypes)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_event_dispatcher");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName DispatcherFName(*DispatcherName);
+
+        // Name uniqueness across delegate signature graphs (BP-defined dispatchers)
+        for (UEdGraph* G : Blueprint->DelegateSignatureGraphs)
+        {
+            if (G != nullptr && G->GetFName() == DispatcherFName)
+                return JsonError(CmdName, TEXT("dispatcher_exists"), DispatcherName);
+        }
+
+        // Pre-validate param types BEFORE creating the graph
+        if (ParamNames.Num() != ParamTypes.Num())
+            return JsonError(CmdName, TEXT("param_arity_mismatch"),
+                FString::Printf(TEXT("params: %d names but %d types"), ParamNames.Num(), ParamTypes.Num()));
+        TArray<FEdGraphPinType> ResolvedParamTypes;
+        ResolvedParamTypes.Reserve(ParamNames.Num());
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            FEdGraphPinType PinType;
+            if (!ResolveVariablePinType(ParamTypes[i], PinType))
+                return JsonError(CmdName, TEXT("unknown_param_type"),
+                    FString::Printf(TEXT("param '%s' type '%s'"), *ParamNames[i], *ParamTypes[i]));
+            ResolvedParamTypes.Add(PinType);
+        }
+
+        // Create the delegate-signature graph
+        UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+            Blueprint, DispatcherFName,
+            UEdGraph::StaticClass(),
+            UEdGraphSchema_K2::StaticClass());
+        if (NewGraph == nullptr)
+            return JsonError(CmdName, TEXT("graph_create_failed"), DispatcherName);
+        Blueprint->DelegateSignatureGraphs.Add(NewGraph);
+
+        // Add a FunctionEntry node — its user-defined output pins are the delegate's params
+        UK2Node_FunctionEntry* EntryNode = NewObject<UK2Node_FunctionEntry>(NewGraph);
+        EntryNode->SetFlags(RF_Transactional);
+        EntryNode->FunctionReference.SetSelfMember(DispatcherFName);
+        EntryNode->AddExtraFlags(FUNC_BlueprintCallable | FUNC_Public);
+        NewGraph->AddNode(EntryNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        EntryNode->CreateNewGuid();
+        EntryNode->PostPlacedNewNode();
+        EntryNode->AllocateDefaultPins();
+
+        // Params: output pins on the entry node (delegate consumers receive these as outputs)
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            EntryNode->CreateUserDefinedPin(FName(*ParamNames[i]), ResolvedParamTypes[i], EGPD_Output, /*bUseUniqueName*/ false);
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_event_dispatcher\",\"dispatcher_name\":%s,\"param_count\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(DispatcherName),
+            ParamNames.Num(),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    /**
+     * Helper for the 3 call/bind/unbind dispatcher node tools.
+     * They share: same DelegateReference setup (self-member), same JSON shape.
+     */
+    template<typename TDelegateNode>
+    FString AddDelegateNodeOnGameThread(
+        const TCHAR* CmdName,
+        const TCHAR* NodeTypeStr,
+        const FString& BlueprintPath,
+        const FString& DispatcherName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        TDelegateNode* NewNode = NewObject<TDelegateNode>(EventGraph);
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+
+        // Bind to self-member dispatcher. For external delegate properties (e.g.,
+        // SomeActor.OnActorBeginOverlap), pass target via connect_pins to the "target"
+        // input pin after node creation — SetSelfMember is just the lookup hint.
+        NewNode->DelegateReference.SetSelfMember(FName(*DispatcherName));
+
+        EventGraph->AddNode(NewNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        NewNode->CreateNewGuid();
+        NewNode->PostPlacedNewNode();
+        NewNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":%s,\"anchor_name\":%s,\"dispatcher_name\":%s,\"node_type\":\"%s\",\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(CmdName),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(DispatcherName),
+            NodeTypeStr,
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddSelectOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        int32 NumOptions)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_select");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+        if (Blueprint->UbergraphPages.Num() == 0)
+            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
+        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+        if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_Select* NewNode = SpawnK2NodeBare<UK2Node_Select>(EventGraph, AnchorName, PosX, PosY);
+        FinalizeK2Node(EventGraph, NewNode);
+
+        // Default Select has 2 option pins. Add more to reach NumOptions.
+        const int32 DefaultNumOptions = 2;
+        for (int32 i = DefaultNumOptions; i < NumOptions; ++i)
+        {
+            NewNode->AddOptionPinToNode();
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_select\",\"anchor_name\":%s,\"num_options\":%d,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            FMath::Max(NumOptions, DefaultNumOptions),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
     }
 }
@@ -2800,7 +3689,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_custom_event (Spike B8) ---
+    // --- add_custom_event (Spike B8 + v7.5 params) ---
     if (Command.Equals(TEXT("add_custom_event"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, EventName, AnchorName;
@@ -2815,12 +3704,34 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        // v7.5: optional "params" array of {name, type} objects
+        TArray<FString> ParamNames, ParamTypes;
+        const TArray<TSharedPtr<FJsonValue>>* ParamsArray = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("params"), ParamsArray) && ParamsArray != nullptr)
+        {
+            for (const TSharedPtr<FJsonValue>& Item : *ParamsArray)
+            {
+                const TSharedPtr<FJsonObject>* ParamObjPtr = nullptr;
+                if (Item.IsValid() && Item->TryGetObject(ParamObjPtr) && ParamObjPtr != nullptr)
+                {
+                    FString PName, PType;
+                    (*ParamObjPtr)->TryGetStringField(TEXT("name"), PName);
+                    (*ParamObjPtr)->TryGetStringField(TEXT("type"), PType);
+                    if (!PName.IsEmpty() && !PType.IsEmpty())
+                    {
+                        ParamNames.Add(PName);
+                        ParamTypes.Add(PType);
+                    }
+                }
+            }
+        }
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, EventName, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes]() mutable
             {
-                Promise.SetValue(AddCustomEventOnGameThread(Blueprint, EventName, AnchorName, PosX, PosY));
+                Promise.SetValue(AddCustomEventOnGameThread(Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_custom_event"), TEXT("game_thread_timeout"));
@@ -3135,7 +4046,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_branch (v3) ---
+    // --- add_branch (v3 + v7.7 graph_name) ---
     if (Command.Equals(TEXT("add_branch"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, AnchorName;
@@ -3148,19 +4059,22 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, GraphName]() mutable
             {
-                Promise.SetValue(AddBranchOnGameThread(Blueprint, AnchorName, PosX, PosY));
+                Promise.SetValue(AddBranchOnGameThread(Blueprint, AnchorName, PosX, PosY, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_branch"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
-    // --- add_cast (v3) ---
+    // --- add_cast (v3 + v7.7 graph_name) ---
     if (Command.Equals(TEXT("add_cast"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, TargetClass, AnchorName;
@@ -3175,12 +4089,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, TargetClass, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, TargetClass, AnchorName, PosX, PosY, GraphName]() mutable
             {
-                Promise.SetValue(AddCastOnGameThread(Blueprint, TargetClass, AnchorName, PosX, PosY));
+                Promise.SetValue(AddCastOnGameThread(Blueprint, TargetClass, AnchorName, PosX, PosY, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_cast"), TEXT("game_thread_timeout"));
@@ -3269,7 +4186,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- connect_pins (Spike B4) ---
+    // --- connect_pins (Spike B4 + v7.7 graph_name) ---
     if (Command.Equals(TEXT("connect_pins"), ESearchCase::IgnoreCase))
     {
         FString Blueprint;
@@ -3288,13 +4205,16 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("connect_pins"), TEXT("missing_field"), TEXT("to_pin"));
         }
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
 
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, FromPin, ToPin]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, FromPin, ToPin, GraphName]() mutable
             {
-                FString Result = ConnectPinsOnGameThread(Blueprint, FromPin, ToPin);
+                FString Result = ConnectPinsOnGameThread(Blueprint, FromPin, ToPin, GraphName);
                 Promise.SetValue(MoveTemp(Result));
             });
 
@@ -3307,7 +4227,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- set_pin_default (Spike B3) ---
+    // --- set_pin_default (Spike B3 + v7.7 graph_name) ---
     if (Command.Equals(TEXT("set_pin_default"), ESearchCase::IgnoreCase))
     {
         FString Blueprint;
@@ -3328,13 +4248,16 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         }
         JsonObject->TryGetStringField(TEXT("value"), Value);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
 
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, PinRef, Value]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, PinRef, Value, GraphName]() mutable
             {
-                FString Result = SetPinDefaultOnGameThread(Blueprint, PinRef, Value);
+                FString Result = SetPinDefaultOnGameThread(Blueprint, PinRef, Value, GraphName);
                 Promise.SetValue(MoveTemp(Result));
             });
 
@@ -3347,7 +4270,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_node (Spike B2) ---
+    // --- add_node (Spike B2 + v7.7 graph_name) ---
     if (Command.Equals(TEXT("add_node"), ESearchCase::IgnoreCase))
     {
         FString Blueprint;
@@ -3373,14 +4296,17 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);   // v7.7: optional
+
         // Marshal to game thread (same TPromise/TFuture pattern as create_blueprint)
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
 
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, NodeType, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, NodeType, AnchorName, PosX, PosY, GraphName]() mutable
             {
-                FString Result = AddNodeOnGameThread(Blueprint, NodeType, AnchorName, PosX, PosY);
+                FString Result = AddNodeOnGameThread(Blueprint, NodeType, AnchorName, PosX, PosY, GraphName);
                 Promise.SetValue(MoveTemp(Result));
             });
 
@@ -3391,6 +4317,303 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("add_node"), TEXT("game_thread_timeout"));
         }
         return Future.Get();
+    }
+
+    // --- set_component_property (v7.1) ---
+    if (Command.Equals(TEXT("set_component_property"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, ComponentName, PropertyName, Value;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("set_component_property"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("component_name"), ComponentName) || ComponentName.IsEmpty())
+            return JsonError(TEXT("set_component_property"), TEXT("missing_field"), TEXT("component_name"));
+        if (!JsonObject->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
+            return JsonError(TEXT("set_component_property"), TEXT("missing_field"), TEXT("property_name"));
+        // value field MUST be present, but empty string is allowed (clears object/class refs)
+        if (!JsonObject->HasField(TEXT("value")))
+            return JsonError(TEXT("set_component_property"), TEXT("missing_field"), TEXT("value"));
+        JsonObject->TryGetStringField(TEXT("value"), Value);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, ComponentName, PropertyName, Value]() mutable
+            {
+                Promise.SetValue(SetComponentPropertyOnGameThread(Blueprint, ComponentName, PropertyName, Value));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+        {
+            UE_LOG(LogBlueprintMCP_TCP, Error, TEXT("set_component_property timed out after %ds"), kGameThreadTimeoutSeconds);
+            return JsonError(TEXT("set_component_property"), TEXT("game_thread_timeout"));
+        }
+        return Future.Get();
+    }
+
+    // --- add_switch (v7.2) ---
+    if (Command.Equals(TEXT("add_switch"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, SwitchType, AnchorName, EnumClass, CaseLabels;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_switch"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("switch_type"), SwitchType) || SwitchType.IsEmpty())
+            return JsonError(TEXT("add_switch"), TEXT("missing_field"), TEXT("switch_type"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_switch"), TEXT("missing_field"), TEXT("anchor_name"));
+        JsonObject->TryGetStringField(TEXT("enum_class"), EnumClass);
+        JsonObject->TryGetStringField(TEXT("case_labels"), CaseLabels);
+
+        int32 PosX = 0, PosY = 0, CaseCount = 2;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetNumberField(TEXT("case_count"), CaseCount);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels]() mutable
+            {
+                Promise.SetValue(AddSwitchOnGameThread(Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_switch"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_sequence (v7.2) ---
+    if (Command.Equals(TEXT("add_sequence"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_sequence"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_sequence"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0, ThenCount = 2;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetNumberField(TEXT("then_count"), ThenCount);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, ThenCount]() mutable
+            {
+                Promise.SetValue(AddSequenceOnGameThread(Blueprint, AnchorName, PosX, PosY, ThenCount));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_sequence"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_make_array (v7.2) ---
+    if (Command.Equals(TEXT("add_make_array"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_make_array"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_make_array"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0, NumInputs = 1;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetNumberField(TEXT("num_inputs"), NumInputs);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumInputs]() mutable
+            {
+                Promise.SetValue(AddMakeArrayOnGameThread(Blueprint, AnchorName, PosX, PosY, NumInputs));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_make_array"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_select (v7.2) ---
+    if (Command.Equals(TEXT("add_select"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_select"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_select"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0, NumOptions = 2;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetNumberField(TEXT("num_options"), NumOptions);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumOptions]() mutable
+            {
+                Promise.SetValue(AddSelectOnGameThread(Blueprint, AnchorName, PosX, PosY, NumOptions));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_select"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_make_struct (v7.3) ---
+    if (Command.Equals(TEXT("add_make_struct"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, StructType, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_make_struct"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("struct_type"), StructType) || StructType.IsEmpty())
+            return JsonError(TEXT("add_make_struct"), TEXT("missing_field"), TEXT("struct_type"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_make_struct"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY]() mutable
+            {
+                Promise.SetValue(AddMakeStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_make_struct"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_break_struct (v7.3) ---
+    if (Command.Equals(TEXT("add_break_struct"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, StructType, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_break_struct"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("struct_type"), StructType) || StructType.IsEmpty())
+            return JsonError(TEXT("add_break_struct"), TEXT("missing_field"), TEXT("struct_type"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_break_struct"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY]() mutable
+            {
+                Promise.SetValue(AddBreakStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_break_struct"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- save_blueprint (v7.8) ---
+    if (Command.Equals(TEXT("save_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("save_blueprint"), TEXT("missing_field"), TEXT("blueprint"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint]() mutable
+            {
+                Promise.SetValue(SaveBlueprintOnGameThread(Blueprint));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("save_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_event_dispatcher (v7.6) ---
+    if (Command.Equals(TEXT("add_event_dispatcher"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, DispatcherName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_event_dispatcher"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("dispatcher_name"), DispatcherName) || DispatcherName.IsEmpty())
+            return JsonError(TEXT("add_event_dispatcher"), TEXT("missing_field"), TEXT("dispatcher_name"));
+
+        TArray<FString> ParamNames, ParamTypes;
+        const TArray<TSharedPtr<FJsonValue>>* ParamsArray = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("params"), ParamsArray) && ParamsArray != nullptr)
+        {
+            for (const TSharedPtr<FJsonValue>& Item : *ParamsArray)
+            {
+                const TSharedPtr<FJsonObject>* ParamObjPtr = nullptr;
+                if (Item.IsValid() && Item->TryGetObject(ParamObjPtr) && ParamObjPtr != nullptr)
+                {
+                    FString PName, PType;
+                    (*ParamObjPtr)->TryGetStringField(TEXT("name"), PName);
+                    (*ParamObjPtr)->TryGetStringField(TEXT("type"), PType);
+                    if (!PName.IsEmpty() && !PType.IsEmpty())
+                    {
+                        ParamNames.Add(PName);
+                        ParamTypes.Add(PType);
+                    }
+                }
+            }
+        }
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, DispatcherName, ParamNames, ParamTypes]() mutable
+            {
+                Promise.SetValue(AddEventDispatcherOnGameThread(Blueprint, DispatcherName, ParamNames, ParamTypes));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_event_dispatcher"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- add_call_dispatcher / add_bind_dispatcher / add_unbind_dispatcher (v7.6) ---
+    // Shared shape: same JSON fields, dispatch by command name to the templated helper.
+    {
+        const bool bCall   = Command.Equals(TEXT("add_call_dispatcher"),   ESearchCase::IgnoreCase);
+        const bool bBind   = Command.Equals(TEXT("add_bind_dispatcher"),   ESearchCase::IgnoreCase);
+        const bool bUnbind = Command.Equals(TEXT("add_unbind_dispatcher"), ESearchCase::IgnoreCase);
+        if (bCall || bBind || bUnbind)
+        {
+            const TCHAR* CmdName = bCall ? TEXT("add_call_dispatcher")
+                                  : bBind ? TEXT("add_bind_dispatcher")
+                                          : TEXT("add_unbind_dispatcher");
+
+            FString Blueprint, DispatcherName, AnchorName;
+            if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+                return JsonError(CmdName, TEXT("missing_field"), TEXT("blueprint"));
+            if (!JsonObject->TryGetStringField(TEXT("dispatcher_name"), DispatcherName) || DispatcherName.IsEmpty())
+                return JsonError(CmdName, TEXT("missing_field"), TEXT("dispatcher_name"));
+            if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+                return JsonError(CmdName, TEXT("missing_field"), TEXT("anchor_name"));
+
+            int32 PosX = 0, PosY = 0;
+            JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+            JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+            TPromise<FString> Promise;
+            TFuture<FString> Future = Promise.GetFuture();
+            AsyncTask(ENamedThreads::GameThread,
+                [Promise = MoveTemp(Promise), CmdName, bCall, bBind, bUnbind, Blueprint, DispatcherName, AnchorName, PosX, PosY]() mutable
+                {
+                    FString Result;
+                    if (bCall)
+                        Result = AddDelegateNodeOnGameThread<UK2Node_CallDelegate>(CmdName, TEXT("K2Node_CallDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                    else if (bBind)
+                        Result = AddDelegateNodeOnGameThread<UK2Node_AddDelegate>(CmdName, TEXT("K2Node_AddDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                    else
+                        Result = AddDelegateNodeOnGameThread<UK2Node_RemoveDelegate>(CmdName, TEXT("K2Node_RemoveDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                    Promise.SetValue(MoveTemp(Result));
+                });
+            if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+                return JsonError(CmdName, TEXT("game_thread_timeout"));
+            return Future.Get();
+        }
     }
 
     return FString::Printf(
