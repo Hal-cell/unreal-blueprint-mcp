@@ -2348,6 +2348,80 @@ def test_pie_press_key_local_validation_missing_key() -> None:
     assert r["error"] == "missing_argument"
 
 
+# ---------------------------------------------------------------------------
+# v8.0.1 — delete_event_dispatcher (OPEN-1 recovery path)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_event_dispatcher_removes_both() -> None:
+    """Healthy dispatcher: both signature graph and member variable removed."""
+    response = (
+        b'{"ok":true,"command":"delete_event_dispatcher","dispatcher_name":"OnDeath",'
+        b'"removed_graph":true,"removed_variable":true,"compiled":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_event_dispatcher(
+            blueprint="/Game/BP_X", dispatcher_name="OnDeath",
+        )
+    assert r["ok"] is True
+    assert r["removed_graph"] is True
+    assert r["removed_variable"] is True
+
+
+def test_delete_event_dispatcher_old_broken_only_graph() -> None:
+    """Old pre-v7.1.2 broken dispatcher: only signature graph, no member var."""
+    response = (
+        b'{"ok":true,"command":"delete_event_dispatcher","dispatcher_name":"OnDeath",'
+        b'"removed_graph":true,"removed_variable":false,"compiled":true,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_event_dispatcher(
+            blueprint="/Game/BP_OldBroken", dispatcher_name="OnDeath",
+        )
+    assert r["ok"] is True
+    assert r["removed_graph"] is True
+    assert r["removed_variable"] is False  # the missing-variable signature
+
+
+def test_delete_event_dispatcher_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"delete_event_dispatcher","error":"dispatcher_not_found",'
+        b'"detail":"No signature graph or member variable named \\"Nope\\""}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_event_dispatcher(
+            blueprint="/Game/BP_X", dispatcher_name="Nope",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "dispatcher_not_found"
+
+
+def test_delete_event_dispatcher_local_validation() -> None:
+    assert server.delete_event_dispatcher(blueprint="", dispatcher_name="X")["error"] == "missing_argument"
+    assert server.delete_event_dispatcher(blueprint="/Game/BP", dispatcher_name="")["error"] == "missing_argument"
+
+
+@pytest.mark.skip(reason="Requires UE editor + a pre-v7.1.2 broken dispatcher")
+def test_delete_event_dispatcher_recovery_path() -> None:
+    """Manual integration: nuke old broken dispatcher, re-add with new dylib."""
+    bp = "/Game/Blueprints/BP_V76_v2"   # the BP from OPEN-1 with old broken OnDeath
+    assert server.delete_event_dispatcher(blueprint=bp, dispatcher_name="OnDeath")["ok"]
+    assert server.add_event_dispatcher(
+        blueprint=bp, dispatcher_name="OnDeath",
+        params=[{"name": "Damage", "type": "float"},
+                {"name": "Source", "type": "object:Actor"}],
+    )["ok"]
+    # Now add_call_dispatcher should produce a node with Damage/Source pins
+    r = server.add_call_dispatcher(blueprint=bp, dispatcher_name="OnDeath",
+                                    anchor_name="broadcast_v2")
+    assert r["ok"] is True
+    pins = r["pins"]
+    pin_names = {p["name"] for p in pins}
+    assert "Damage" in pin_names, f"OPEN-1 NOT fixed: pins={pins}"
+    assert "Source" in pin_names, f"OPEN-1 NOT fixed: pins={pins}"
+
+
 @pytest.mark.skip(reason="Requires UE editor — agentic loop demo")
 def test_v8_agentic_loop_against_real_plugin() -> None:
     """Manual integration: write hello-world BP → spawn → PIE → read log → stop."""

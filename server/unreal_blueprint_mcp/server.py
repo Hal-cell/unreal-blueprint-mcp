@@ -565,6 +565,46 @@ def add_event_dispatcher(
 
 
 @mcp.tool()
+def delete_event_dispatcher(
+    blueprint: str,
+    dispatcher_name: str,
+) -> dict[str, Any]:
+    """Delete an event dispatcher (signature graph + member variable) — v8.0.1.
+
+    Provides a recovery path for dispatchers that were created with **pre-v7.1.2
+    plugin versions**, which were missing the PC_MCDelegate member variable.
+    Those broken dispatchers can't be repaired in place — `add_call_dispatcher`
+    won't resolve their signature. Use this to delete them, then recreate with
+    `add_event_dispatcher` on the current dylib.
+
+    Also useful for runtime renames / cleanup of healthy dispatchers.
+
+    Removes whichever of the two pieces is present:
+    - Signature graph (in ``Blueprint->DelegateSignatureGraphs``)
+    - Member variable (PC_MCDelegate)
+
+    Args:
+        blueprint: BP asset path.
+        dispatcher_name: Name of the dispatcher to remove.
+
+    Returns:
+        ``{"ok": True, "dispatcher_name": ..., "removed_graph": bool,
+            "removed_variable": bool, "compiled": True, "saved": True}``
+
+    Errors:
+        dispatcher_not_found — neither a signature graph nor a member variable
+            of that name exists.
+    """
+    if not blueprint or not dispatcher_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "delete_event_dispatcher",
+        "blueprint": blueprint,
+        "dispatcher_name": dispatcher_name,
+    })
+
+
+@mcp.tool()
 def add_call_dispatcher(
     blueprint: str,
     dispatcher_name: str,

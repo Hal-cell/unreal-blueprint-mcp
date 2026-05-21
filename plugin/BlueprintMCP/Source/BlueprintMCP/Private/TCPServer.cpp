@@ -3795,6 +3795,71 @@ namespace
     }
 
     /**
+     * v8.0.1 OPEN-1 fix: delete an event dispatcher (signature graph + member variable)
+     * so users can remove dispatchers built by pre-v7.1.2 dylibs (which were missing
+     * the member variable and therefore can't be repaired by add_call_dispatcher).
+     *
+     * Removes whichever of the two pieces is present — old broken dispatchers have
+     * only the signature graph; new healthy ones have both. Returns flags so caller
+     * can verify what was actually cleaned.
+     */
+    FString DeleteEventDispatcherOnGameThread(
+        const FString& BlueprintPath,
+        const FString& DispatcherName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_event_dispatcher");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName DispatcherFName(*DispatcherName);
+        bool bRemovedGraph = false;
+        bool bRemovedVariable = false;
+
+        Blueprint->Modify();
+
+        // Remove the signature graph (if any). RemoveGraph handles array removal +
+        // cleanup. Iterate backwards in case multiple (corrupt) entries exist.
+        for (int32 i = Blueprint->DelegateSignatureGraphs.Num() - 1; i >= 0; --i)
+        {
+            UEdGraph* G = Blueprint->DelegateSignatureGraphs[i];
+            if (G != nullptr && G->GetFName() == DispatcherFName)
+            {
+                FBlueprintEditorUtils::RemoveGraph(Blueprint, G, EGraphRemoveFlags::Recompile);
+                bRemovedGraph = true;
+                // Don't break — clean up any duplicates
+            }
+        }
+
+        // Remove the member variable (present for v7.1.2+ dispatchers, absent for older)
+        if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, DispatcherFName) != INDEX_NONE)
+        {
+            FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, DispatcherFName);
+            bRemovedVariable = true;
+        }
+
+        if (!bRemovedGraph && !bRemovedVariable)
+        {
+            return JsonError(CmdName, TEXT("dispatcher_not_found"),
+                FString::Printf(TEXT("No signature graph or member variable named '%s' in %s"),
+                    *DispatcherName, *BlueprintPath));
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"delete_event_dispatcher\",\"dispatcher_name\":%s,\"removed_graph\":%s,\"removed_variable\":%s,\"compiled\":true,\"saved\":%s}\n"),
+            *EscapeJsonString(DispatcherName),
+            bRemovedGraph ? TEXT("true") : TEXT("false"),
+            bRemovedVariable ? TEXT("true") : TEXT("false"),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    /**
      * Helper for the 3 call/bind/unbind dispatcher node tools.
      * They share: same DelegateReference setup (self-member), same JSON shape.
      */
@@ -4144,13 +4209,20 @@ void FTCPServerRunnable::HandleClient(FSocket* ClientSocket)
     }
 
     const FString JsonLine(BytesRead, reinterpret_cast<const ANSICHAR*>(Buffer));
-    UE_LOG(LogBlueprintMCP_TCP, Verbose, TEXT("Received: %s"), *JsonLine);
+    // v8.0.1 OPEN-2: promote from Verbose to Log so FOutputDevice (and therefore
+    // read_log_capture) sees every MCP request/response. Truncate at 800 chars to
+    // keep the buffer readable when large get_blueprint snapshots are flowing.
+    UE_LOG(LogBlueprintMCP_TCP, Log, TEXT("MCP recv: %s%s"),
+        *(JsonLine.Len() > 800 ? JsonLine.Left(800) : JsonLine),
+        JsonLine.Len() > 800 ? TEXT("...[truncated]") : TEXT(""));
 
     const FString Response = DispatchCommand(JsonLine);
     const FTCHARToUTF8 ResponseUtf8(*Response);
     int32 BytesSent = 0;
     ClientSocket->Send(reinterpret_cast<const uint8*>(ResponseUtf8.Get()), ResponseUtf8.Length(), BytesSent);
-    UE_LOG(LogBlueprintMCP_TCP, Verbose, TEXT("Sent: %s"), *Response);
+    UE_LOG(LogBlueprintMCP_TCP, Log, TEXT("MCP send: %s%s"),
+        *(Response.Len() > 800 ? Response.Left(800) : Response),
+        Response.Len() > 800 ? TEXT("...[truncated]") : TEXT(""));
 }
 
 FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
@@ -5154,6 +5226,27 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_event_dispatcher"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- delete_event_dispatcher (v8.0.1 OPEN-1) ---
+    if (Command.Equals(TEXT("delete_event_dispatcher"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, DispatcherName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("delete_event_dispatcher"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("dispatcher_name"), DispatcherName) || DispatcherName.IsEmpty())
+            return JsonError(TEXT("delete_event_dispatcher"), TEXT("missing_field"), TEXT("dispatcher_name"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, DispatcherName]() mutable
+            {
+                Promise.SetValue(DeleteEventDispatcherOnGameThread(Blueprint, DispatcherName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_event_dispatcher"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
