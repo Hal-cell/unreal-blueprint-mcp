@@ -1645,9 +1645,37 @@ namespace
             return JsonError(TEXT("call_blueprint_function"), TEXT("target_class_not_found"), TargetClassStr);
 
         UFunction* TargetFunc = TargetClass->FindFunctionByName(FName(*FunctionName));
+        bool bAutoCompiled = false;
+
+        // v7.1.3: function not found may just mean the target BP wasn't compiled since the
+        // function was added (common when LLM does `add_function` then immediately
+        // `call_blueprint_function`). If TargetClass is BP-generated, compile its owning BP
+        // and retry the lookup once. Native classes skip this fallback.
         if (!TargetFunc)
-            return JsonError(TEXT("call_blueprint_function"), TEXT("function_not_found"),
-                FString::Printf(TEXT("%s on %s"), *FunctionName, *TargetClass->GetName()));
+        {
+            UBlueprint* OwningBP = Cast<UBlueprint>(TargetClass->ClassGeneratedBy);
+            if (OwningBP != nullptr)
+            {
+                UE_LOG(LogBlueprintMCP_TCP, Log,
+                    TEXT("call_blueprint_function: '%s' not found on %s — auto-compiling owning BP %s and retrying"),
+                    *FunctionName, *TargetClass->GetName(), *OwningBP->GetName());
+                FKismetEditorUtilities::CompileBlueprint(OwningBP, EBlueprintCompileOptions::None);
+                bAutoCompiled = true;
+                // GeneratedClass may be reassigned after compile (rare); refresh from BP
+                if (OwningBP->GeneratedClass != nullptr)
+                {
+                    TargetClass = OwningBP->GeneratedClass;
+                    TargetFunc = TargetClass->FindFunctionByName(FName(*FunctionName));
+                }
+            }
+            if (!TargetFunc)
+            {
+                return JsonError(TEXT("call_blueprint_function"), TEXT("function_not_found"),
+                    FString::Printf(TEXT("%s on %s (auto_compile_attempted=%s)"),
+                        *FunctionName, *TargetClass->GetName(),
+                        bAutoCompiled ? TEXT("yes") : TEXT("no — TargetClass is not BP-generated")));
+            }
+        }
 
         UK2Node_CallFunction* NewNode = NewObject<UK2Node_CallFunction>(EventGraph);
         NewNode->SetFlags(RF_Transactional);
@@ -1723,9 +1751,10 @@ namespace
         }
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"call_blueprint_function\",\"anchor_name\":%s,\"node_guid\":%s,\"target_class\":%s,\"function\":%s,\"pins\":%s%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"call_blueprint_function\",\"anchor_name\":%s,\"node_guid\":%s,\"target_class\":%s,\"function\":%s,\"auto_compiled\":%s,\"pins\":%s%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName), *EscapeJsonString(GuidStr),
             *EscapeJsonString(TargetClass->GetName()), *EscapeJsonString(FunctionName),
+            bAutoCompiled ? TEXT("true") : TEXT("false"),
             *PinsJson, *WiringJsonFragment,
             bSaved ? TEXT("true") : TEXT("false"));
     }
