@@ -130,6 +130,12 @@
 // resolve its UClass at runtime via FindObject (see CreateNiagaraSystemOnGameThread).
 #include "NiagaraSystem.h"
 
+// v9.4.0 — UMG + save_all
+#include "WidgetBlueprint.h"
+#include "WidgetBlueprintFactory.h"
+#include "Blueprint/UserWidget.h"
+#include "FileHelpers.h"   // FEditorFileUtils::SaveDirtyPackages
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -3748,6 +3754,105 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.4.0 — UMG door-opener =====
+    //
+    // Opens the UMG (Widget Blueprint) surface. v9.4.0 ships only the
+    // asset-creation step; widget tree authoring (Canvas, Button, Text, etc.)
+    // is planned for v9.4.x follow-ups.
+    //
+    // UWidgetBlueprintFactory is MinimalAPI (StaticClass IS exported), so
+    // we can NewObject it directly — no FindObject dance needed.
+
+    FString CreateWidgetBlueprintOnGameThread(
+        const FString& Name,
+        const FString& ParentClassName,   // "" → UUserWidget
+        const FString& Path)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("create_widget_blueprint");
+
+        const FString FullAssetPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullAssetPath))
+            return JsonError(CmdName, TEXT("asset_exists"), FullAssetPath);
+
+        // Resolve parent class. Default is UUserWidget; users may pass a
+        // custom subclass like "/Game/UI/WBP_MenuBase_C".
+        UClass* ParentClass = UUserWidget::StaticClass();
+        if (!ParentClassName.IsEmpty())
+        {
+            UClass* Resolved = FindObject<UClass>(nullptr, *ParentClassName);
+            if (Resolved == nullptr)
+            {
+                // Try as Blueprint Generated Class (BPGC) — common case
+                Resolved = LoadObject<UClass>(nullptr, *ParentClassName);
+            }
+            if (Resolved == nullptr || !Resolved->IsChildOf(UUserWidget::StaticClass()))
+            {
+                return JsonError(CmdName, TEXT("invalid_parent_class"),
+                    FString::Printf(TEXT("%s must derive from UUserWidget"), *ParentClassName));
+            }
+            ParentClass = Resolved;
+        }
+
+        UWidgetBlueprintFactory* Factory = NewObject<UWidgetBlueprintFactory>();
+        Factory->BlueprintType = BPTYPE_Normal;
+        Factory->ParentClass = ParentClass;
+
+        FAssetToolsModule& AssetToolsModule =
+            FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(
+            Name, Path, UWidgetBlueprint::StaticClass(), Factory);
+        if (NewAsset == nullptr)
+            return JsonError(CmdName, TEXT("creation_failed"), FullAssetPath);
+
+        UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(NewAsset);
+        if (WidgetBP == nullptr)
+            return JsonError(CmdName, TEXT("wrong_asset_type"),
+                FString::Printf(TEXT("Created asset is %s, not UWidgetBlueprint"),
+                    *NewAsset->GetClass()->GetName()));
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullAssetPath, /*bOnlyIfIsDirty*/ false);
+        if (!bSaved)
+        {
+            UE_LOG(LogBlueprintMCP_TCP, Warning,
+                TEXT("create_widget_blueprint: created but save failed (%s)"), *FullAssetPath);
+        }
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_widget_blueprint\",\"widget_path\":%s,\"parent_class\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FullAssetPath),
+            *EscapeJsonString(ParentClass->GetPathName()),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.4.0 — save_all =====
+    //
+    // Silent save of every dirty package (content + maps). Mirrors what
+    // File → Save All does in the UE editor menu, but with no prompts —
+    // safe to call right before a kill/restart cycle to avoid the
+    // "Save changes?" dialog on next launch.
+
+    FString SaveAllOnGameThread()
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("save_all");
+
+        bool bPackagesNeededSaving = false;
+        const bool bOk = FEditorFileUtils::SaveDirtyPackages(
+            /*bPromptUserToSave*/ false,
+            /*bSaveMapPackages*/ true,
+            /*bSaveContentPackages*/ true,
+            /*bFastSave*/ false,
+            /*bNotifyNoPackagesSaved*/ false,
+            /*bCanBeDeclined*/ true,
+            &bPackagesNeededSaving);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"save_all\",\"saved\":%s,\"packages_needed_saving\":%s}\n"),
+            bOk ? TEXT("true") : TEXT("false"),
+            bPackagesNeededSaving ? TEXT("true") : TEXT("false"));
+    }
+
     FString CreateBlueprintOnGameThread(const FString& Name, const FString& ParentClassStr, const FString& Path)
     {
         check(IsInGameThread());
@@ -5102,7 +5207,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.3.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.4.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -5372,6 +5477,46 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("create_niagara_system"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.4.0 UMG door-opener ---
+    if (Command.Equals(TEXT("create_widget_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Name, ParentClassName, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_widget_blueprint"), TEXT("missing_field"), TEXT("name"));
+        JsonObject->TryGetStringField(TEXT("parent_class"), ParentClassName);   // optional
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/UI");
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, ParentClassName, Path]() mutable
+            {
+                Promise.SetValue(CreateWidgetBlueprintOnGameThread(Name, ParentClassName, Path));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_widget_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.4.0 save_all ---
+    // Silently save every dirty package. Use this before any UE editor kill
+    // to skip the "save changes?" dialog on next launch.
+    if (Command.Equals(TEXT("save_all"), ESearchCase::IgnoreCase))
+    {
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise)]() mutable
+            {
+                Promise.SetValue(SaveAllOnGameThread());
+            });
+        // save_all can take longer than 10s on large projects — give it 30s.
+        if (!Future.WaitFor(FTimespan::FromSeconds(30)))
+            return JsonError(TEXT("save_all"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

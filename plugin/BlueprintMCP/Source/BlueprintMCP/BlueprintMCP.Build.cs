@@ -43,6 +43,9 @@ public class BlueprintMCP : ModuleRules
             // v9.3.0: Niagara — UNiagaraSystem (factory class found via FindObject
             // because UNiagaraSystemFactoryNew isn't NIAGARAEDITOR_API-exported)
             "Niagara",
+            // v9.4.0: UMG — UWidgetBlueprint + UWidgetBlueprintFactory + UUserWidget
+            "UMG",
+            "UMGEditor",
         });
     }
 }

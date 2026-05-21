@@ -2359,6 +2359,72 @@ def create_niagara_system(
     })
 
 
+# ---------------------------------------------------------------------------
+# v9.4.0 — UMG door-opener + save_all
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def create_widget_blueprint(
+    name: str,
+    parent_class: str = "",
+    path: str = "/Game/UI",
+) -> dict[str, Any]:
+    """Create a blank Widget Blueprint (UMG) asset — v9.4.0.
+
+    UMG is UE's editor surface for UI. ``UWidgetBlueprint`` is the
+    Blueprint-graph + designer-canvas asset; it inherits from
+    ``UUserWidget`` by default. v9.4.0 ships only asset creation; the
+    widget tree (Canvas / Button / Text / etc.) must be authored
+    manually for now. Programmatic widget composition is a planned
+    follow-up.
+
+    Args:
+        name: Asset name (e.g. ``"WBP_Menu"``).
+        parent_class: Optional path to a ``UUserWidget`` subclass to use
+            as the parent. Default is ``UUserWidget`` itself. Use a
+            Blueprint Generated Class path like
+            ``"/Game/UI/WBP_MenuBase_C"`` to extend an existing widget.
+        path: /Game-relative folder. Defaults to ``/Game/UI``.
+
+    Returns:
+        ``{"ok": True, "widget_path": "/Game/UI/WBP_Menu",
+            "parent_class": "/Script/UMG.UserWidget", "saved": True}``
+
+    Common errors:
+        asset_exists          — name already taken
+        invalid_parent_class  — parent isn't a UUserWidget subclass
+        creation_failed       — IAssetTools::CreateAsset returned null
+        wrong_asset_type      — sanity check (factory misconfigured)
+    """
+    if not name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "create_widget_blueprint",
+        "name": name,
+        "path": path,
+    }
+    if parent_class:
+        payload["parent_class"] = parent_class
+    return _send_command(payload)
+
+
+@mcp.tool()
+def save_all() -> dict[str, Any]:
+    """Silently save every dirty package — v9.4.0.
+
+    Mirrors UE's File → Save All menu item but with no prompts. Use
+    this before any UE editor kill or restart to prevent the "Save
+    changes?" dialog on next launch. Safe to call at any time — if
+    nothing is dirty, it returns ``saved=true`` with
+    ``packages_needed_saving=false``.
+
+    Returns:
+        ``{"ok": True, "saved": True, "packages_needed_saving": True}``
+    """
+    return _send_command({"command": "save_all"})
+
+
 @mcp.tool()
 def create_blueprint(
     name: str,

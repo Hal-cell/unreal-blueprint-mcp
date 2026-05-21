@@ -3073,3 +3073,131 @@ def test_ping_returns_plugin_version_9_3_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.3.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.4.0 — UMG door-opener + save_all
+# ---------------------------------------------------------------------------
+
+
+def test_create_widget_blueprint_success() -> None:
+    response = (
+        b'{"ok":true,"command":"create_widget_blueprint",'
+        b'"widget_path":"/Game/UI/WBP_Menu",'
+        b'"parent_class":"/Script/UMG.UserWidget","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_widget_blueprint(name="WBP_Menu")
+    assert r["ok"] is True
+    assert r["widget_path"] == "/Game/UI/WBP_Menu"
+    assert r["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    # parent_class omitted when blank — server uses default UUserWidget
+    assert sent_dict == {
+        "command": "create_widget_blueprint",
+        "name": "WBP_Menu",
+        "path": "/Game/UI",
+    }
+
+
+def test_create_widget_blueprint_custom_parent() -> None:
+    response = (
+        b'{"ok":true,"command":"create_widget_blueprint",'
+        b'"widget_path":"/Game/UI/WBP_Submenu",'
+        b'"parent_class":"/Game/UI/WBP_MenuBase_C","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_widget_blueprint(
+            name="WBP_Submenu",
+            parent_class="/Game/UI/WBP_MenuBase_C",
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["parent_class"] == "/Game/UI/WBP_MenuBase_C"
+
+
+def test_create_widget_blueprint_invalid_parent() -> None:
+    response = (
+        b'{"ok":false,"command":"create_widget_blueprint",'
+        b'"error":"invalid_parent_class","detail":"/Game/Foo/Bar must derive from UUserWidget"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_widget_blueprint(name="WBP_X", parent_class="/Game/Foo/Bar")
+    assert r["ok"] is False
+    assert r["error"] == "invalid_parent_class"
+
+
+def test_create_widget_blueprint_local_validation() -> None:
+    assert server.create_widget_blueprint(name="")["error"] == "missing_argument"
+
+
+def test_save_all_success() -> None:
+    response = (
+        b'{"ok":true,"command":"save_all","saved":true,"packages_needed_saving":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.save_all()
+    assert r["ok"] is True
+    assert r["saved"] is True
+    assert r["packages_needed_saving"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "save_all"}
+
+
+def test_save_all_nothing_dirty() -> None:
+    response = (
+        b'{"ok":true,"command":"save_all","saved":true,"packages_needed_saving":false}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.save_all()
+    assert r["ok"] is True
+    assert r["packages_needed_saving"] is False
+
+
+@requires_ue_editor(extra_reason="v9.4.0 UMG + save_all end-to-end")
+def test_v9_4_widget_blueprint_and_save_all_against_real_plugin() -> None:
+    """Integration: create a widget BP, verify via list_assets, then save_all."""
+    import uuid
+
+    unique_name = f"WBP_V94Test_{uuid.uuid4().hex[:8]}"
+    r = server.create_widget_blueprint(name=unique_name, path="/Game/Tests")
+    assert r["ok"] is True, f"create_widget_blueprint failed: {r}"
+    assert r["widget_path"] == f"/Game/Tests/{unique_name}"
+
+    # Verify via list_assets — exercises the non-Engine class fallback
+    # (WidgetBlueprint lives in /Script/UMGEditor).
+    list_r = server.list_assets(
+        folder="/Game/Tests", asset_class="WidgetBlueprint", max_results=200,
+    )
+    assert list_r["ok"] is True
+    names = [a["name"] for a in list_r["assets"]]
+    assert unique_name in names, (
+        f"Created widget BP {unique_name} not visible via list_assets. "
+        f"Got: {names}"
+    )
+
+    # save_all should succeed even if nothing else is dirty.
+    save_r = server.save_all()
+    assert save_r["ok"] is True, f"save_all failed: {save_r}"
+    assert save_r["saved"] is True
+
+
+def test_ping_returns_plugin_version_9_4_0() -> None:
+    """v9.4.0: ping surfaces 9.4.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.4.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.4.0"
