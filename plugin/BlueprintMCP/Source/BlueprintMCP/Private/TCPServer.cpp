@@ -111,6 +111,12 @@
 #include "GameFramework/PlayerController.h"  // already in v3, but explicit
 #include "Engine/World.h"                // UWorld for PIE
 
+// v9.0.0 — AnimBlueprint creation
+#include "Animation/AnimBlueprint.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/Skeleton.h"
+#include "Factories/AnimBlueprintFactory.h"
+
 // v7.1 — set_component_property (FProperty reflection for component template defaults)
 #include "UObject/UnrealType.h"        // FObjectProperty / FStructProperty / FClassProperty
 
@@ -3121,6 +3127,73 @@ namespace
      * Create a Blueprint asset. MUST run on the game thread.
      * Returns a complete JSON response line (with trailing \n).
      */
+    // ===== v9.0.0 — AnimBlueprint creation =====
+    //
+    // Opens the Animation Blueprint surface. Only the asset-creation step is in v9.0.0 —
+    // state machines, state nodes, transitions, and sequence-player pose configuration
+    // are planned for v9.0.x follow-ups. The blank AnimBP can already be opened in the
+    // editor and edited manually.
+
+    FString CreateAnimBlueprintOnGameThread(
+        const FString& Name,
+        const FString& SkeletonPath,
+        const FString& Path)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("create_anim_blueprint");
+
+        // Validate skeleton (required — AnimBP can't exist without one in normal mode)
+        USkeleton* TargetSkeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+        if (TargetSkeleton == nullptr)
+        {
+            return JsonError(CmdName, TEXT("skeleton_not_found"),
+                FString::Printf(TEXT("%s (try /Engine/Mannequin/Mesh/SK_Mannequin_Skeleton or your project's skeleton)"),
+                    *SkeletonPath));
+        }
+
+        const FString FullAssetPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullAssetPath))
+        {
+            return JsonError(CmdName, TEXT("asset_exists"), FullAssetPath);
+        }
+
+        // Mirror create_blueprint's pattern: configure factory, call IAssetTools.
+        UAnimBlueprintFactory* Factory = NewObject<UAnimBlueprintFactory>();
+        Factory->ParentClass = UAnimInstance::StaticClass();
+        Factory->TargetSkeleton = TargetSkeleton;
+        Factory->bTemplate = false;
+
+        FAssetToolsModule& AssetToolsModule =
+            FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(
+            Name, Path, UAnimBlueprint::StaticClass(), Factory);
+
+        if (NewAsset == nullptr)
+        {
+            return JsonError(CmdName, TEXT("creation_failed"), FullAssetPath);
+        }
+        UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(NewAsset);
+        if (AnimBP == nullptr)
+        {
+            return JsonError(CmdName, TEXT("wrong_asset_type"),
+                FString::Printf(TEXT("Created asset is %s, not UAnimBlueprint"),
+                    *NewAsset->GetClass()->GetName()));
+        }
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullAssetPath, /*bOnlyIfIsDirty*/ false);
+        if (!bSaved)
+        {
+            UE_LOG(LogBlueprintMCP_TCP, Warning,
+                TEXT("create_anim_blueprint: created but save failed (%s)"), *FullAssetPath);
+        }
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_anim_blueprint\",\"blueprint_path\":%s,\"skeleton\":%s,\"parent_class\":\"AnimInstance\",\"saved\":%s}\n"),
+            *EscapeJsonString(FullAssetPath),
+            *EscapeJsonString(SkeletonPath),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     FString CreateBlueprintOnGameThread(const FString& Name, const FString& ParentClassStr, const FString& Path)
     {
         check(IsInGameThread());
@@ -4475,9 +4548,32 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.1.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.0.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
+    }
+
+    // --- create_anim_blueprint (v9.0.0) ---
+    if (Command.Equals(TEXT("create_anim_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Name, SkeletonPath, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_anim_blueprint"), TEXT("missing_field"), TEXT("name"));
+        if (!JsonObject->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
+            return JsonError(TEXT("create_anim_blueprint"), TEXT("missing_field"), TEXT("skeleton"));
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/Blueprints");
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, SkeletonPath, Path]() mutable
+            {
+                Promise.SetValue(CreateAnimBlueprintOnGameThread(Name, SkeletonPath, Path));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_anim_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
     }
 
     // --- create_blueprint (Spike B1) ---

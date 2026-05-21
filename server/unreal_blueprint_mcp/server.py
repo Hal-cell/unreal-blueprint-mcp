@@ -1935,6 +1935,54 @@ def add_variable_set(
 
 
 @mcp.tool()
+def create_anim_blueprint(
+    name: str,
+    skeleton: str,
+    path: str = "/Game/Blueprints",
+) -> dict[str, Any]:
+    """Create a new Animation Blueprint asset — v9.0.0.
+
+    Animation Blueprints drive skeletal mesh animation: state machines,
+    blend spaces, sequence playback, IK, etc. This tool creates a blank
+    AnimBlueprint with `UAnimInstance` as parent class and the user-provided
+    skeleton as target. The asset opens in the AnimGraph editor where
+    state machines + states can be added manually.
+
+    **v9.0.0 scope is asset creation only.** Programmatic editing of the
+    AnimGraph (state machines, state nodes, transitions, sequence-player pose
+    setting) is planned for v9.0.x follow-ups. The created BP is fully
+    functional in-editor.
+
+    Args:
+        name: Asset name (e.g. ``"ABP_Mannequin"``).
+        skeleton: Path to the target ``USkeleton`` asset. Required.
+            Common engine skeletons:
+              ``/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton``
+              ``/Game/Mannequin/Mesh/UE4_Mannequin_Skeleton``
+            Or any USkeleton in your project.
+        path: /Game-relative folder. Defaults to ``/Game/Blueprints``.
+
+    Returns:
+        ``{"ok": True, "blueprint_path": "/Game/...", "skeleton": "...",
+            "parent_class": "AnimInstance", "saved": True}``
+
+    Common errors:
+        skeleton_not_found     — path doesn't resolve to a USkeleton
+        asset_exists           — name already taken at that path
+        creation_failed        — IAssetTools::CreateAsset returned null
+        wrong_asset_type       — sanity check; would mean factory misconfigured
+    """
+    if not name or not skeleton:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "create_anim_blueprint",
+        "name": name,
+        "skeleton": skeleton,
+        "path": path,
+    })
+
+
+@mcp.tool()
 def create_blueprint(
     name: str,
     parent_class: str = "Actor",

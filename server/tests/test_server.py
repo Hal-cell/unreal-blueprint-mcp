@@ -2367,6 +2367,66 @@ def test_pie_press_key_local_validation_missing_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v9.0.0 — create_anim_blueprint (AnimGraph domain opens)
+# ---------------------------------------------------------------------------
+
+
+def test_create_anim_blueprint_success() -> None:
+    response = (
+        b'{"ok":true,"command":"create_anim_blueprint",'
+        b'"blueprint_path":"/Game/Blueprints/ABP_Test",'
+        b'"skeleton":"/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton",'
+        b'"parent_class":"AnimInstance","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_anim_blueprint(
+            name="ABP_Test",
+            skeleton="/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton",
+        )
+    assert r["ok"] is True
+    assert r["parent_class"] == "AnimInstance"
+    assert r["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "create_anim_blueprint",
+        "name": "ABP_Test",
+        "skeleton": "/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton",
+        "path": "/Game/Blueprints",
+    }
+
+
+def test_create_anim_blueprint_handles_no_skeleton() -> None:
+    response = (
+        b'{"ok":false,"command":"create_anim_blueprint","error":"skeleton_not_found",'
+        b'"detail":"/Game/NoSkel"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_anim_blueprint(name="X", skeleton="/Game/NoSkel")
+    assert r["ok"] is False
+    assert r["error"] == "skeleton_not_found"
+
+
+def test_create_anim_blueprint_local_validation() -> None:
+    assert server.create_anim_blueprint(name="", skeleton="/Game/X")["error"] == "missing_argument"
+    assert server.create_anim_blueprint(name="X", skeleton="")["error"] == "missing_argument"
+
+
+@requires_ue_editor(extra_reason="Project needs a USkeleton asset like SK_Mannequin_Skeleton")
+def test_create_anim_blueprint_against_real_plugin() -> None:
+    """Integration: actually create + save an AnimBP referencing the engine mannequin skeleton."""
+    r = server.create_anim_blueprint(
+        name="ABP_V9Test",
+        skeleton="/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton",
+        path="/Game/Tests",
+    )
+    assert r["ok"] is True
+    assert r["parent_class"] == "AnimInstance"
+
+
+# ---------------------------------------------------------------------------
 # v8.0.2 — migrate_dispatchers + plugin_version in ping
 # ---------------------------------------------------------------------------
 
