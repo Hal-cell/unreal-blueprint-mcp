@@ -6,17 +6,80 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-No outstanding bugs. Hal's rev4 smoke-test report (2026-05-21) closed all of:
-- 7 original bugs (BUG-1..7 from v7 testing)
-- 3 follow-up issues (`call_blueprint_function` compile order, MCP command
-  logging, `read_log_capture` category filter)
-- 2 plugin enhancements (dispatcher recovery: `delete_event_dispatcher`
-  + `migrate_dispatchers`)
+Roadmap (3 directions from rev4 close-out):
+- **AnimGraph / UMG / Niagara node support** — each is a separate editor subsystem
+  with its own graph schema. Targeting minimum slices in v9.x.
+- (Done in v8.1.0) Auto-migration of legacy dispatchers — including the
+  "ghost dispatcher" recreate case.
+- (Done in v8.2.0) Headless test harness — gated integration tests + script.
 
-Only standing item: legacy "ghost dispatcher" assets created by pre-v7.1.2
-builds (where both signature graph AND member variable were lost) need
-manual recreation via `add_event_dispatcher`. Has a clear recovery path;
-documented in the relevant tool docstrings.
+---
+
+## [v8.2.0] — 2026-05-21 — Integration test harness
+
+### Added
+- **`server/tests/conftest.py`** with `requires_ue_editor()` decorator. Two gates:
+  - `BLUEPRINTMCP_INTEGRATION=1` env var (opt-in)
+  - UE editor reachable on `127.0.0.1:55558` (cached probe)
+  Replaces 16 ad-hoc `@pytest.mark.skip(reason="Requires UE editor + ...")`
+  decorators throughout the test file.
+- **`scripts/run_integration_tests.sh`** — probes UE first, sets the env var,
+  runs pytest filtered to `*_against_real_plugin` tests. Forwards any extra
+  pytest flags (`-v`, `--tb=long`, `-k`...).
+- **`scripts/README.md`** — usage docs + sketch of a future self-hosted-runner
+  GitHub Actions workflow (UE binaries too big / licensed for cloud CI).
+
+### Tests
+- 127 unit (unchanged), 16 integration (gated; same set, now reachable via
+  the harness rather than per-test `skip(...)`).
+- Confirmed: env-var-off run still produces 16 cleanly-skipped tests with
+  precise reason strings.
+
+### No dylib changes
+This release is server-side + scripts. `ping.plugin_version` stays `"8.1.0"`.
+
+---
+
+## [v8.1.0] — 2026-05-21 — migrate_dispatchers: ghost detection + recreate
+
+### Extended `migrate_dispatchers`
+Closes the only remaining roadmap item from rev4 — legacy dispatcher recovery
+now covers all three damage modes:
+
+  - **Mode 1 — "graph present, variable missing"** (pre-v7.1.2 partial damage):
+    Pass 1 back-fills member variable. (Existed in v8.0.2.)
+  - **Mode 2 — "variable present, graph missing"**: Pass 2 detects + reports
+    only. (Existed in v8.0.2.)
+  - **Mode 3 — "ghost dispatcher" — both missing, but K2Node_CallDelegate /
+    AddDelegate / RemoveDelegate nodes still reference the dead name**:
+    Pass 3 scans every graph (UbergraphPages + FunctionGraphs + MacroGraphs)
+    for `UK2Node_BaseMCDelegate` instances whose
+    `DelegateReference.GetMemberName()` doesn't resolve. Collects unique names
+    into `ghosts_detected`. With `recreate_ghosts=True`, Pass 4 recreates
+    each ghost with empty signature via `CreateDispatcherInternal` (extracted
+    from `add_event_dispatcher`).
+
+### Refactoring
+- `add_event_dispatcher` core logic extracted into private
+  `CreateDispatcherInternal(BP, name, params, types, &OutError)` helper.
+  Caller batches `MarkStructurallyModified` + compile + save.
+
+### Response gains 4 fields
+`ghosts_detected_count`, `ghosts_detected`, `ghosts_recreated_count`,
+`ghosts_recreated`, `recreate_ghosts_requested`.
+
+### Tool count
+48 (unchanged — feature extension on existing tool).
+
+### Tests
+125 → 127 (+2: dry-run + active recreate).
+
+### `ping.plugin_version`
+"8.0.3" → **"8.1.0"**.
+
+### Caveats
+- Recreated ghosts have **empty signatures** — pin types of the old caller nodes
+  are NOT inferred (documented limit). User can add params manually after.
 
 ---
 

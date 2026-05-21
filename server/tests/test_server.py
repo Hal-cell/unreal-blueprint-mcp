@@ -11,6 +11,8 @@ from unittest import mock
 
 import pytest
 
+from conftest import requires_ue_editor
+
 from unreal_blueprint_mcp import server
 
 
@@ -1253,14 +1255,14 @@ def test_wire_imc_subscribe_handles_anchor_collision() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin loaded")
+@requires_ue_editor(extra_reason="BlueprintMCP plugin loaded")
 def test_ping_ue_against_real_plugin() -> None:
     result = server.ping_ue()
     assert result["ok"] is True
     assert "version" in result
 
 
-@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin loaded")
+@requires_ue_editor(extra_reason="BlueprintMCP plugin loaded")
 def test_create_blueprint_against_real_plugin() -> None:
     """Manual spike test: creates an asset in the running editor. Un-skip in spike B1."""
     result = server.create_blueprint(name="BP_TestSpikeB1", parent_class="Actor")
@@ -1268,7 +1270,7 @@ def test_create_blueprint_against_real_plugin() -> None:
     assert result["blueprint_path"].endswith("BP_TestSpikeB1")
 
 
-@pytest.mark.skip(reason="Requires UE editor + BlueprintMCP plugin + a Blueprint to add to")
+@requires_ue_editor(extra_reason="BlueprintMCP plugin + a Blueprint to add to")
 def test_add_node_against_real_plugin() -> None:
     """Manual spike test: adds a PrintString node to BP_TestSpikeB1_v2. Un-skip in spike B2."""
     result = server.add_node(
@@ -1282,7 +1284,7 @@ def test_add_node_against_real_plugin() -> None:
     assert result["function"] == "PrintString"
 
 
-@pytest.mark.skip(reason="Requires UE editor + plugin + a node with anchor 'print_hello' on it")
+@requires_ue_editor(extra_reason="plugin + a node with anchor 'print_hello' on it")
 def test_set_pin_default_against_real_plugin() -> None:
     """Manual spike test: changes print_hello.InString default to 'hello world'."""
     result = server.set_pin_default(
@@ -1294,7 +1296,7 @@ def test_set_pin_default_against_real_plugin() -> None:
     assert result["value"] == "hello world"
 
 
-@pytest.mark.skip(reason="Requires UE editor + plugin + BP with begin_play and print_hello nodes")
+@requires_ue_editor(extra_reason="plugin + BP with begin_play and print_hello nodes")
 def test_connect_pins_against_real_plugin() -> None:
     """Manual spike test: wires BeginPlay.then -> print_hello.execute."""
     result = server.connect_pins(
@@ -1305,7 +1307,7 @@ def test_connect_pins_against_real_plugin() -> None:
     assert result["ok"] is True
 
 
-@pytest.mark.skip(reason="Requires UE editor + plugin + a complete wired BP to compile")
+@requires_ue_editor(extra_reason="plugin + a complete wired BP to compile")
 def test_compile_blueprint_against_real_plugin() -> None:
     """Manual spike test: compiles BP_TestSpikeB1_v2 (should be wired by B4)."""
     result = server.compile_blueprint(name="/Game/Blueprints/BP_TestSpikeB1_v2")
@@ -1313,7 +1315,7 @@ def test_compile_blueprint_against_real_plugin() -> None:
     assert result["status"] in ("up_to_date", "warnings")
 
 
-@pytest.mark.skip(reason="Requires UE editor + plugin + a compiled Actor BP")
+@requires_ue_editor(extra_reason="plugin + a compiled Actor BP")
 def test_spawn_actor_against_real_plugin() -> None:
     """Manual spike test: spawns BP_TestSpikeB1_v2 into current level."""
     result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
@@ -1460,7 +1462,7 @@ def test_set_component_property_empty_value_allowed() -> None:
     assert sent_dict["value"] == ""
 
 
-@pytest.mark.skip(reason="Requires UE editor + BP_TargetDummy with VisualMesh + TriggerBox")
+@requires_ue_editor(extra_reason="BP_TargetDummy with VisualMesh + TriggerBox")
 def test_set_component_property_against_real_plugin() -> None:
     """Manual integration: assign Cube mesh + grow box + set collision preset."""
     r1 = server.set_component_property(
@@ -1640,7 +1642,7 @@ def test_v72_local_validation_missing_args() -> None:
     assert server.add_select(blueprint="", anchor_name="")["error"] == "missing_argument"
 
 
-@pytest.mark.skip(reason="Requires UE editor + a BP to add nodes to")
+@requires_ue_editor(extra_reason="a BP to add nodes to")
 def test_v72_against_real_plugin() -> None:
     """Manual integration: spawn each v7.2 node type into a fresh BP."""
     bp = "/Game/Blueprints/BP_V72_Smoke"
@@ -1815,7 +1817,7 @@ def test_add_variable_object_ref_handles_unknown_class() -> None:
     assert r["error"] == "unknown_variable_type"
 
 
-@pytest.mark.skip(reason="Requires UE editor + a BP")
+@requires_ue_editor(extra_reason="a BP")
 def test_v74_object_ref_against_real_plugin() -> None:
     """Manual integration: add Actor ref + Pawn class ref vars to a BP."""
     bp = "/Game/Blueprints/BP_V74_Smoke"
@@ -2031,7 +2033,7 @@ def test_v76_local_validation_missing_args() -> None:
     assert server.add_unbind_dispatcher(blueprint="", dispatcher_name="", anchor_name="")["error"] == "missing_argument"
 
 
-@pytest.mark.skip(reason="Requires UE editor + BP with event dispatcher pattern")
+@requires_ue_editor(extra_reason="BP with event dispatcher pattern")
 def test_v76_full_dispatcher_loop_against_real_plugin() -> None:
     """Manual integration: define dispatcher, custom event matching it, bind+call+unbind."""
     bp = "/Game/Blueprints/BP_V76_Dispatcher"
@@ -2165,7 +2167,7 @@ def test_add_node_handles_graph_not_found() -> None:
     assert r["error"] == "graph_not_found"
 
 
-@pytest.mark.skip(reason="Requires UE editor + BP with a user function 'MyFunc'")
+@requires_ue_editor(extra_reason="BP with a user function 'MyFunc'")
 def test_v77_function_body_against_real_plugin() -> None:
     """Manual integration: add_function then write nodes inside its graph."""
     bp = "/Game/Blueprints/BP_V77_FuncBody"
@@ -2221,7 +2223,7 @@ def test_save_blueprint_local_validation_missing_arg() -> None:
     assert r["error"] == "missing_argument"
 
 
-@pytest.mark.skip(reason="Requires UE editor + a modified BP")
+@requires_ue_editor(extra_reason="a modified BP")
 def test_save_blueprint_against_real_plugin() -> None:
     r = server.save_blueprint(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
     assert r["ok"] is True
@@ -2471,7 +2473,7 @@ def test_ping_returns_plugin_version() -> None:
     assert "build_date" in r
 
 
-@pytest.mark.skip(reason="Requires UE editor + a pre-v7.1.2 BP with broken dispatchers")
+@requires_ue_editor(extra_reason="a pre-v7.1.2 BP with broken dispatchers")
 def test_migrate_dispatchers_against_real_plugin() -> None:
     """Manual integration: scan + repair an old BP, then verify add_call_dispatcher works."""
     bp = "/Game/Blueprints/BP_V76_v2"
@@ -2545,7 +2547,7 @@ def test_delete_event_dispatcher_local_validation() -> None:
     assert server.delete_event_dispatcher(blueprint="/Game/BP", dispatcher_name="")["error"] == "missing_argument"
 
 
-@pytest.mark.skip(reason="Requires UE editor + a pre-v7.1.2 broken dispatcher")
+@requires_ue_editor(extra_reason="a pre-v7.1.2 broken dispatcher")
 def test_delete_event_dispatcher_recovery_path() -> None:
     """Manual integration: nuke old broken dispatcher, re-add with new dylib."""
     bp = "/Game/Blueprints/BP_V76_v2"   # the BP from OPEN-1 with old broken OnDeath
@@ -2565,7 +2567,7 @@ def test_delete_event_dispatcher_recovery_path() -> None:
     assert "Source" in pin_names, f"OPEN-1 NOT fixed: pins={pins}"
 
 
-@pytest.mark.skip(reason="Requires UE editor — agentic loop demo")
+@requires_ue_editor(extra_reason="agentic loop demo")
 def test_v8_agentic_loop_against_real_plugin() -> None:
     """Manual integration: write hello-world BP → spawn → PIE → read log → stop."""
     bp = "/Game/Blueprints/BP_V8_AgenticLoop"
