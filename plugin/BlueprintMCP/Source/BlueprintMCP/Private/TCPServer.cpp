@@ -3027,6 +3027,320 @@ namespace
             LocX, LocY, LocZ);
     }
 
+    // ===== v9.7.0 — Level / instance manipulation =====
+    //
+    // Closes feature-request gaps #2/#3/#6 from the 2026-05-21 review:
+    //   list_level_actors  — read what's in the level (LLM is no longer "blind")
+    //   get_actor_transform — read position of a spawned instance
+    //   set_actor_transform — move an instance (don't re-spawn → no duplicates)
+    //   set_actor_property  — set per-instance property (NOT the BP CDO);
+    //                         supports another actor's name for AActor refs
+    //   delete_actor        — remove from level
+    //
+    // Actor lookup uses GetName() OR GetActorLabel() — both work, since
+    // spawn_actor returns GetName() but Outliner shows GetActorLabel().
+
+    /** Find an actor in the editor world by GetName() or GetActorLabel(). */
+    AActor* FindActorByNameOrLabel(const FString& NameOrLabel)
+    {
+        if (GEditor == nullptr) return nullptr;
+        UEditorActorSubsystem* AS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+        if (AS == nullptr) return nullptr;
+        TArray<AActor*> All = AS->GetAllLevelActors();
+        for (AActor* A : All)
+        {
+            if (A == nullptr) continue;
+            if (A->GetName() == NameOrLabel || A->GetActorLabel() == NameOrLabel)
+                return A;
+        }
+        return nullptr;
+    }
+
+    FString ListLevelActorsOnGameThread(
+        const FString& ClassFilter,
+        const FString& NameContains,
+        int32 MaxResults)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("list_level_actors");
+
+        if (GEditor == nullptr)
+            return JsonError(CmdName, TEXT("no_editor"), TEXT("GEditor null"));
+        UEditorActorSubsystem* AS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+        if (AS == nullptr)
+            return JsonError(CmdName, TEXT("no_actor_subsystem"));
+
+        // Resolve class filter — accepts bare class name OR /Script/Module.Class
+        UClass* FilterClass = nullptr;
+        if (!ClassFilter.IsEmpty())
+        {
+            if (ClassFilter.StartsWith(TEXT("/Script/")))
+            {
+                FilterClass = LoadObject<UClass>(nullptr, *ClassFilter);
+            }
+            else
+            {
+                for (TObjectIterator<UClass> It; It; ++It)
+                {
+                    if (It->GetName() == ClassFilter)
+                    {
+                        FilterClass = *It;
+                        break;
+                    }
+                }
+            }
+            if (FilterClass == nullptr)
+                return JsonError(CmdName, TEXT("class_not_found"), ClassFilter);
+        }
+
+        TArray<AActor*> All = AS->GetAllLevelActors();
+
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), CmdName);
+        Writer->WriteValue(TEXT("class_filter"), ClassFilter);
+        Writer->WriteArrayStart(TEXT("actors"));
+
+        int32 Count = 0;
+        for (AActor* A : All)
+        {
+            if (A == nullptr) continue;
+            if (FilterClass != nullptr && !A->IsA(FilterClass)) continue;
+            if (!NameContains.IsEmpty()
+                && !A->GetName().Contains(NameContains, ESearchCase::IgnoreCase)
+                && !A->GetActorLabel().Contains(NameContains, ESearchCase::IgnoreCase))
+                continue;
+
+            const FVector Loc = A->GetActorLocation();
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), A->GetName());
+            Writer->WriteValue(TEXT("label"), A->GetActorLabel());
+            Writer->WriteValue(TEXT("class"), A->GetClass()->GetName());
+            Writer->WriteArrayStart(TEXT("location"));
+            Writer->WriteValue(Loc.X);
+            Writer->WriteValue(Loc.Y);
+            Writer->WriteValue(Loc.Z);
+            Writer->WriteArrayEnd();
+            Writer->WriteObjectEnd();
+
+            ++Count;
+            if (MaxResults > 0 && Count >= MaxResults) break;
+        }
+        Writer->WriteArrayEnd();
+        Writer->WriteValue(TEXT("count"), Count);
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
+    FString GetActorTransformOnGameThread(const FString& ActorName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("get_actor_transform");
+        AActor* A = FindActorByNameOrLabel(ActorName);
+        if (A == nullptr)
+            return JsonError(CmdName, TEXT("actor_not_found"), ActorName);
+
+        const FTransform& T = A->GetActorTransform();
+        const FVector Loc = T.GetLocation();
+        const FRotator Rot = T.Rotator();
+        const FVector Scale = T.GetScale3D();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"get_actor_transform\",\"actor\":%s,\"label\":%s,\"class\":%s,")
+            TEXT("\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f],\"scale\":[%f,%f,%f]}\n"),
+            *EscapeJsonString(A->GetName()),
+            *EscapeJsonString(A->GetActorLabel()),
+            *EscapeJsonString(A->GetClass()->GetName()),
+            Loc.X, Loc.Y, Loc.Z,
+            Rot.Pitch, Rot.Yaw, Rot.Roll,
+            Scale.X, Scale.Y, Scale.Z);
+    }
+
+    FString SetActorTransformOnGameThread(
+        const FString& ActorName,
+        FVector Loc, FRotator Rot, FVector Scale,
+        bool bSetLoc, bool bSetRot, bool bSetScale)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_actor_transform");
+        AActor* A = FindActorByNameOrLabel(ActorName);
+        if (A == nullptr)
+            return JsonError(CmdName, TEXT("actor_not_found"), ActorName);
+
+        FTransform NewT = A->GetActorTransform();
+        if (bSetLoc)   NewT.SetLocation(Loc);
+        if (bSetRot)   NewT.SetRotation(Rot.Quaternion());
+        if (bSetScale) NewT.SetScale3D(Scale);
+
+        A->Modify();
+        const bool bMoved = A->SetActorTransform(NewT, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+
+        // Mark level package dirty so save_all persists the change.
+        if (A->GetLevel() != nullptr && A->GetLevel()->GetOutermost() != nullptr)
+            A->GetLevel()->GetOutermost()->MarkPackageDirty();
+
+        const FVector OutLoc = NewT.GetLocation();
+        const FRotator OutRot = NewT.Rotator();
+        const FVector OutScale = NewT.GetScale3D();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_actor_transform\",\"actor\":%s,\"moved\":%s,")
+            TEXT("\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f],\"scale\":[%f,%f,%f]}\n"),
+            *EscapeJsonString(A->GetName()),
+            bMoved ? TEXT("true") : TEXT("false"),
+            OutLoc.X, OutLoc.Y, OutLoc.Z,
+            OutRot.Pitch, OutRot.Yaw, OutRot.Roll,
+            OutScale.X, OutScale.Y, OutScale.Z);
+    }
+
+    /**
+     * Set a property on a level actor INSTANCE (not the BP CDO — see
+     * v7's set_component_property for that). For AActor-typed properties,
+     * Value can be another actor's name/label — resolved before the
+     * asset-path fallback. Per the feature-request doc this is the "set
+     * PortalA.LinkedPortal = PortalB" case.
+     */
+    FString SetActorPropertyOnGameThread(
+        const FString& ActorName,
+        const FString& PropertyPath,
+        const FString& Value)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_actor_property");
+        AActor* A = FindActorByNameOrLabel(ActorName);
+        if (A == nullptr)
+            return JsonError(CmdName, TEXT("actor_not_found"), ActorName);
+
+        void* ValuePtr = nullptr;
+        FProperty* LeafProp = WalkPropertyPath(A->GetClass(), A, PropertyPath, ValuePtr);
+        if (LeafProp == nullptr || ValuePtr == nullptr)
+            return JsonError(CmdName, TEXT("property_not_found"),
+                FString::Printf(TEXT("Actor '%s' (class %s) has no property '%s'"),
+                    *ActorName, *A->GetClass()->GetName(), *PropertyPath));
+
+        A->PreEditChange(LeafProp);
+
+        FString ResolvedValueStr;
+        FString ErrorDetail;
+        bool bSuccess = false;
+
+        if (FObjectProperty* ObjProp = CastField<FObjectProperty>(LeafProp))
+        {
+            UObject* Ref = nullptr;
+            const bool bClear = Value.IsEmpty()
+                || Value.Equals(TEXT("None"), ESearchCase::IgnoreCase)
+                || Value.Equals(TEXT("null"), ESearchCase::IgnoreCase);
+            if (!bClear)
+            {
+                // v9.7.0 — for AActor-typed properties, try another level actor first.
+                if (ObjProp->PropertyClass != nullptr && ObjProp->PropertyClass->IsChildOf(AActor::StaticClass()))
+                {
+                    AActor* OtherActor = FindActorByNameOrLabel(Value);
+                    if (OtherActor != nullptr && OtherActor->IsA(ObjProp->PropertyClass))
+                        Ref = OtherActor;
+                }
+                // Fall back: asset path
+                if (Ref == nullptr)
+                    Ref = LoadObject<UObject>(nullptr, *Value);
+                if (Ref == nullptr)
+                    ErrorDetail = FString::Printf(
+                        TEXT("Cannot resolve '%s' (tried as actor name + asset path)"), *Value);
+                else if (!Ref->IsA(ObjProp->PropertyClass))
+                {
+                    ErrorDetail = FString::Printf(
+                        TEXT("'%s' is %s but property expects %s"),
+                        *Value, *Ref->GetClass()->GetName(), *ObjProp->PropertyClass->GetName());
+                    Ref = nullptr;
+                }
+            }
+            if (ErrorDetail.IsEmpty())
+            {
+                ObjProp->SetObjectPropertyValue(ValuePtr, Ref);
+                ResolvedValueStr = (Ref != nullptr) ? Ref->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        else if (FClassProperty* ClassProp = CastField<FClassProperty>(LeafProp))
+        {
+            UClass* Class = nullptr;
+            const bool bClear = Value.IsEmpty() || Value.Equals(TEXT("None"), ESearchCase::IgnoreCase);
+            if (!bClear)
+            {
+                Class = LoadObject<UClass>(nullptr, *Value);
+                if (Class == nullptr)
+                    ErrorDetail = FString::Printf(TEXT("Class not found: %s"), *Value);
+                else if (ClassProp->MetaClass != nullptr && !Class->IsChildOf(ClassProp->MetaClass))
+                {
+                    ErrorDetail = FString::Printf(TEXT("'%s' is not a subclass of %s"),
+                        *Value, *ClassProp->MetaClass->GetName());
+                    Class = nullptr;
+                }
+            }
+            if (ErrorDetail.IsEmpty())
+            {
+                ClassProp->SetObjectPropertyValue(ValuePtr, Class);
+                ResolvedValueStr = (Class != nullptr) ? Class->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        else
+        {
+            FString NormalizedValue = Value;
+            if (FStructProperty* StructProp = CastField<FStructProperty>(LeafProp))
+            {
+                if (IsSupportedStructForDefault(StructProp->Struct))
+                    NormalizedValue = FormatStructDefault(StructProp->Struct, Value);
+            }
+            const TCHAR* Buffer = *NormalizedValue;
+            const TCHAR* Result = LeafProp->ImportText_Direct(Buffer, ValuePtr, /*OwnerObject*/ A, PPF_None);
+            if (Result == nullptr)
+                ErrorDetail = FString::Printf(TEXT("Failed to parse '%s' for property '%s' (type %s)"),
+                    *NormalizedValue, *PropertyPath, *LeafProp->GetClass()->GetName());
+            else
+            {
+                ResolvedValueStr = NormalizedValue;
+                bSuccess = true;
+            }
+        }
+
+        if (!bSuccess)
+            return JsonError(CmdName, TEXT("set_failed"), ErrorDetail);
+
+        FPropertyChangedEvent ChangeEvent(LeafProp, EPropertyChangeType::ValueSet);
+        A->PostEditChangeProperty(ChangeEvent);
+        if (A->GetLevel() != nullptr && A->GetLevel()->GetOutermost() != nullptr)
+            A->GetLevel()->GetOutermost()->MarkPackageDirty();
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_actor_property\",\"actor\":%s,\"property\":%s,\"resolved_value\":%s}\n"),
+            *EscapeJsonString(A->GetName()),
+            *EscapeJsonString(PropertyPath),
+            *EscapeJsonString(ResolvedValueStr));
+    }
+
+    FString DeleteActorOnGameThread(const FString& ActorName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_actor");
+        AActor* A = FindActorByNameOrLabel(ActorName);
+        if (A == nullptr)
+            return JsonError(CmdName, TEXT("actor_not_found"), ActorName);
+        if (GEditor == nullptr)
+            return JsonError(CmdName, TEXT("no_editor"));
+        UEditorActorSubsystem* AS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+        if (AS == nullptr)
+            return JsonError(CmdName, TEXT("no_actor_subsystem"));
+
+        const FString DeletedName = A->GetName();
+        const bool bOk = AS->DestroyActor(A);
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"delete_actor\",\"actor\":%s,\"destroyed\":%s}\n"),
+            *EscapeJsonString(DeletedName),
+            bOk ? TEXT("true") : TEXT("false"));
+    }
+
     /**
      * Compile a Blueprint. MUST run on the game thread.
      * Returns a complete JSON response line (with trailing \n).
@@ -5210,7 +5524,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.6.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.7.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6090,6 +6404,142 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             UE_LOG(LogBlueprintMCP_TCP, Error, TEXT("spawn_actor timed out"));
             return JsonError(TEXT("spawn_actor"), TEXT("game_thread_timeout"));
         }
+        return Future.Get();
+    }
+
+    // --- v9.7.0 list_level_actors ---
+    if (Command.Equals(TEXT("list_level_actors"), ESearchCase::IgnoreCase))
+    {
+        FString ClassFilter, NameContains;
+        JsonObject->TryGetStringField(TEXT("class_filter"), ClassFilter);
+        JsonObject->TryGetStringField(TEXT("name_contains"), NameContains);
+        int32 MaxResults = 500;
+        JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ClassFilter, NameContains, MaxResults]() mutable
+            {
+                Promise.SetValue(ListLevelActorsOnGameThread(ClassFilter, NameContains, MaxResults));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_level_actors"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.7.0 get_actor_transform ---
+    if (Command.Equals(TEXT("get_actor_transform"), ESearchCase::IgnoreCase))
+    {
+        FString ActorName;
+        if (!JsonObject->TryGetStringField(TEXT("actor"), ActorName) || ActorName.IsEmpty())
+            return JsonError(TEXT("get_actor_transform"), TEXT("missing_field"), TEXT("actor"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ActorName]() mutable
+            {
+                Promise.SetValue(GetActorTransformOnGameThread(ActorName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_actor_transform"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.7.0 set_actor_transform ---
+    // Any of location/rotation/scale may be omitted — only fields that were
+    // supplied in the JSON get applied. bSetLoc/bSetRot/bSetScale tracks which.
+    if (Command.Equals(TEXT("set_actor_transform"), ESearchCase::IgnoreCase))
+    {
+        FString ActorName;
+        if (!JsonObject->TryGetStringField(TEXT("actor"), ActorName) || ActorName.IsEmpty())
+            return JsonError(TEXT("set_actor_transform"), TEXT("missing_field"), TEXT("actor"));
+
+        FVector Loc = FVector::ZeroVector;
+        FRotator Rot = FRotator::ZeroRotator;
+        FVector Scale = FVector::OneVector;
+        bool bSetLoc = false, bSetRot = false, bSetScale = false;
+
+        const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("location"), LocArr) && LocArr->Num() >= 3)
+        {
+            Loc.X = (*LocArr)[0]->AsNumber();
+            Loc.Y = (*LocArr)[1]->AsNumber();
+            Loc.Z = (*LocArr)[2]->AsNumber();
+            bSetLoc = true;
+        }
+        const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("rotation"), RotArr) && RotArr->Num() >= 3)
+        {
+            Rot.Pitch = (*RotArr)[0]->AsNumber();
+            Rot.Yaw   = (*RotArr)[1]->AsNumber();
+            Rot.Roll  = (*RotArr)[2]->AsNumber();
+            bSetRot = true;
+        }
+        const TArray<TSharedPtr<FJsonValue>>* ScaleArr = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("scale"), ScaleArr) && ScaleArr->Num() >= 3)
+        {
+            Scale.X = (*ScaleArr)[0]->AsNumber();
+            Scale.Y = (*ScaleArr)[1]->AsNumber();
+            Scale.Z = (*ScaleArr)[2]->AsNumber();
+            bSetScale = true;
+        }
+
+        if (!bSetLoc && !bSetRot && !bSetScale)
+            return JsonError(TEXT("set_actor_transform"), TEXT("no_change_specified"),
+                TEXT("Provide at least one of: location, rotation, scale"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ActorName, Loc, Rot, Scale, bSetLoc, bSetRot, bSetScale]() mutable
+            {
+                Promise.SetValue(SetActorTransformOnGameThread(ActorName, Loc, Rot, Scale, bSetLoc, bSetRot, bSetScale));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_actor_transform"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.7.0 set_actor_property ---
+    if (Command.Equals(TEXT("set_actor_property"), ESearchCase::IgnoreCase))
+    {
+        FString ActorName, PropertyPath, Value;
+        if (!JsonObject->TryGetStringField(TEXT("actor"), ActorName) || ActorName.IsEmpty())
+            return JsonError(TEXT("set_actor_property"), TEXT("missing_field"), TEXT("actor"));
+        if (!JsonObject->TryGetStringField(TEXT("property"), PropertyPath) || PropertyPath.IsEmpty())
+            return JsonError(TEXT("set_actor_property"), TEXT("missing_field"), TEXT("property"));
+        JsonObject->TryGetStringField(TEXT("value"), Value);   // value may legitimately be empty (== clear)
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ActorName, PropertyPath, Value]() mutable
+            {
+                Promise.SetValue(SetActorPropertyOnGameThread(ActorName, PropertyPath, Value));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_actor_property"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.7.0 delete_actor ---
+    if (Command.Equals(TEXT("delete_actor"), ESearchCase::IgnoreCase))
+    {
+        FString ActorName;
+        if (!JsonObject->TryGetStringField(TEXT("actor"), ActorName) || ActorName.IsEmpty())
+            return JsonError(TEXT("delete_actor"), TEXT("missing_field"), TEXT("actor"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ActorName]() mutable
+            {
+                Promise.SetValue(DeleteActorOnGameThread(ActorName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_actor"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

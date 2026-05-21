@@ -3393,3 +3393,217 @@ def test_ping_returns_plugin_version_9_6_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.6.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.7.0 — Level / instance manipulation
+# ---------------------------------------------------------------------------
+
+
+def test_list_level_actors_success() -> None:
+    response = (
+        b'{"ok":true,"command":"list_level_actors","class_filter":"",'
+        b'"actors":[{"name":"BP_Portal_C_1","label":"Portal A","class":"BP_Portal_C",'
+        b'"location":[100.0,200.0,50.0]}],"count":1}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_level_actors()
+    assert r["ok"] is True
+    assert r["count"] == 1
+    assert r["actors"][0]["label"] == "Portal A"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    # Empty filters omitted
+    assert sent_dict == {"command": "list_level_actors", "max_results": 500}
+
+
+def test_list_level_actors_with_filters() -> None:
+    response = b'{"ok":true,"command":"list_level_actors","actors":[],"count":0}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_level_actors(class_filter="StaticMeshActor", name_contains="floor", max_results=50)
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["class_filter"] == "StaticMeshActor"
+    assert sent_dict["name_contains"] == "floor"
+    assert sent_dict["max_results"] == 50
+
+
+def test_get_actor_transform_success() -> None:
+    response = (
+        b'{"ok":true,"command":"get_actor_transform","actor":"BP_Portal_C_1",'
+        b'"label":"Portal A","class":"BP_Portal_C",'
+        b'"location":[100.0,200.0,50.0],"rotation":[0.0,90.0,0.0],"scale":[1.0,1.0,1.0]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_actor_transform(actor="BP_Portal_C_1")
+    assert r["ok"] is True
+    assert r["location"] == [100.0, 200.0, 50.0]
+    assert r["rotation"][1] == 90.0
+
+
+def test_get_actor_transform_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"get_actor_transform","error":"actor_not_found",'
+        b'"detail":"Ghost"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_actor_transform(actor="Ghost")
+    assert r["ok"] is False
+    assert r["error"] == "actor_not_found"
+
+
+def test_get_actor_transform_local_validation() -> None:
+    assert server.get_actor_transform(actor="")["error"] == "missing_argument"
+
+
+def test_set_actor_transform_location_only() -> None:
+    response = (
+        b'{"ok":true,"command":"set_actor_transform","actor":"BP_Portal_C_1","moved":true,'
+        b'"location":[500.0,0.0,100.0],"rotation":[0.0,0.0,0.0],"scale":[1.0,1.0,1.0]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_actor_transform(actor="BP_Portal_C_1", location=[500, 0, 100])
+    assert r["ok"] is True
+    assert r["moved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["location"] == [500, 0, 100]
+    assert "rotation" not in sent_dict   # only location was set
+    assert "scale" not in sent_dict
+
+
+def test_set_actor_transform_all_fields() -> None:
+    response = b'{"ok":true,"command":"set_actor_transform","actor":"A","moved":true,"location":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.set_actor_transform(
+            actor="A",
+            location=[1, 2, 3],
+            rotation=[10, 20, 30],
+            scale=[2, 2, 2],
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["location"] == [1, 2, 3]
+    assert sent_dict["rotation"] == [10, 20, 30]
+    assert sent_dict["scale"] == [2, 2, 2]
+
+
+def test_set_actor_transform_local_validation() -> None:
+    assert server.set_actor_transform(actor="")["error"] == "missing_argument"
+
+
+def test_set_actor_property_string() -> None:
+    response = (
+        b'{"ok":true,"command":"set_actor_property","actor":"PortalA",'
+        b'"property":"DisplayName","resolved_value":"East Portal"}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_actor_property(actor="PortalA", property="DisplayName", value="East Portal")
+    assert r["ok"] is True
+    assert r["resolved_value"] == "East Portal"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_actor_property",
+        "actor": "PortalA",
+        "property": "DisplayName",
+        "value": "East Portal",
+    }
+
+
+def test_set_actor_property_actor_ref() -> None:
+    """The double-portal canonical use case: pass another actor's name as value."""
+    response = (
+        b'{"ok":true,"command":"set_actor_property","actor":"PortalA",'
+        b'"property":"LinkedPortal","resolved_value":"/Game/Maps/Demo.Demo:PersistentLevel.BP_Portal_C_2"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_actor_property(actor="PortalA", property="LinkedPortal", value="PortalB")
+    assert r["ok"] is True
+    assert "LinkedPortal" not in r.get("resolved_value", "")  # path is what's returned
+
+
+def test_set_actor_property_local_validation() -> None:
+    assert server.set_actor_property(actor="", property="X")["error"] == "missing_argument"
+    assert server.set_actor_property(actor="A", property="")["error"] == "missing_argument"
+
+
+def test_delete_actor_success() -> None:
+    response = b'{"ok":true,"command":"delete_actor","actor":"PortalA","destroyed":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_actor(actor="PortalA")
+    assert r["ok"] is True
+    assert r["destroyed"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "delete_actor", "actor": "PortalA"}
+
+
+def test_delete_actor_local_validation() -> None:
+    assert server.delete_actor(actor="")["error"] == "missing_argument"
+
+
+@skip_if_headless("level actor ops require a loaded level with persistent actors")
+@requires_ue_editor(extra_reason="v9.7.0 level/instance ops end-to-end")
+def test_v9_7_level_actor_ops_against_real_plugin() -> None:
+    """End-to-end: spawn → list → get transform → set transform → delete."""
+    import uuid
+
+    # 1. Spawn a BP to operate on.
+    bp_name = f"BP_V97Test_{uuid.uuid4().hex[:6]}"
+    cr = server.create_blueprint(name=bp_name, path="/Game/Tests")
+    assert cr["ok"], f"create_blueprint failed: {cr}"
+    bp_path = cr["blueprint_path"]
+    assert server.compile_blueprint(name=bp_path)["ok"]
+    sp = server.spawn_actor(blueprint=bp_path, location_x=100, location_y=200, location_z=50)
+    assert sp["ok"], f"spawn_actor failed: {sp}"
+    actor_name = sp["actor_name"]
+
+    # 2. List — confirm it's visible.
+    lr = server.list_level_actors(name_contains=bp_name)
+    assert lr["ok"]
+    assert any(a["name"] == actor_name for a in lr["actors"]), (
+        f"Spawned actor {actor_name} not in list_level_actors result: "
+        f"{[a['name'] for a in lr['actors']]}"
+    )
+
+    # 3. Get transform — should match where we spawned.
+    gt = server.get_actor_transform(actor=actor_name)
+    assert gt["ok"], f"get_actor_transform failed: {gt}"
+    assert abs(gt["location"][0] - 100) < 0.5
+    assert abs(gt["location"][1] - 200) < 0.5
+
+    # 4. Move it.
+    st = server.set_actor_transform(actor=actor_name, location=[500, -300, 75])
+    assert st["ok"], f"set_actor_transform failed: {st}"
+    gt2 = server.get_actor_transform(actor=actor_name)
+    assert abs(gt2["location"][0] - 500) < 0.5
+    assert abs(gt2["location"][1] - (-300)) < 0.5
+
+    # 5. Clean up.
+    dr = server.delete_actor(actor=actor_name)
+    assert dr["ok"], f"delete_actor failed: {dr}"
+
+
+def test_ping_returns_plugin_version_9_7_0() -> None:
+    """v9.7.0: ping surfaces 9.7.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.7.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.7.0"

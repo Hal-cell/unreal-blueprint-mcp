@@ -1106,6 +1106,187 @@ def spawn_actor(
     })
 
 
+# ---------------------------------------------------------------------------
+# v9.7.0 — Level / instance manipulation
+# ---------------------------------------------------------------------------
+# Closes feature-request gaps #2/#3/#6 (the highest-priority block):
+# read what's in the level, move spawned actors, set per-instance properties.
+#
+# Actor lookup accepts either ``GetName()`` (returned by spawn_actor) OR
+# ``GetActorLabel()`` (the Outliner display name).
+
+
+@mcp.tool()
+def list_level_actors(
+    class_filter: str = "",
+    name_contains: str = "",
+    max_results: int = 500,
+) -> dict[str, Any]:
+    """List actors in the current editor level — v9.7.0.
+
+    Lets the LLM see the level layout instead of being blind to the scene.
+    Each actor is reported with its `name` (canonical UE name, what
+    ``spawn_actor`` returns), `label` (Outliner display), `class`, and
+    world-space `location` [X, Y, Z].
+
+    Args:
+        class_filter: Restrict to actors of this class. Accepts a bare
+            class name (e.g. ``"StaticMeshActor"``) or a full
+            ``"/Script/Engine.StaticMeshActor"`` path.
+        name_contains: Case-insensitive substring match against both
+            `name` and `label`.
+        max_results: Cap on number of actors returned (default 500).
+
+    Returns:
+        ``{"ok": True, "actors": [{"name", "label", "class", "location"}, ...],
+            "count": N, "class_filter": "..."}``
+
+    Common errors:
+        class_not_found       — class_filter didn't resolve to a UClass
+        no_editor / no_actor_subsystem — editor unavailable
+    """
+    payload: dict[str, Any] = {
+        "command": "list_level_actors",
+        "max_results": max_results,
+    }
+    if class_filter:
+        payload["class_filter"] = class_filter
+    if name_contains:
+        payload["name_contains"] = name_contains
+    return _send_command(payload)
+
+
+@mcp.tool()
+def get_actor_transform(actor: str) -> dict[str, Any]:
+    """Get the world-space transform of a level actor — v9.7.0.
+
+    Args:
+        actor: Actor name (`GetName()`) or label (`GetActorLabel()`).
+
+    Returns:
+        ``{"ok": True, "actor": "...", "label": "...", "class": "...",
+            "location": [X, Y, Z], "rotation": [Pitch, Yaw, Roll],
+            "scale": [X, Y, Z]}``
+
+    Common errors:
+        actor_not_found — no actor with that name or label
+    """
+    if not actor:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "get_actor_transform", "actor": actor})
+
+
+@mcp.tool()
+def set_actor_transform(
+    actor: str,
+    location: list[float] | None = None,
+    rotation: list[float] | None = None,
+    scale: list[float] | None = None,
+) -> dict[str, Any]:
+    """Move / rotate / scale a level actor (no re-spawn) — v9.7.0.
+
+    Any of the three components can be omitted — only fields that are
+    passed get applied. Marks the level package dirty so ``save_all()``
+    persists the move.
+
+    Args:
+        actor: Actor name or label.
+        location: ``[X, Y, Z]`` — world position. None = leave unchanged.
+        rotation: ``[Pitch, Yaw, Roll]`` (degrees). None = leave unchanged.
+        scale: ``[X, Y, Z]`` — relative scale. None = leave unchanged.
+
+    Returns:
+        ``{"ok": True, "actor": "...", "moved": bool,
+            "location": [...], "rotation": [...], "scale": [...]}``
+        Note: returned location/rotation/scale are the actor's final state,
+        which includes any unchanged components.
+
+    Common errors:
+        actor_not_found
+        no_change_specified — passed none of location/rotation/scale
+    """
+    if not actor:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {"command": "set_actor_transform", "actor": actor}
+    if location is not None:
+        payload["location"] = list(location)
+    if rotation is not None:
+        payload["rotation"] = list(rotation)
+    if scale is not None:
+        payload["scale"] = list(scale)
+    return _send_command(payload)
+
+
+@mcp.tool()
+def set_actor_property(
+    actor: str,
+    property: str,
+    value: str = "",
+) -> dict[str, Any]:
+    """Set a property on a level actor INSTANCE — v9.7.0.
+
+    Per-instance setter via FProperty reflection. **Different from
+    ``set_component_property``** — that one writes to the Blueprint CDO
+    (every spawned instance gets the value). This one writes only to the
+    specific actor in the level.
+
+    For ``AActor``-typed properties (e.g. ``LinkedPortal: ABP_Portal*``),
+    ``value`` can be **another actor's name or label** — it's resolved
+    against the level before falling back to asset-path lookup. This is
+    the canonical "double portal" wiring: ``set_actor_property("PortalA",
+    "LinkedPortal", "PortalB")``.
+
+    Dot-notation walks into struct fields:
+    ``"BodyInstance.CollisionProfileName"``.
+
+    Args:
+        actor: Actor name or label.
+        property: Property name or dot-separated path.
+        value: New value. Empty / "None" / "null" clears object refs.
+            For struct types accepts shorthand (e.g. ``"1,2,3"`` for
+            Vector). For object refs: another actor's name OR an asset
+            path.
+
+    Returns:
+        ``{"ok": True, "actor": "...", "property": "...",
+            "resolved_value": "..."}``
+
+    Common errors:
+        actor_not_found
+        property_not_found
+        set_failed         — value couldn't be parsed/resolved (see `detail`)
+    """
+    if not actor or not property:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_actor_property",
+        "actor": actor,
+        "property": property,
+        "value": value,
+    })
+
+
+@mcp.tool()
+def delete_actor(actor: str) -> dict[str, Any]:
+    """Destroy a level actor — v9.7.0.
+
+    Uses ``UEditorActorSubsystem::DestroyActor``. The actor is removed
+    from the level and freed; level package is marked dirty.
+
+    Args:
+        actor: Actor name or label.
+
+    Returns:
+        ``{"ok": True, "actor": "...", "destroyed": True}``
+
+    Common errors:
+        actor_not_found
+    """
+    if not actor:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "delete_actor", "actor": actor})
+
+
 @mcp.tool()
 def compile_blueprint(name: str) -> dict[str, Any]:
     """Compile a Blueprint after modifying its graph.
