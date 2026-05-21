@@ -2125,6 +2125,7 @@ def add_variable(
     name: str,
     variable_type: str,
     default_value: str = "",
+    instance_editable: bool = False,
 ) -> dict[str, Any]:
     """Add a member variable to a Blueprint (visible in the "Variables" panel).
 
@@ -2140,27 +2141,155 @@ def add_variable(
             - **`TimerHandle`** — the FTimerHandle struct (essential for timer cancellation)
             - **v5 arrays:** append `[]` to any primitive — `int[]`, `float[]`, `string[]`,
               `bool[]`, `name[]`. (TimerHandle[] is not supported.)
+            - **v7 object/class refs:** `object:Actor`, `class:Pawn`, `object:Actor[]`.
         default_value: Optional initial value as string (e.g., "true", "5.0", "hello").
             For TimerHandle and other structs, leave empty (will be a default-constructed struct).
+        instance_editable: **v9.8.0** — if True, the variable will appear in the
+            Details panel of every spawned instance and be editable per-instance.
+            Internally clears the ``CPF_DisableEditOnInstance`` flag. Defaults
+            False (private to the BP class, like UE's default).
 
     Returns:
-        On success: {"ok": True, "variable_name": "...", "variable_type": "...", "saved": True}
+        On success: ``{"ok": True, "variable_name": "...", "variable_type": "...",
+                        "instance_editable": bool, "saved": True}``
 
     After this, use `add_variable_get` / `add_variable_set` to read/write the
-    variable inside the EventGraph.
+    variable inside the EventGraph. To flip flags on an EXISTING variable,
+    use ``set_variable_flags`` (v9.8.0).
 
     Common errors:
         variable_exists          - another BP variable already has this name
         unknown_variable_type    - type not in v1 whitelist
         add_failed               - UE refused to add (rare)
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_variable",
         "blueprint": blueprint,
         "name": name,
         "variable_type": variable_type,
         "default_value": default_value,
+    }
+    if instance_editable:
+        payload["instance_editable"] = True
+    return _send_command(payload)
+
+
+# ---------------------------------------------------------------------------
+# v9.8.0 — Blueprint / variable lifecycle
+# ---------------------------------------------------------------------------
+# Closes feature-request gaps #1, #5, #8 from the 2026-05-21 review.
+
+
+@mcp.tool()
+def set_variable_flags(
+    blueprint: str,
+    name: str,
+    instance_editable: bool | None = None,
+    blueprint_read_only: bool | None = None,
+    expose_on_spawn: bool | None = None,
+) -> dict[str, Any]:
+    """Flip flags on an existing BP variable — v9.8.0.
+
+    Each argument is tri-state: ``None`` = leave unchanged. Pass a real
+    bool to set or clear. Recompiles the BP so flag changes propagate to
+    the generated FProperty.
+
+    Args:
+        blueprint: BP asset path.
+        name: Variable name (must already exist — use ``add_variable`` first).
+        instance_editable: Show in per-instance Details panel
+            (clears ``CPF_DisableEditOnInstance``).
+        blueprint_read_only: Sets ``CPF_BlueprintReadOnly`` — variable can't
+            be written from BP graphs (still readable).
+        expose_on_spawn: Sets metadata ``ExposeOnSpawn``=true — variable
+            shows up as a pin on ``SpawnActor`` nodes that target this BP.
+
+    Returns:
+        ``{"ok": True, "variable_name": "...", "instance_editable": bool,
+            "blueprint_read_only": bool, "expose_on_spawn": bool|null,
+            "saved": True}``
+        ``expose_on_spawn`` is ``null`` when not modified by this call.
+
+    Common errors:
+        blueprint_not_found
+        variable_not_found
+        no_flag_specified   - all three args were None
+    """
+    if not blueprint or not name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "set_variable_flags",
+        "blueprint": blueprint,
+        "name": name,
+    }
+    if instance_editable is not None:
+        payload["instance_editable"] = instance_editable
+    if blueprint_read_only is not None:
+        payload["blueprint_read_only"] = blueprint_read_only
+    if expose_on_spawn is not None:
+        payload["expose_on_spawn"] = expose_on_spawn
+    return _send_command(payload)
+
+
+@mcp.tool()
+def delete_variable(blueprint: str, name: str) -> dict[str, Any]:
+    """Remove a member variable from a Blueprint — v9.8.0.
+
+    Uses ``FBlueprintEditorUtils::RemoveMemberVariable``. BP is marked
+    structurally modified, recompiled, and saved.
+
+    Note: this removes regular member variables only. To remove an event
+    dispatcher, use ``delete_event_dispatcher`` (separate path through
+    ``DelegateSignatureGraphs``).
+
+    Args:
+        blueprint: BP asset path.
+        name: Variable name.
+
+    Returns:
+        ``{"ok": True, "variable_name": "...", "saved": True}``
+
+    Common errors:
+        blueprint_not_found
+        variable_not_found
+    """
+    if not blueprint or not name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "delete_variable",
+        "blueprint": blueprint,
+        "name": name,
     })
+
+
+@mcp.tool()
+def delete_blueprint(path: str) -> dict[str, Any]:
+    """Delete an entire Blueprint asset from disk — v9.8.0.
+
+    Uses ``UEditorAssetLibrary::DeleteAsset`` after a sanity check that
+    the asset is actually a ``UBlueprint`` (defensive against accidental
+    deletion of textures / meshes through this tool).
+
+    Warning: this is destructive and only affects the asset on disk.
+    Any actor instances spawned from this BP that are still in a level
+    will become invalid references — delete them first with
+    ``delete_actor`` if needed.
+
+    Args:
+        path: Full /Game-relative BP asset path (e.g.
+            ``"/Game/Tests/BP_Portal"``).
+
+    Returns:
+        ``{"ok": True, "blueprint_path": "...", "deleted": True}``
+
+    Common errors:
+        asset_not_found  — path doesn't resolve
+        not_a_blueprint  — asset exists but isn't a UBlueprint (use a
+            future ``delete_asset`` tool when it's needed)
+    """
+    if not path:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "delete_blueprint", "path": path})
 
 
 @mcp.tool()

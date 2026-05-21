@@ -3607,3 +3607,189 @@ def test_ping_returns_plugin_version_9_7_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.7.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.8.0 — Blueprint / variable lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_add_variable_instance_editable() -> None:
+    """v9.8.0 — instance_editable=True passes the flag through."""
+    response = (
+        b'{"ok":true,"command":"add_variable","variable_name":"LinkedPortal",'
+        b'"variable_type":"object:Actor","instance_editable":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_variable(
+            blueprint="/Game/BP_Portal", name="LinkedPortal",
+            variable_type="object:Actor", instance_editable=True,
+        )
+    assert r["ok"] is True
+    assert r["instance_editable"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["instance_editable"] is True
+
+
+def test_add_variable_default_not_instance_editable() -> None:
+    """Default behavior unchanged — instance_editable omitted from payload."""
+    response = b'{"ok":true,"command":"add_variable","variable_name":"X","variable_type":"int","instance_editable":false,"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_variable(blueprint="/Game/BP", name="X", variable_type="int")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "instance_editable" not in sent_dict
+
+
+def test_set_variable_flags_instance_editable_only() -> None:
+    response = (
+        b'{"ok":true,"command":"set_variable_flags","variable_name":"LinkedPortal",'
+        b'"instance_editable":true,"blueprint_read_only":false,"expose_on_spawn":null,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_variable_flags(
+            blueprint="/Game/BP_Portal", name="LinkedPortal", instance_editable=True,
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["instance_editable"] is True
+    assert "blueprint_read_only" not in sent_dict
+    assert "expose_on_spawn" not in sent_dict
+
+
+def test_set_variable_flags_all_three() -> None:
+    response = b'{"ok":true,"command":"set_variable_flags","variable_name":"V","instance_editable":true,"blueprint_read_only":true,"expose_on_spawn":true,"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_variable_flags(
+            blueprint="/Game/BP", name="V",
+            instance_editable=True, blueprint_read_only=True, expose_on_spawn=True,
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["instance_editable"] is True
+    assert sent_dict["blueprint_read_only"] is True
+    assert sent_dict["expose_on_spawn"] is True
+
+
+def test_set_variable_flags_no_flag_specified() -> None:
+    """All None → server should return no_flag_specified."""
+    response = b'{"ok":false,"command":"set_variable_flags","error":"no_flag_specified"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_variable_flags(blueprint="/Game/BP", name="V")
+    assert r["ok"] is False
+    assert r["error"] == "no_flag_specified"
+
+
+def test_set_variable_flags_local_validation() -> None:
+    assert server.set_variable_flags(blueprint="", name="X")["error"] == "missing_argument"
+    assert server.set_variable_flags(blueprint="/G/BP", name="")["error"] == "missing_argument"
+
+
+def test_delete_variable_success() -> None:
+    response = b'{"ok":true,"command":"delete_variable","variable_name":"OldVar","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_variable(blueprint="/Game/BP", name="OldVar")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "delete_variable", "blueprint": "/Game/BP", "name": "OldVar"}
+
+
+def test_delete_variable_not_found() -> None:
+    response = b'{"ok":false,"command":"delete_variable","error":"variable_not_found","detail":"Ghost"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_variable(blueprint="/Game/BP", name="Ghost")
+    assert r["ok"] is False
+    assert r["error"] == "variable_not_found"
+
+
+def test_delete_variable_local_validation() -> None:
+    assert server.delete_variable(blueprint="", name="V")["error"] == "missing_argument"
+    assert server.delete_variable(blueprint="/G/BP", name="")["error"] == "missing_argument"
+
+
+def test_delete_blueprint_success() -> None:
+    response = b'{"ok":true,"command":"delete_blueprint","blueprint_path":"/Game/Tests/BP_X","deleted":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_blueprint(path="/Game/Tests/BP_X")
+    assert r["ok"] is True
+    assert r["deleted"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "delete_blueprint", "path": "/Game/Tests/BP_X"}
+
+
+def test_delete_blueprint_not_a_blueprint() -> None:
+    """Safety: refuses to delete non-BP assets."""
+    response = (
+        b'{"ok":false,"command":"delete_blueprint","error":"not_a_blueprint",'
+        b'"detail":"Asset at /Game/Tex_X is Texture2D, not a UBlueprint."}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_blueprint(path="/Game/Tex_X")
+    assert r["ok"] is False
+    assert r["error"] == "not_a_blueprint"
+
+
+def test_delete_blueprint_local_validation() -> None:
+    assert server.delete_blueprint(path="")["error"] == "missing_argument"
+
+
+@requires_ue_editor(extra_reason="v9.8.0 BP/variable lifecycle end-to-end")
+def test_v9_8_blueprint_variable_lifecycle_against_real_plugin() -> None:
+    """End-to-end: create BP → add var (instance_editable) → set flags →
+    delete var → delete BP. All transitions verified."""
+    import uuid
+    bp_name = f"BP_V98Test_{uuid.uuid4().hex[:6]}"
+    bp_path = f"/Game/Tests/{bp_name}"
+
+    # 1. Create
+    r = server.create_blueprint(name=bp_name, path="/Game/Tests")
+    assert r["ok"], f"create_blueprint failed: {r}"
+
+    # 2. Add variable with instance_editable=True
+    r = server.add_variable(
+        blueprint=bp_path, name="MyVar", variable_type="int",
+        default_value="42", instance_editable=True,
+    )
+    assert r["ok"], f"add_variable failed: {r}"
+    assert r["instance_editable"] is True
+
+    # 3. Flip readonly flag
+    r = server.set_variable_flags(
+        blueprint=bp_path, name="MyVar", blueprint_read_only=True,
+    )
+    assert r["ok"], f"set_variable_flags failed: {r}"
+    assert r["blueprint_read_only"] is True
+
+    # 4. Delete the variable
+    r = server.delete_variable(blueprint=bp_path, name="MyVar")
+    assert r["ok"], f"delete_variable failed: {r}"
+
+    # 5. Delete the BP
+    r = server.delete_blueprint(path=bp_path)
+    assert r["ok"], f"delete_blueprint failed: {r}"
+    assert r["deleted"] is True
+
+
+def test_ping_returns_plugin_version_9_8_0() -> None:
+    """v9.8.0: ping surfaces 9.8.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.8.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.8.0"

@@ -1418,7 +1418,8 @@ namespace
         const FString& BlueprintPath,
         const FString& VarName,
         const FString& VarTypeKey,
-        const FString& DefaultValue)
+        const FString& DefaultValue,
+        bool bInstanceEditable = false)   // v9.8.0 — closes feature-request #5
     {
         check(IsInGameThread());
 
@@ -1446,14 +1447,137 @@ namespace
             return JsonError(TEXT("add_variable"), TEXT("add_failed"), VarName);
         }
 
+        // v9.8.0 — apply instance_editable flag if requested. UE stores this as
+        // the NEGATIVE flag CPF_DisableEditOnInstance — clear bit = editable.
+        if (bInstanceEditable)
+        {
+            uint64* PropertyFlags = FBlueprintEditorUtils::GetBlueprintVariablePropertyFlags(Blueprint, VarFName);
+            if (PropertyFlags != nullptr)
+                *PropertyFlags &= ~CPF_DisableEditOnInstance;
+        }
+
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_variable\",\"variable_name\":%s,\"variable_type\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_variable\",\"variable_name\":%s,\"variable_type\":%s,\"instance_editable\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(VarName),
             *EscapeJsonString(VarTypeKey),
+            bInstanceEditable ? TEXT("true") : TEXT("false"),
             bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.8.0 — Blueprint / variable lifecycle =====
+    //
+    // Closes feature-request gaps #1, #5, #8 from the 2026-05-21 review.
+
+    /**
+     * Set instance_editable / blueprint_read_only / expose_on_spawn on an
+     * existing BP variable. Each tri-state — None / unset = leave unchanged.
+     */
+    FString SetVariableFlagsOnGameThread(
+        const FString& BlueprintPath,
+        const FString& VarName,
+        bool bHasInstanceEditable, bool bInstanceEditable,
+        bool bHasReadOnly,         bool bReadOnly,
+        bool bHasExposeOnSpawn,    bool bExposeOnSpawn)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_variable_flags");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName VarFName(*VarName);
+        if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarFName) == INDEX_NONE)
+            return JsonError(CmdName, TEXT("variable_not_found"), VarName);
+
+        uint64* PropertyFlags = FBlueprintEditorUtils::GetBlueprintVariablePropertyFlags(Blueprint, VarFName);
+        if (PropertyFlags == nullptr)
+            return JsonError(CmdName, TEXT("no_property_flags"), VarName);
+
+        if (bHasInstanceEditable)
+        {
+            if (bInstanceEditable) *PropertyFlags &= ~CPF_DisableEditOnInstance;
+            else                   *PropertyFlags |=  CPF_DisableEditOnInstance;
+        }
+        if (bHasReadOnly)
+        {
+            if (bReadOnly) *PropertyFlags |=  CPF_BlueprintReadOnly;
+            else           *PropertyFlags &= ~CPF_BlueprintReadOnly;
+        }
+        if (bHasExposeOnSpawn)
+        {
+            FBlueprintEditorUtils::SetBlueprintVariableMetaData(
+                Blueprint, VarFName, /*InLocalVarScope*/ nullptr,
+                FName(TEXT("ExposeOnSpawn")),
+                bExposeOnSpawn ? FString(TEXT("true")) : FString(TEXT("false")));
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        // Recompile so flag changes propagate to the GeneratedClass FProperty
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_variable_flags\",\"variable_name\":%s,")
+            TEXT("\"instance_editable\":%s,\"blueprint_read_only\":%s,\"expose_on_spawn\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(VarName),
+            (*PropertyFlags & CPF_DisableEditOnInstance) ? TEXT("false") : TEXT("true"),
+            (*PropertyFlags & CPF_BlueprintReadOnly) ? TEXT("true") : TEXT("false"),
+            bHasExposeOnSpawn ? (bExposeOnSpawn ? TEXT("true") : TEXT("false")) : TEXT("null"),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString DeleteVariableOnGameThread(const FString& BlueprintPath, const FString& VarName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_variable");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName VarFName(*VarName);
+        if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarFName) == INDEX_NONE)
+            return JsonError(CmdName, TEXT("variable_not_found"), VarName);
+
+        FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VarFName);
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"delete_variable\",\"variable_name\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(VarName),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString DeleteBlueprintOnGameThread(const FString& BlueprintPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_blueprint");
+
+        if (!UEditorAssetLibrary::DoesAssetExist(BlueprintPath))
+            return JsonError(CmdName, TEXT("asset_not_found"), BlueprintPath);
+
+        // Optional sanity: confirm it's actually a Blueprint asset (defensive
+        // against accidental deletion of e.g. textures via this tool).
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(BlueprintPath);
+        if (Asset != nullptr && !Asset->IsA(UBlueprint::StaticClass()))
+        {
+            return JsonError(CmdName, TEXT("not_a_blueprint"),
+                FString::Printf(TEXT("Asset at %s is %s, not a UBlueprint. Use delete_asset for non-BP assets (not yet implemented)."),
+                    *BlueprintPath, *Asset->GetClass()->GetName()));
+        }
+
+        const bool bOk = UEditorAssetLibrary::DeleteAsset(BlueprintPath);
+        return FString::Printf(
+            TEXT("{\"ok\":%s,\"command\":\"delete_blueprint\",\"blueprint_path\":%s,\"deleted\":%s}\n"),
+            bOk ? TEXT("true") : TEXT("false"),
+            *EscapeJsonString(BlueprintPath),
+            bOk ? TEXT("true") : TEXT("false"));
     }
 
     // ===== Spike B10 — add_variable_get / add_variable_set =====
@@ -5524,7 +5648,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.7.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.8.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -5974,7 +6098,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_variable (Spike B9) ---
+    // --- add_variable (Spike B9 + v9.8.0 instance_editable) ---
     if (Command.Equals(TEXT("add_variable"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, Name, VarType, DefaultValue;
@@ -5985,16 +6109,99 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         if (!JsonObject->TryGetStringField(TEXT("variable_type"), VarType) || VarType.IsEmpty())
             return JsonError(TEXT("add_variable"), TEXT("missing_field"), TEXT("variable_type"));
         JsonObject->TryGetStringField(TEXT("default_value"), DefaultValue);  // optional
+        bool bInstanceEditable = false;
+        JsonObject->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable);   // v9.8.0
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, Name, VarType, DefaultValue]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, Name, VarType, DefaultValue, bInstanceEditable]() mutable
             {
-                Promise.SetValue(AddVariableOnGameThread(Blueprint, Name, VarType, DefaultValue));
+                Promise.SetValue(AddVariableOnGameThread(Blueprint, Name, VarType, DefaultValue, bInstanceEditable));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_variable"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.8.0 set_variable_flags ---
+    // Each flag is tri-state: omitted = leave unchanged. None / null in JSON
+    // is treated as omitted. Pass a real bool to set.
+    if (Command.Equals(TEXT("set_variable_flags"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, Name;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("set_variable_flags"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("set_variable_flags"), TEXT("missing_field"), TEXT("name"));
+
+        bool bInstanceEditable = false;
+        const bool bHasInstanceEditable = JsonObject->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable);
+        bool bReadOnly = false;
+        const bool bHasReadOnly = JsonObject->TryGetBoolField(TEXT("blueprint_read_only"), bReadOnly);
+        bool bExposeOnSpawn = false;
+        const bool bHasExposeOnSpawn = JsonObject->TryGetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawn);
+
+        if (!bHasInstanceEditable && !bHasReadOnly && !bHasExposeOnSpawn)
+            return JsonError(TEXT("set_variable_flags"), TEXT("no_flag_specified"),
+                TEXT("Provide at least one of: instance_editable, blueprint_read_only, expose_on_spawn"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, Name,
+             bHasInstanceEditable, bInstanceEditable,
+             bHasReadOnly, bReadOnly,
+             bHasExposeOnSpawn, bExposeOnSpawn]() mutable
+            {
+                Promise.SetValue(SetVariableFlagsOnGameThread(
+                    Blueprint, Name,
+                    bHasInstanceEditable, bInstanceEditable,
+                    bHasReadOnly, bReadOnly,
+                    bHasExposeOnSpawn, bExposeOnSpawn));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_variable_flags"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.8.0 delete_variable ---
+    if (Command.Equals(TEXT("delete_variable"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, Name;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("delete_variable"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("delete_variable"), TEXT("missing_field"), TEXT("name"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, Name]() mutable
+            {
+                Promise.SetValue(DeleteVariableOnGameThread(Blueprint, Name));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_variable"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.8.0 delete_blueprint ---
+    if (Command.Equals(TEXT("delete_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Path;
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            return JsonError(TEXT("delete_blueprint"), TEXT("missing_field"), TEXT("path"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Path]() mutable
+            {
+                Promise.SetValue(DeleteBlueprintOnGameThread(Path));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_blueprint"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
