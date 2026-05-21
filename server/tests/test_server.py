@@ -2212,6 +2212,148 @@ def test_pie_press_key_local_validation_missing_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v9.1.0 — Discovery tools (list_assets / skeletons / meshes / blueprints / classes)
+# ---------------------------------------------------------------------------
+
+
+def test_list_assets_success() -> None:
+    response = (
+        b'{"ok":true,"command":"list_assets","folder":"/Game","asset_class":"",'
+        b'"recursive":true,"count":2,"assets":['
+        b'{"name":"BP_A","path":"/Game/BP_A.BP_A","package_path":"/Game","class":"Blueprint"},'
+        b'{"name":"M_B","path":"/Game/M_B.M_B","package_path":"/Game","class":"Material"}]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_assets()
+    assert r["ok"] is True
+    assert r["count"] == 2
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "list_assets"
+    assert sent_dict["folder"] == "/Game"
+    assert sent_dict["recursive"] is True
+    assert sent_dict["max_results"] == 500
+
+
+def test_list_skeletons_passes_filter_through() -> None:
+    response = (
+        b'{"ok":true,"command":"list_skeletons","folder":"/Game",'
+        b'"asset_class":"Skeleton","recursive":true,"count":1,"assets":['
+        b'{"name":"SK_Test","path":"/Game/SK_Test.SK_Test","package_path":"/Game","class":"Skeleton"}]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_skeletons(folder="/Game/Anim")
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "list_skeletons",
+        "folder": "/Game/Anim",
+        "max_results": 100,
+    }
+
+
+def test_list_meshes_combines_static_and_skeletal() -> None:
+    response = (
+        b'{"ok":true,"command":"list_meshes","folder":"/Game",'
+        b'"static_count":2,"skeletal_count":1,"count":3,"assets":['
+        b'{"name":"SM_A","path":"/Game/SM_A.SM_A","package_path":"/Game","class":"StaticMesh"},'
+        b'{"name":"SM_B","path":"/Game/SM_B.SM_B","package_path":"/Game","class":"StaticMesh"},'
+        b'{"name":"SKM_C","path":"/Game/SKM_C.SKM_C","package_path":"/Game","class":"SkeletalMesh"}]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_meshes()
+    assert r["ok"] is True
+    assert r["static_count"] == 2
+    assert r["skeletal_count"] == 1
+    assert r["count"] == 3
+    # Verify both classes appear in merged assets array
+    classes = {a["class"] for a in r["assets"]}
+    assert classes == {"StaticMesh", "SkeletalMesh"}
+
+
+def test_list_blueprints_success() -> None:
+    response = (
+        b'{"ok":true,"command":"list_blueprints","folder":"/Game",'
+        b'"asset_class":"Blueprint","recursive":true,"count":1,"assets":['
+        b'{"name":"BP_X","path":"/Game/BP_X.BP_X","package_path":"/Game","class":"Blueprint"}]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_blueprints()
+    assert r["ok"] is True
+    assert r["count"] == 1
+
+
+def test_list_classes_passes_parent_filter() -> None:
+    response = (
+        b'{"ok":true,"command":"list_classes","parent_class":"Pawn",'
+        b'"native_only":true,"name_contains":"","count":2,"classes":['
+        b'{"name":"Pawn","path":"/Script/Engine.Pawn","native":true,"super":"Actor"},'
+        b'{"name":"Character","path":"/Script/Engine.Character","native":true,"super":"Pawn"}]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_classes(parent_class="Pawn", native_only=True)
+    assert r["ok"] is True
+    assert r["count"] == 2
+    assert {c["name"] for c in r["classes"]} == {"Pawn", "Character"}
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["parent_class"] == "Pawn"
+    assert sent_dict["native_only"] is True
+    # Empty filter strings should NOT be in payload
+    assert "name_contains" not in sent_dict
+
+
+def test_list_classes_handles_unknown_parent() -> None:
+    response = (
+        b'{"ok":false,"command":"list_classes","error":"parent_class_not_found",'
+        b'"detail":"WeirdClass"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_classes(parent_class="WeirdClass")
+    assert r["ok"] is False
+    assert r["error"] == "parent_class_not_found"
+
+
+@requires_ue_editor(extra_reason="discovery tools probe real asset registry")
+def test_discovery_tools_against_real_plugin() -> None:
+    """Integration: discover what's actually in the project."""
+    # 1. Skeletons — at least 1 in any non-empty project
+    r = server.list_skeletons()
+    assert r["ok"] is True
+    assert r["count"] >= 1, f"No skeletons in project? {r}"
+
+    # 2. Meshes — should find /Engine/BasicShapes/Cube at least
+    r = server.list_meshes()
+    assert r["ok"] is True
+    assert r["count"] >= 1
+
+    # 3. Blueprints — every project has at least the GameMode/Character/etc
+    r = server.list_blueprints()
+    assert r["ok"] is True
+    assert r["count"] >= 1
+
+    # 4. List Pawn subclasses — Pawn itself + Character + DefaultPawn always exist
+    r = server.list_classes(parent_class="Pawn", native_only=True)
+    assert r["ok"] is True
+    names = {c["name"] for c in r["classes"]}
+    assert "Pawn" in names
+    assert "Character" in names
+
+    # 5. Filter by /Engine basic shapes
+    r = server.list_assets(folder="/Engine/BasicShapes", asset_class="StaticMesh")
+    assert r["ok"] is True
+    cube = next((a for a in r["assets"] if a["name"] == "Cube"), None)
+    assert cube is not None, "Where did /Engine/BasicShapes/Cube go?"
+
+
+# ---------------------------------------------------------------------------
 # v9.0.0 — create_anim_blueprint (AnimGraph domain opens)
 # ---------------------------------------------------------------------------
 

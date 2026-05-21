@@ -117,6 +117,12 @@
 #include "Animation/Skeleton.h"
 #include "Factories/AnimBlueprintFactory.h"
 
+// v9.1.0 — asset / class discovery
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "AssetRegistry/AssetData.h"
+#include "UObject/UObjectIterator.h"   // already pulled in, but explicit
+
 // v7.1 — set_component_property (FProperty reflection for component template defaults)
 #include "UObject/UnrealType.h"        // FObjectProperty / FStructProperty / FClassProperty
 
@@ -3127,6 +3133,162 @@ namespace
      * Create a Blueprint asset. MUST run on the game thread.
      * Returns a complete JSON response line (with trailing \n).
      */
+    // ===== v9.1.0 — Discovery tools =====
+    //
+    // Closes the "what's in this project?" introspection gap. LLMs previously had
+    // to guess asset paths (e.g. /Engine/Mannequin/Mesh/SK_Mannequin_Skeleton vs.
+    // /Game/FirstPersonArms/.../SK_Mannequin_Arms_Skeleton) which produced false
+    // skeleton_not_found errors. These tools let LLMs probe the actual project state.
+
+    /**
+     * Shared core: list assets via IAssetRegistry, optionally filtered by class.
+     * Returns ready-to-send JSON (with trailing newline).
+     *
+     * v9.1.0 fix #1: MUST run on game thread. UE 5.4's IAssetRegistry::GetAssets*
+     * asserts IsInGameThread() because "Enumerating in-memory assets... uses
+     * non-threadsafe UE::AssetRegistry::Filtering globals". Callers in dispatch
+     * branches wrap this in AsyncTask(ENamedThreads::GameThread, ...).
+     */
+    FString ListAssetsCore(
+        const TCHAR* CmdName,
+        const FString& FolderPath,
+        const FString& AssetClass,         // e.g. "Skeleton", "StaticMesh", "Blueprint". Empty = all.
+        bool bRecursive,
+        int32 MaxResults)
+    {
+        check(IsInGameThread());   // IAssetRegistry filtering globals aren't thread-safe
+        FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+        IAssetRegistry& Reg = Module.Get();
+
+        TArray<FAssetData> Results;
+        const FName PathName(*(FolderPath.IsEmpty() ? FString(TEXT("/Game")) : FolderPath));
+
+        if (AssetClass.IsEmpty())
+        {
+            Reg.GetAssetsByPath(PathName, Results, bRecursive);
+        }
+        else
+        {
+            // Try as /Script/Engine.Foo path first; fall back to bare name → /Script/Engine.<Name>
+            FTopLevelAssetPath ClassPath;
+            if (AssetClass.StartsWith(TEXT("/Script/")))
+            {
+                ClassPath = FTopLevelAssetPath(*AssetClass);
+            }
+            else
+            {
+                ClassPath = FTopLevelAssetPath(*FString::Printf(TEXT("/Script/Engine.%s"), *AssetClass));
+            }
+
+            TArray<FAssetData> ByClass;
+            Reg.GetAssetsByClass(ClassPath, ByClass, /*bSearchSubClasses*/ true);
+
+            // Path-filter the class-scoped results
+            const FString FolderNorm = FolderPath.IsEmpty() ? FString(TEXT("/Game")) : FolderPath;
+            for (const FAssetData& Data : ByClass)
+            {
+                const FString PkgPath = Data.PackagePath.ToString();
+                if (bRecursive ? PkgPath.StartsWith(FolderNorm) : PkgPath == FolderNorm)
+                {
+                    Results.Add(Data);
+                }
+            }
+        }
+
+        if (MaxResults > 0 && Results.Num() > MaxResults)
+        {
+            Results.SetNum(MaxResults, EAllowShrinking::No);
+        }
+
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), CmdName);
+        Writer->WriteValue(TEXT("folder"), FolderPath.IsEmpty() ? FString(TEXT("/Game")) : FolderPath);
+        Writer->WriteValue(TEXT("asset_class"), AssetClass);
+        Writer->WriteValue(TEXT("recursive"), bRecursive);
+        Writer->WriteValue(TEXT("count"), Results.Num());
+        Writer->WriteArrayStart(TEXT("assets"));
+        for (const FAssetData& Data : Results)
+        {
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), Data.AssetName.ToString());
+            Writer->WriteValue(TEXT("path"), Data.GetObjectPathString());
+            Writer->WriteValue(TEXT("package_path"), Data.PackagePath.ToString());
+            Writer->WriteValue(TEXT("class"), Data.AssetClassPath.GetAssetName().ToString());
+            Writer->WriteObjectEnd();
+        }
+        Writer->WriteArrayEnd();
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
+    FString ListClassesCore(
+        const FString& ParentClassName,
+        bool bNativeOnly,
+        const FString& NameContains,
+        int32 MaxResults)
+    {
+        check(IsInGameThread());   // UObjectIterator must be game-thread
+
+        UClass* ParentClass = nullptr;
+        if (!ParentClassName.IsEmpty())
+        {
+            // Reuse v7.4's ResolveCastTargetClass — whitelist + qualified fallback
+            ParentClass = ResolveCastTargetClass(ParentClassName);
+            if (ParentClass == nullptr)
+            {
+                return JsonError(TEXT("list_classes"), TEXT("parent_class_not_found"), ParentClassName);
+            }
+        }
+
+        TArray<UClass*> Matches;
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            UClass* Cls = *It;
+            if (Cls == nullptr) continue;
+            if (ParentClass != nullptr && !Cls->IsChildOf(ParentClass)) continue;
+            if (bNativeOnly && !Cls->IsNative()) continue;
+            // Skip CDO/intermediate cruft
+            if (Cls->HasAnyClassFlags(CLASS_NewerVersionExists | CLASS_Deprecated | CLASS_HideDropDown))
+                continue;
+            if (!NameContains.IsEmpty()
+                && !Cls->GetName().Contains(NameContains, ESearchCase::IgnoreCase))
+                continue;
+            Matches.Add(Cls);
+            if (MaxResults > 0 && Matches.Num() >= MaxResults) break;
+        }
+
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), TEXT("list_classes"));
+        Writer->WriteValue(TEXT("parent_class"), ParentClassName);
+        Writer->WriteValue(TEXT("native_only"), bNativeOnly);
+        Writer->WriteValue(TEXT("name_contains"), NameContains);
+        Writer->WriteValue(TEXT("count"), Matches.Num());
+        Writer->WriteArrayStart(TEXT("classes"));
+        for (UClass* Cls : Matches)
+        {
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), Cls->GetName());
+            Writer->WriteValue(TEXT("path"), Cls->GetPathName());
+            Writer->WriteValue(TEXT("native"), Cls->IsNative());
+            const UClass* SuperCls = Cls->GetSuperClass();
+            Writer->WriteValue(TEXT("super"), SuperCls ? SuperCls->GetName() : TEXT(""));
+            Writer->WriteObjectEnd();
+        }
+        Writer->WriteArrayEnd();
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
     // ===== v9.0.0 — AnimBlueprint creation =====
     //
     // Opens the Animation Blueprint surface. Only the asset-creation step is in v9.0.0 —
@@ -4548,9 +4710,134 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.0.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.1.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
+    }
+
+    // --- v9.1.0 Discovery tools ---
+    // ALL go through AsyncTask(GameThread, ...) — IAssetRegistry asserts game-thread
+    // because its filtering globals aren't thread-safe (crash discovered in initial
+    // v9.1.0 testing).
+    if (Command.Equals(TEXT("list_assets"), ESearchCase::IgnoreCase))
+    {
+        FString Folder, AssetClass;
+        JsonObject->TryGetStringField(TEXT("folder"), Folder);
+        JsonObject->TryGetStringField(TEXT("asset_class"), AssetClass);
+        bool bRecursive = true;
+        JsonObject->TryGetBoolField(TEXT("recursive"), bRecursive);
+        int32 MaxResults = 500;
+        JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Folder, AssetClass, bRecursive, MaxResults]() mutable
+            {
+                Promise.SetValue(ListAssetsCore(TEXT("list_assets"), Folder, AssetClass, bRecursive, MaxResults));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_assets"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+    if (Command.Equals(TEXT("list_skeletons"), ESearchCase::IgnoreCase))
+    {
+        FString Folder; JsonObject->TryGetStringField(TEXT("folder"), Folder);
+        int32 MaxResults = 100; JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Folder, MaxResults]() mutable
+            {
+                Promise.SetValue(ListAssetsCore(TEXT("list_skeletons"), Folder, TEXT("Skeleton"), true, MaxResults));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_skeletons"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+    if (Command.Equals(TEXT("list_meshes"), ESearchCase::IgnoreCase))
+    {
+        FString Folder; JsonObject->TryGetStringField(TEXT("folder"), Folder);
+        int32 MaxResults = 200; JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        // Single game-thread hop that runs both class queries + merges, so we don't
+        // double the latency by marshaling twice.
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Folder, MaxResults]() mutable
+            {
+                const FString StaticJson = ListAssetsCore(TEXT("list_meshes"), Folder, TEXT("StaticMesh"), true, MaxResults);
+                const FString SkelJson   = ListAssetsCore(TEXT("list_meshes"), Folder, TEXT("SkeletalMesh"), true, MaxResults);
+                TSharedPtr<FJsonObject> StaticObj, SkelObj;
+                FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(StaticJson), StaticObj);
+                FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(SkelJson), SkelObj);
+                const TArray<TSharedPtr<FJsonValue>>* StaticArr = nullptr;
+                const TArray<TSharedPtr<FJsonValue>>* SkelArr = nullptr;
+                if (StaticObj.IsValid()) StaticObj->TryGetArrayField(TEXT("assets"), StaticArr);
+                if (SkelObj.IsValid())   SkelObj->TryGetArrayField(TEXT("assets"), SkelArr);
+
+                FString OutJson;
+                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> W =
+                    TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+                W->WriteObjectStart();
+                W->WriteValue(TEXT("ok"), true);
+                W->WriteValue(TEXT("command"), TEXT("list_meshes"));
+                W->WriteValue(TEXT("folder"), Folder.IsEmpty() ? FString(TEXT("/Game")) : Folder);
+                const int32 StaticCount = StaticArr ? StaticArr->Num() : 0;
+                const int32 SkelCount   = SkelArr   ? SkelArr->Num()   : 0;
+                W->WriteValue(TEXT("static_count"), StaticCount);
+                W->WriteValue(TEXT("skeletal_count"), SkelCount);
+                W->WriteValue(TEXT("count"), StaticCount + SkelCount);
+                W->WriteArrayStart(TEXT("assets"));
+                if (StaticArr) for (const auto& V : *StaticArr) FJsonSerializer::Serialize(V.ToSharedRef(), TEXT(""), W, false);
+                if (SkelArr)   for (const auto& V : *SkelArr)   FJsonSerializer::Serialize(V.ToSharedRef(), TEXT(""), W, false);
+                W->WriteArrayEnd();
+                W->WriteObjectEnd();
+                W->Close();
+                Promise.SetValue(OutJson + TEXT("\n"));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_meshes"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+    if (Command.Equals(TEXT("list_blueprints"), ESearchCase::IgnoreCase))
+    {
+        FString Folder; JsonObject->TryGetStringField(TEXT("folder"), Folder);
+        int32 MaxResults = 200; JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Folder, MaxResults]() mutable
+            {
+                Promise.SetValue(ListAssetsCore(TEXT("list_blueprints"), Folder, TEXT("Blueprint"), true, MaxResults));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_blueprints"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+    if (Command.Equals(TEXT("list_classes"), ESearchCase::IgnoreCase))
+    {
+        FString ParentClass, NameContains;
+        JsonObject->TryGetStringField(TEXT("parent_class"), ParentClass);
+        JsonObject->TryGetStringField(TEXT("name_contains"), NameContains);
+        bool bNativeOnly = false;
+        JsonObject->TryGetBoolField(TEXT("native_only"), bNativeOnly);
+        int32 MaxResults = 200;
+        JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ParentClass, bNativeOnly, NameContains, MaxResults]() mutable
+            {
+                Promise.SetValue(ListClassesCore(ParentClass, bNativeOnly, NameContains, MaxResults));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_classes"), TEXT("game_thread_timeout"));
+        return Future.Get();
     }
 
     // --- create_anim_blueprint (v9.0.0) ---

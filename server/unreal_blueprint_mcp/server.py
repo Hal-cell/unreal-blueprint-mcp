@@ -1935,6 +1935,143 @@ def add_variable_set(
 
 
 @mcp.tool()
+def list_assets(
+    folder: str = "/Game",
+    asset_class: str = "",
+    recursive: bool = True,
+    max_results: int = 500,
+) -> dict[str, Any]:
+    """List assets via IAssetRegistry — v9.1.0 generic discovery.
+
+    Use this when you don't know the exact path of a needed asset. Returns up
+    to ``max_results`` entries from the asset registry, optionally filtered by
+    folder and/or class.
+
+    Args:
+        folder: ``/Game``-rooted folder to scan (default ``/Game``).
+        asset_class: Class to filter by. Either bare name (``"StaticMesh"``,
+            ``"Skeleton"``, ``"Material"``) or fully-qualified
+            ``"/Script/Engine.StaticMesh"``. Empty = no class filter.
+        recursive: Whether to descend into subfolders (default True).
+        max_results: Cap on returned entries. Use 0 for no cap (slow on big projects).
+
+    Returns:
+        ``{"ok": True, "folder": ..., "asset_class": ..., "recursive": bool,
+            "count": N, "assets": [{"name", "path", "package_path", "class"}, ...]}``
+
+    See also: ``list_skeletons``, ``list_meshes``, ``list_blueprints``,
+    ``list_classes`` for class-specific convenience wrappers.
+    """
+    return _send_command({
+        "command": "list_assets",
+        "folder": folder,
+        "asset_class": asset_class,
+        "recursive": recursive,
+        "max_results": max_results,
+    })
+
+
+@mcp.tool()
+def list_skeletons(
+    folder: str = "/Game",
+    max_results: int = 100,
+) -> dict[str, Any]:
+    """List USkeleton assets in the project — v9.1.0.
+
+    Useful when ``create_anim_blueprint`` needs a skeleton path but you don't
+    know what's in the project.
+
+    Returns the standard ``list_assets`` JSON shape, scoped to ``Skeleton`` class.
+    """
+    return _send_command({
+        "command": "list_skeletons",
+        "folder": folder,
+        "max_results": max_results,
+    })
+
+
+@mcp.tool()
+def list_meshes(
+    folder: str = "/Game",
+    max_results: int = 200,
+) -> dict[str, Any]:
+    """List StaticMesh + SkeletalMesh assets — v9.1.0.
+
+    Useful for ``set_component_property`` on a StaticMeshComponent (which needs
+    a mesh asset path) — you don't have to guess `/Engine/BasicShapes/Cube` etc.
+
+    Returns ``{"ok": True, "static_count": N, "skeletal_count": M, "count": N+M,
+                "assets": [...both types merged...]}``.
+    Each entry's ``class`` field tells you which kind.
+    """
+    return _send_command({
+        "command": "list_meshes",
+        "folder": folder,
+        "max_results": max_results,
+    })
+
+
+@mcp.tool()
+def list_blueprints(
+    folder: str = "/Game",
+    max_results: int = 200,
+) -> dict[str, Any]:
+    """List UBlueprint assets in the project — v9.1.0.
+
+    Quick "what BPs do I have" probe. Standard ``list_assets`` shape, scoped
+    to ``Blueprint`` class.
+    """
+    return _send_command({
+        "command": "list_blueprints",
+        "folder": folder,
+        "max_results": max_results,
+    })
+
+
+@mcp.tool()
+def list_classes(
+    parent_class: str = "",
+    native_only: bool = False,
+    name_contains: str = "",
+    max_results: int = 200,
+) -> dict[str, Any]:
+    """List loaded UClass objects — v9.1.0 class discovery.
+
+    Iterates the UObject hierarchy (TObjectIterator<UClass>) and filters by
+    parent / native-only / name substring.
+
+    Args:
+        parent_class: Restrict to subclasses of this class. Accepts the same
+            whitelist + qualified-path syntax as ``add_cast`` (Pawn, Actor,
+            PlayerController, /Script/Engine.Actor, /Game/BP_X.BP_X_C, etc.).
+            Empty = no parent filter (warning: returns thousands).
+        native_only: True = engine/plugin C++ classes only, no Blueprint classes.
+        name_contains: Optional case-insensitive substring filter on class name.
+        max_results: Cap on returned entries (default 200).
+
+    Returns:
+        ``{"ok": True, "parent_class": ..., "native_only": bool,
+            "name_contains": ..., "count": N,
+            "classes": [{"name", "path", "native": bool, "super"}, ...]}``
+
+    Common use cases:
+        - "what subclasses of Pawn are available?" — ``list_classes(parent_class="Pawn")``
+        - "what AnimInstance subclasses?" — ``list_classes(parent_class="AnimInstance")``
+        - "find a class with 'Movement' in its name" — ``list_classes(name_contains="Movement")``
+    """
+    payload: dict[str, Any] = {
+        "command": "list_classes",
+        "native_only": native_only,
+        "max_results": max_results,
+    }
+    if parent_class:
+        payload["parent_class"] = parent_class
+    if name_contains:
+        payload["name_contains"] = name_contains
+    return _send_command(payload)
+
+
+@mcp.tool()
 def create_anim_blueprint(
     name: str,
     skeleton: str,

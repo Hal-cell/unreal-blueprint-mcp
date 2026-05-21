@@ -36,6 +36,8 @@ public class BlueprintMCP : ModuleRules
             "EnhancedInput",
             // v5: K2Node_EnhancedInputAction lives in this module
             "InputBlueprintNodes",
+            // v9.1.0: asset discovery (IAssetRegistry, FAssetData)
+            "AssetRegistry",
         });
     }
 }
