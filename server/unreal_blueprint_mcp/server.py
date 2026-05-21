@@ -2553,6 +2553,33 @@ def save_all() -> dict[str, Any]:
 
 
 @mcp.tool()
+def shutdown_editor() -> dict[str, Any]:
+    """Request a clean editor exit — v9.6.0.
+
+    Works in BOTH headless (BlueprintMCPRun commandlet) and GUI modes:
+      - Headless: flips the commandlet's exit flag → process returns
+        from Main() with exit code 0 on the next tick (~250ms).
+      - GUI: schedules FPlatformMisc::RequestExit(false), the same
+        exit path used by File → Exit. Dirty packages will prompt
+        unless ``save_all()`` ran first.
+
+    Returns immediately — does NOT wait for the editor to actually
+    finish exiting. Poll TCP port 55558 (e.g. ``nc -z``) to confirm
+    shutdown completed.
+
+    Pair with ``save_all()`` for a clean shutdown sequence:
+
+        server.save_all()
+        server.shutdown_editor()
+        # poll: until ! nc -z 127.0.0.1 55558 ...
+
+    Returns:
+        ``{"ok": True, "requested": True}``
+    """
+    return _send_command({"command": "shutdown_editor"})
+
+
+@mcp.tool()
 def create_blueprint(
     name: str,
     parent_class: str = "Actor",

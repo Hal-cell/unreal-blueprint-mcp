@@ -49,3 +49,8 @@ Thumbs.db
 *.swo
 .envrc
 .direnv/
+
+# =========================
+# v9.6.0 — headless CI run artifacts
+# =========================
+.headless-ue.log

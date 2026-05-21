@@ -76,3 +76,20 @@ def requires_ue_editor(extra_reason: str = ""):
 
     # All gates open — return a no-op marker so the test runs normally.
     return pytest.mark.skipif(False, reason="(integration test active)")
+
+
+def skip_if_headless(reason: str = "incompatible with -nullrhi/-unattended"):
+    """v9.6.0 — skip tests that don't work in headless commandlet mode.
+
+    The headless harness (``scripts/run_headless_ci.sh``) sets
+    ``BLUEPRINTMCP_HEADLESS=1``. Use this decorator on tests that
+    fundamentally need a GUI editor — for example PIE tests (no game
+    world ticks under ``-nullrhi``) or tests that depend on UI dialogs.
+
+    Args:
+        reason: Why the test is incompatible.
+    """
+    return pytest.mark.skipif(
+        os.environ.get("BLUEPRINTMCP_HEADLESS") == "1",
+        reason=f"headless mode incompatible: {reason}",
+    )

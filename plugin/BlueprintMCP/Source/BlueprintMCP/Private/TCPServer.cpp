@@ -136,6 +136,9 @@
 #include "Blueprint/UserWidget.h"
 #include "FileHelpers.h"   // FEditorFileUtils::SaveDirtyPackages
 
+// v9.6.0 — Headless CI commandlet shutdown flag
+#include "BlueprintMCPRunCommandlet.h"
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -5207,7 +5210,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.4.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.6.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -5518,6 +5521,26 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         if (!Future.WaitFor(FTimespan::FromSeconds(30)))
             return JsonError(TEXT("save_all"), TEXT("game_thread_timeout"));
         return Future.Get();
+    }
+
+    // --- v9.6.0 shutdown_editor ---
+    // Clean shutdown signal — works in BOTH headless (commandlet) and GUI modes.
+    //
+    // Headless (BlueprintMCPRunCommandlet): flips bShouldExit; commandlet's
+    // sleep loop sees it on next tick (~250ms) and returns 0.
+    //
+    // GUI: schedules FPlatformMisc::RequestExit(false) on the game thread,
+    // which is the same exit path used by File → Exit. Any dirty packages
+    // will prompt unless caller ran save_all first.
+    //
+    // Returns immediately — doesn't wait for the shutdown to actually complete.
+    if (Command.Equals(TEXT("shutdown_editor"), ESearchCase::IgnoreCase))
+    {
+        UBlueprintMCPRunCommandlet::bShouldExit = true;
+        AsyncTask(ENamedThreads::GameThread, [](){
+            FPlatformMisc::RequestExit(/*Force*/ false);
+        });
+        return TEXT("{\"ok\":true,\"command\":\"shutdown_editor\",\"requested\":true}\n");
     }
 
     // --- create_blueprint (Spike B1) ---
