@@ -2369,6 +2369,52 @@ def test_pie_press_key_local_validation_missing_key() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_migrate_dispatchers_recreate_ghosts_dry_run() -> None:
+    """v8.1.0: ghost detection without recreate (default behavior)."""
+    response = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP_Ghost",'
+        b'"migrated_count":0,"already_healthy_count":0,"orphan_variable_count":0,'
+        b'"ghosts_detected_count":2,"ghosts_recreated_count":0,'
+        b'"migrated":[],"already_healthy":[],"orphan_variables":[],'
+        b'"ghosts_detected":["OnDeath","OnHit"],"ghosts_recreated":[],'
+        b'"recreate_ghosts_requested":false,"compiled":false,"saved":false}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.migrate_dispatchers(blueprint="/Game/BP_Ghost")
+    assert r["ok"] is True
+    assert r["ghosts_detected_count"] == 2
+    assert r["ghosts_recreated_count"] == 0  # default — dry run
+    assert set(r["ghosts_detected"]) == {"OnDeath", "OnHit"}
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    # recreate_ghosts default is False → field should NOT be sent
+    assert "recreate_ghosts" not in sent_dict
+
+
+def test_migrate_dispatchers_recreate_ghosts_active() -> None:
+    """v8.1.0: with recreate_ghosts=True, ghosts get rebuilt with empty signatures."""
+    response = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP_Ghost",'
+        b'"migrated_count":0,"already_healthy_count":0,"orphan_variable_count":0,'
+        b'"ghosts_detected_count":2,"ghosts_recreated_count":2,'
+        b'"migrated":[],"already_healthy":[],"orphan_variables":[],'
+        b'"ghosts_detected":["OnDeath","OnHit"],"ghosts_recreated":["OnDeath","OnHit"],'
+        b'"recreate_ghosts_requested":true,"compiled":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.migrate_dispatchers(blueprint="/Game/BP_Ghost", recreate_ghosts=True)
+    assert r["ok"] is True
+    assert r["ghosts_recreated_count"] == 2
+    assert r["compiled"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["recreate_ghosts"] is True
+
+
 def test_migrate_dispatchers_repairs_old() -> None:
     response = (
         b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP_Old",'

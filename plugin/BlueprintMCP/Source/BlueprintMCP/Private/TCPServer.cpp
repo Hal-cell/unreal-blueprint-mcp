@@ -133,6 +133,7 @@
 #include "K2Node_CallDelegate.h"
 #include "K2Node_AddDelegate.h"
 #include "K2Node_RemoveDelegate.h"
+#include "K2Node_BaseMCDelegate.h"   // v8.1.0: ghost dispatcher detection scans this base type
 
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
 
@@ -3677,6 +3678,74 @@ namespace
      * Implementation: creates a graph in Blueprint->DelegateSignatureGraphs with
      * a K2Node_FunctionEntry whose user-defined pins become the delegate's params.
      */
+    /**
+     * v8.1.0 helper: full v7.1.2 dispatcher-creation flow as a reusable function.
+     * Does NOT MarkStructurallyModified or compile — caller batches those.
+     * Caller MUST have already validated uniqueness + param types.
+     */
+    bool CreateDispatcherInternal(
+        UBlueprint* Blueprint,
+        const FName& DispatcherFName,
+        const TArray<FString>& ParamNames,
+        const TArray<FEdGraphPinType>& ResolvedParamTypes,
+        FString& OutError)
+    {
+        const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+        if (K2Schema == nullptr) { OutError = TEXT("no_k2_schema"); return false; }
+
+        // (1) Member variable — becomes FMulticastDelegateProperty after compile
+        FEdGraphPinType DelegateType;
+        DelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+        if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, DispatcherFName, DelegateType))
+        {
+            OutError = FString::Printf(TEXT("add_member_variable_failed: %s"), *DispatcherFName.ToString());
+            return false;
+        }
+
+        // (2) Signature graph
+        UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+            Blueprint, DispatcherFName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+        if (NewGraph == nullptr)
+        {
+            FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, DispatcherFName);
+            OutError = FString::Printf(TEXT("graph_create_failed: %s"), *DispatcherFName.ToString());
+            return false;
+        }
+        NewGraph->bEditable = false;
+
+        // (3) Schema setup — creates FunctionEntry/Result, marks editable
+        K2Schema->CreateDefaultNodesForGraph(*NewGraph);
+        K2Schema->CreateFunctionGraphTerminators(*NewGraph, (UClass*)nullptr);
+        K2Schema->AddExtraFunctionFlags(NewGraph, (FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public));
+        K2Schema->MarkFunctionEntryAsEditable(NewGraph, true);
+
+        // (4) Register graph
+        Blueprint->DelegateSignatureGraphs.Add(NewGraph);
+
+        // (5) Find FunctionEntry, add user-defined output pins for each param
+        UK2Node_FunctionEntry* EntryNode = nullptr;
+        for (UEdGraphNode* N : NewGraph->Nodes)
+        {
+            if (UK2Node_FunctionEntry* FE = Cast<UK2Node_FunctionEntry>(N))
+            {
+                EntryNode = FE;
+                break;
+            }
+        }
+        if (EntryNode == nullptr)
+        {
+            OutError = FString::Printf(TEXT("no_function_entry: %s"), *DispatcherFName.ToString());
+            return false;
+        }
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            EntryNode->CreateUserDefinedPin(FName(*ParamNames[i]), ResolvedParamTypes[i],
+                EGPD_Output, /*bUseUniqueName*/ false);
+        }
+
+        return true;
+    }
+
     FString AddEventDispatcherOnGameThread(
         const FString& BlueprintPath,
         const FString& DispatcherName,
@@ -3716,72 +3785,16 @@ namespace
             ResolvedParamTypes.Add(PinType);
         }
 
-        const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
-        if (K2Schema == nullptr)
-            return JsonError(CmdName, TEXT("no_k2_schema"));
-
-        // ----- v7.1.2 BUG-1 fix — mirror FBlueprintEditor::OnAddNewDelegate flow -----
-        // The PREVIOUS implementation built only the signature graph; that's NOT enough.
-        // The compiler needs an actual member variable of type PC_MCDelegate to generate
-        // an FMulticastDelegateProperty on the GeneratedClass. Without that property,
-        // K2Node_CallDelegate.AllocateDefaultPins can't resolve the signature → no param pins.
-
         Blueprint->Modify();
 
-        // (1) Add the member variable of multicast-delegate type. This is what becomes
-        //     the FMulticastDelegateProperty on the BP's GeneratedClass at compile time.
-        FEdGraphPinType DelegateType;
-        DelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
-        if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, DispatcherFName, DelegateType))
-            return JsonError(CmdName, TEXT("add_member_variable_failed"), DispatcherName);
-
-        // (2) Create the signature graph
-        UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
-            Blueprint, DispatcherFName,
-            UEdGraph::StaticClass(),
-            UEdGraphSchema_K2::StaticClass());
-        if (NewGraph == nullptr)
+        // Refactored v8.1.0: delegate creation lives in CreateDispatcherInternal so
+        // migrate_dispatchers can reuse it for ghost-dispatcher recreation.
+        FString InternalError;
+        if (!CreateDispatcherInternal(Blueprint, DispatcherFName, ParamNames, ResolvedParamTypes, InternalError))
         {
-            FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, DispatcherFName);
-            return JsonError(CmdName, TEXT("graph_create_failed"), DispatcherName);
-        }
-        NewGraph->bEditable = false;
-
-        // (3) Schema-driven graph setup: creates FunctionEntry/FunctionResult, sets flags.
-        K2Schema->CreateDefaultNodesForGraph(*NewGraph);
-        K2Schema->CreateFunctionGraphTerminators(*NewGraph, (UClass*)nullptr);
-        K2Schema->AddExtraFunctionFlags(NewGraph, (FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public));
-        K2Schema->MarkFunctionEntryAsEditable(NewGraph, true);
-
-        // (4) Register the signature graph with the BP
-        Blueprint->DelegateSignatureGraphs.Add(NewGraph);
-
-        // (5) Locate the FunctionEntry node created in step 3 and add our user-defined params
-        UK2Node_FunctionEntry* EntryNode = nullptr;
-        for (UEdGraphNode* N : NewGraph->Nodes)
-        {
-            if (UK2Node_FunctionEntry* FE = Cast<UK2Node_FunctionEntry>(N))
-            {
-                EntryNode = FE;
-                break;
-            }
-        }
-        if (EntryNode == nullptr)
-        {
-            // CreateFunctionGraphTerminators normally creates an entry; if missing we can't add params.
-            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
-            const bool bSavedPartial = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
-            return JsonError(CmdName, TEXT("no_function_entry"),
-                FString::Printf(TEXT("CreateFunctionGraphTerminators didn't create a FunctionEntry (saved=%d)"),
-                    bSavedPartial ? 1 : 0));
-        }
-        for (int32 i = 0; i < ParamNames.Num(); ++i)
-        {
-            EntryNode->CreateUserDefinedPin(FName(*ParamNames[i]), ResolvedParamTypes[i],
-                EGPD_Output, /*bUseUniqueName*/ false);
+            return JsonError(CmdName, TEXT("internal_create_failed"), InternalError);
         }
 
-        // (6) Mark + compile so GeneratedClass gets the FMulticastDelegateProperty + linked SignatureFunction
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
         FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
 
@@ -3805,7 +3818,9 @@ namespace
      * reports it but doesn't auto-remove the orphan variable — caller can use
      * delete_event_dispatcher.
      */
-    FString MigrateDispatchersOnGameThread(const FString& BlueprintPath)
+    FString MigrateDispatchersOnGameThread(
+        const FString& BlueprintPath,
+        bool bRecreateGhosts)   // v8.1.0: opt-in recreate of "ghost" dispatchers
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("migrate_dispatchers");
@@ -3815,7 +3830,9 @@ namespace
 
         TArray<FString> Migrated;
         TArray<FString> AlreadyHealthy;
-        TArray<FString> OrphanVariables;   // variable but no signature graph (rare)
+        TArray<FString> OrphanVariables;          // variable but no signature graph (rare)
+        TArray<FString> GhostsDetected;           // v8.1.0: dispatcher names referenced by orphan delegate nodes
+        TArray<FString> GhostsRecreated;          // v8.1.0: ghosts we successfully recreated
 
         // Pass 1: every signature graph should have a matching PC_MCDelegate member variable
         for (UEdGraph* SigGraph : Blueprint->DelegateSignatureGraphs)
@@ -3860,11 +3877,78 @@ namespace
             }
         }
 
-        // Compile only if we actually changed something — avoids triggering
-        // unnecessary editor work on healthy BPs.
+        // v8.1.0 Pass 3: ghost dispatcher detection. Scan delegate-reference nodes in all
+        // graphs and collect names that point at non-existent dispatchers. These survived
+        // when the dispatcher itself was deleted; without a matching signature graph or
+        // member variable, AllocateDefaultPins resolves to nothing.
+        TSet<FName> KnownDispatcherNames;
+        for (UEdGraph* G : Blueprint->DelegateSignatureGraphs)
+        {
+            if (G != nullptr) KnownDispatcherNames.Add(G->GetFName());
+        }
+        for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarType.PinCategory == UEdGraphSchema_K2::PC_MCDelegate)
+            {
+                KnownDispatcherNames.Add(Var.VarName);
+            }
+        }
+
+        TSet<FName> GhostNames;
+        auto ScanGraph = [&](UEdGraph* Graph)
+        {
+            if (Graph == nullptr) return;
+            for (UEdGraphNode* Node : Graph->Nodes)
+            {
+                if (UK2Node_BaseMCDelegate* DelegateNode = Cast<UK2Node_BaseMCDelegate>(Node))
+                {
+                    const FName RefName = DelegateNode->DelegateReference.GetMemberName();
+                    if (RefName != NAME_None && !KnownDispatcherNames.Contains(RefName))
+                    {
+                        GhostNames.Add(RefName);
+                    }
+                }
+            }
+        };
+        for (UEdGraph* G : Blueprint->UbergraphPages)  ScanGraph(G);
+        for (UEdGraph* G : Blueprint->FunctionGraphs)  ScanGraph(G);
+        // (Macro graphs unlikely to contain delegate refs, but harmless to scan)
+        for (UEdGraph* G : Blueprint->MacroGraphs)     ScanGraph(G);
+
+        for (const FName& G : GhostNames) GhostsDetected.Add(G.ToString());
+
+        // v8.1.0 Pass 4: opt-in recreation. Empty signature — caller adds params later
+        // via add_custom_event-style flow or manual editor edits. The ghost's old pin
+        // types on its caller nodes are NOT inferred; that's a documented limit.
+        if (bRecreateGhosts)
+        {
+            for (const FName& GhostName : GhostNames)
+            {
+                FString InternalError;
+                if (CreateDispatcherInternal(Blueprint, GhostName,
+                    /*ParamNames=*/ TArray<FString>(),
+                    /*ResolvedParamTypes=*/ TArray<FEdGraphPinType>(),
+                    InternalError))
+                {
+                    GhostsRecreated.Add(GhostName.ToString());
+                    UE_LOG(LogBlueprintMCP_TCP, Log,
+                        TEXT("migrate_dispatchers: recreated ghost '%s' (empty signature) on %s"),
+                        *GhostName.ToString(), *BlueprintPath);
+                }
+                else
+                {
+                    UE_LOG(LogBlueprintMCP_TCP, Warning,
+                        TEXT("migrate_dispatchers: failed to recreate ghost '%s' on %s: %s"),
+                        *GhostName.ToString(), *BlueprintPath, *InternalError);
+                }
+            }
+        }
+
+        // Compile only if we actually changed something
+        const bool bDidMutate = (Migrated.Num() > 0) || (GhostsRecreated.Num() > 0);
         bool bCompiled = false;
         bool bSaved = false;
-        if (Migrated.Num() > 0)
+        if (bDidMutate)
         {
             FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
             FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
@@ -3883,6 +3967,8 @@ namespace
         Writer->WriteValue(TEXT("migrated_count"), Migrated.Num());
         Writer->WriteValue(TEXT("already_healthy_count"), AlreadyHealthy.Num());
         Writer->WriteValue(TEXT("orphan_variable_count"), OrphanVariables.Num());
+        Writer->WriteValue(TEXT("ghosts_detected_count"), GhostsDetected.Num());
+        Writer->WriteValue(TEXT("ghosts_recreated_count"), GhostsRecreated.Num());
         Writer->WriteArrayStart(TEXT("migrated"));
         for (const FString& Name : Migrated) Writer->WriteValue(Name);
         Writer->WriteArrayEnd();
@@ -3892,6 +3978,13 @@ namespace
         Writer->WriteArrayStart(TEXT("orphan_variables"));
         for (const FString& Name : OrphanVariables) Writer->WriteValue(Name);
         Writer->WriteArrayEnd();
+        Writer->WriteArrayStart(TEXT("ghosts_detected"));
+        for (const FString& Name : GhostsDetected) Writer->WriteValue(Name);
+        Writer->WriteArrayEnd();
+        Writer->WriteArrayStart(TEXT("ghosts_recreated"));
+        for (const FString& Name : GhostsRecreated) Writer->WriteValue(Name);
+        Writer->WriteArrayEnd();
+        Writer->WriteValue(TEXT("recreate_ghosts_requested"), bRecreateGhosts);
         Writer->WriteValue(TEXT("compiled"), bCompiled);
         Writer->WriteValue(TEXT("saved"), bSaved);
         Writer->WriteObjectEnd();
@@ -4382,7 +4475,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.0.3\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.1.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -5366,19 +5459,21 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- migrate_dispatchers (v8.0.2 ISSUE-1) ---
+    // --- migrate_dispatchers (v8.0.2 ISSUE-1 + v8.1.0 ghost recreate) ---
     if (Command.Equals(TEXT("migrate_dispatchers"), ESearchCase::IgnoreCase))
     {
         FString Blueprint;
         if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
             return JsonError(TEXT("migrate_dispatchers"), TEXT("missing_field"), TEXT("blueprint"));
+        bool bRecreateGhosts = false;
+        JsonObject->TryGetBoolField(TEXT("recreate_ghosts"), bRecreateGhosts);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, bRecreateGhosts]() mutable
             {
-                Promise.SetValue(MigrateDispatchersOnGameThread(Blueprint));
+                Promise.SetValue(MigrateDispatchersOnGameThread(Blueprint, bRecreateGhosts));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("migrate_dispatchers"), TEXT("game_thread_timeout"));

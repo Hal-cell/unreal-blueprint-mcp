@@ -565,50 +565,74 @@ def add_event_dispatcher(
 
 
 @mcp.tool()
-def migrate_dispatchers(blueprint: str) -> dict[str, Any]:
-    """Repair old-format event dispatchers in-place — v8.0.2 (ISSUE-1).
+def migrate_dispatchers(
+    blueprint: str,
+    recreate_ghosts: bool = False,
+) -> dict[str, Any]:
+    """Repair old-format event dispatchers in-place — v8.0.2 + v8.1.0 ghost recreate.
 
-    Scans the Blueprint for dispatcher signature graphs that were created by a
-    pre-v7.1.2 plugin version (missing the PC_MCDelegate member variable) and
-    back-fills the missing variable. Recompiles + saves only if anything was
-    actually changed.
+    Three damage modes are now covered:
 
-    Use this once per old project after upgrading the plugin. Healthy BPs
-    pass through unchanged.
+    **Mode 1 — "graph present, variable missing"** (pre-v7.1.2 partial damage)
+        Signature graph exists in ``Blueprint->DelegateSignatureGraphs`` but no
+        matching ``PC_MCDelegate`` member variable. Pass 1 back-fills the variable.
+        Reported in ``migrated`` array.
 
-    **Coverage limit — "ghost dispatcher" state is NOT recoverable here:**
-    Some pre-v7.1.2 builds left even worse-damaged BPs where neither the
-    signature graph NOR the member variable survived. There's literally
-    nothing on the BP to detect or recover; `migrate_dispatchers` returns
-    all zeros and `delete_event_dispatcher` returns `dispatcher_not_found`.
-    For those, just call ``add_event_dispatcher`` to recreate from scratch
-    (and delete any stale `add_call_dispatcher` / `add_bind_dispatcher`
-    nodes referencing the lost name with ``delete_node``).
+    **Mode 2 — "variable present, graph missing"** (rare, opposite imbalance)
+        Member variable of type ``PC_MCDelegate`` exists but no signature graph.
+        Pass 2 detects but doesn't auto-clean — use ``delete_event_dispatcher``.
+        Reported in ``orphan_variables`` array.
+
+    **Mode 3 — "ghost dispatcher" — both missing** (pre-v7.1.2 full damage) — v8.1.0
+        Neither signature graph nor member variable survived, but the BP still
+        contains ``K2Node_CallDelegate`` / ``K2Node_AddDelegate`` / ``K2Node_RemoveDelegate``
+        nodes referencing the lost dispatcher by name. Pass 3 scans every graph
+        (EventGraph + UbergraphPages + FunctionGraphs + MacroGraphs) for these
+        orphan references and collects unique names.
+
+        With ``recreate_ghosts=True``, Pass 4 recreates each ghost via the full
+        v7.1.2 flow (`AddMemberVariable PC_MCDelegate` + signature graph + schema
+        setup), **with an empty parameter signature** — caller adds params later
+        via direct editor work if needed. The old nodes' pin layout is NOT
+        inferred (documented limit). Re-running ``add_call_dispatcher`` etc.
+        after this will succeed.
+
+    Healthy BPs pass through unchanged (``compiled=false``, ``saved=false``).
+    Compile + save are batched once at end, only if anything was actually
+    changed (Mode 1 backfill or Mode 3 recreate).
 
     Args:
         blueprint: BP asset path to scan.
+        recreate_ghosts: v8.1.0 — opt-in. If True, ghost dispatchers detected in
+            Pass 3 are recreated with empty signatures. Default False so a
+            "dry run" just reports what would be done.
 
     Returns:
         ``{"ok": True, "blueprint": "...",
-           "migrated_count": N, "migrated": [...names...],
-           "already_healthy_count": N, "already_healthy": [...],
-           "orphan_variable_count": N, "orphan_variables": [...names...],
+           "migrated_count": N,            "migrated": [...names...],
+           "already_healthy_count": N,     "already_healthy": [...names...],
+           "orphan_variable_count": N,     "orphan_variables": [...names...],
+           "ghosts_detected_count": N,     "ghosts_detected": [...names...],
+           "ghosts_recreated_count": N,    "ghosts_recreated": [...names...],
+           "recreate_ghosts_requested": bool,
            "compiled": bool, "saved": bool}``
 
-        - ``migrated`` = dispatchers that were repaired (variable added)
-        - ``already_healthy`` = dispatchers that were already correct
-        - ``orphan_variables`` = PC_MCDelegate variables WITHOUT a signature graph
-          (rare; use ``delete_event_dispatcher`` to clean those)
-        - ``compiled`` / ``saved`` only true when ``migrated_count > 0``
-        - **all zeros for "ghost dispatcher" state** — no manifest survived;
-          recreate via ``add_event_dispatcher``
+        ``ghosts_detected`` ⊇ ``ghosts_recreated`` (recreated is a subset of detected
+        when ``recreate_ghosts=True``).
+
+    Idempotent: re-running with ``recreate_ghosts=True`` after a successful migration
+    is safe — all dispatchers now have both pieces, so subsequent passes report
+    everything as ``already_healthy`` with no further changes.
     """
     if not blueprint:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "migrate_dispatchers",
         "blueprint": blueprint,
-    })
+    }
+    if recreate_ghosts:
+        payload["recreate_ghosts"] = True
+    return _send_command(payload)
 
 
 @mcp.tool()
