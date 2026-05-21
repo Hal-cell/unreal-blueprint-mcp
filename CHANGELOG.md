@@ -6,16 +6,123 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-All four rev4 roadmap items shipped:
+All four rev4 roadmap items + all 7 feature-request gaps from 2026-05-21
+review shipped:
 - (Done in v9.0.0–v9.3.0) AnimGraph / UMG / Niagara door-openers — every editor
-  subsystem now has at least asset-creation parity.
+  subsystem has asset-creation parity.
 - (Done in v8.1.0 + v9.5.0) Auto-migration of legacy dispatchers — detect +
   recreate + project-wide silent sweep.
 - (Done in v9.6.0) Headless CI test harness — commandlet boots in `-nullrhi`
   mode, pumps the game thread, runs the integration suite, exits cleanly.
+- (Done in v9.7.0–v9.9.0) Feature-request gaps from agentic-loop reviews —
+  level/instance manipulation, BP/variable lifecycle, PIE input enhancements.
 
 Future work: complete the AnimGraph / UMG / Niagara surfaces (parameter bindings,
 widget trees, emitter modules) beyond the door-opener asset creation.
+
+---
+
+## [v9.9.0] — 2026-05-21 — PIE input enhancements
+
+### Closes feature-request gap #7
+
+The LLM can now actually drive a character pawn into a trigger volume to
+verify "walk in" gameplay loops — previously `pie_press_key` couldn't
+simulate a held W, and there was no way to position the player.
+
+### Added — 2 new tools + 1 extension (72 → 74)
+
+- **`pie_press_key(..., duration_sec=0.0)`** — extended. `duration_sec > 0`
+  presses now, then schedules the release via `FTSTicker` after the
+  given duration. Non-blocking — returns immediately with `held=true`.
+- **`pie_set_player_location(location, player_index=0)`** — teleport the
+  PIE pawn via `Pawn->SetActorLocation(loc, TeleportPhysics)`. The
+  "drop the player at a test position" tool.
+- **`pie_move_player(direction, duration_sec=1.0, scale=1.0)`** —
+  simulate continuous movement input. Each game-thread tick calls
+  `Pawn->AddMovementInput(direction.Normal, scale)`. Uses an FTSTicker
+  that re-arms each tick until duration elapses. Returns immediately
+  with `queued=true`. **This is the right tool for character pawns**
+  because they use axis bindings — `pie_press_key("W")` only works for
+  pawns with explicit Pressed-bindings on W.
+
+### Implementation notes
+
+`WeakObjectPtr<APawn>` in the ticker lambda — if PIE ends between tick
+fires (`stop_pie` or pawn destruction) the lambda no-ops instead of
+dereferencing a dangling pointer.
+
+### `ping.plugin_version`
+"9.8.0" → **"9.9.0"**.
+
+---
+
+## [v9.8.0] — 2026-05-21 — Blueprint / variable lifecycle
+
+### Closes feature-request gaps #1, #5, #8
+
+- #1 — delete an entire BP asset
+- #5 — mark variables as Instance Editable (visible in per-instance
+  Details panel)
+- #8 — delete unwanted variables
+
+### Added — 3 new tools + 1 extension (69 → 72)
+
+- **`add_variable(..., instance_editable=False)`** — extended kwarg.
+  When `True`, clears `CPF_DisableEditOnInstance` so the variable
+  appears in per-instance Details. Backwards compatible (default False).
+- **`set_variable_flags(blueprint, name, instance_editable=None,
+   blueprint_read_only=None, expose_on_spawn=None)`** — tri-state flag
+   editor for existing variables. `None` = leave unchanged. Recompiles
+   so flags propagate to the generated FProperty. `ExposeOnSpawn` is
+   metadata; the other two are CPF_* bits.
+- **`delete_variable(blueprint, name)`** —
+  `FBlueprintEditorUtils::RemoveMemberVariable` + structural-modify +
+  recompile + save. For regular member variables; event dispatchers
+  go through `delete_event_dispatcher`.
+- **`delete_blueprint(path)`** — `UEditorAssetLibrary::DeleteAsset`
+  with a defensive class check (refuses to delete non-UBlueprint
+  assets — won't fat-finger a texture).
+
+### `ping.plugin_version`
+"9.7.0" → **"9.8.0"**.
+
+---
+
+## [v9.7.0] — 2026-05-21 — Level / instance manipulation
+
+### Closes feature-request gaps #2, #3, #6 (the highest-priority block)
+
+Before v9.7.0 the LLM was "blind" to the scene — it could create BPs
+and spawn them, but couldn't read what was already in the level or
+reposition existing instances without re-spawning duplicates.
+
+### Added — 5 new tools (64 → 69)
+
+- **`list_level_actors(class_filter, name_contains, max_results=500)`** —
+  `UEditorActorSubsystem::GetAllLevelActors()` + class + name filter.
+  Each result includes `{name, label, class, location}`. The LLM is
+  no longer blind to the scene.
+- **`get_actor_transform(actor)`** — world-space location / rotation /
+  scale of a level actor.
+- **`set_actor_transform(actor, location, rotation, scale)`** — move /
+  rotate / scale a SINGLE level instance (no re-spawn → no duplicates,
+  no `GetActorOfClass-returns-first-instance` trap). Any of the three
+  components may be omitted.
+- **`set_actor_property(actor, property, value)`** — per-instance
+  FProperty setter (DIFFERENT from v7's `set_component_property` which
+  writes to the BP CDO). For AActor-typed properties, value can be
+  **another actor's name or label** — resolved against the level
+  before asset-path fallback. The canonical "double portal" wiring.
+- **`delete_actor(actor)`** — `UEditorActorSubsystem::DestroyActor`.
+
+### Actor lookup
+
+All five accept either `GetName()` (returned by `spawn_actor`) or
+`GetActorLabel()` (Outliner display).
+
+### `ping.plugin_version`
+"9.6.0" → **"9.7.0"**.
 
 ---
 

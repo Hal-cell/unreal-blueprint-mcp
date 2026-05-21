@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.6.0](https://img.shields.io/badge/version-v9.6.0-brightgreen)](#status)
-[![64 tools](https://img.shields.io/badge/tools-64-blue)](#tools)
-[![172 tests](https://img.shields.io/badge/tests-172%20passing-success)](#requirements)
+[![v9.9.0](https://img.shields.io/badge/version-v9.9.0-brightgreen)](#status)
+[![74 tools](https://img.shields.io/badge/tools-74-blue)](#tools)
+[![203 tests](https://img.shields.io/badge/tests-203%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -69,8 +69,11 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.4.0** | ✅ `create_widget_blueprint` (UMG door-opener) + `save_all` (no-prompt save-all-dirty) |
 | **v9.5.0** | ✅ Silent dispatcher migration: `auto_migrate_dispatchers` + `auto_migrate_all_dispatchers` (Python-only) |
 | **v9.6.0** | ✅ Headless CI: `BlueprintMCPRun` commandlet + `shutdown_editor` + `scripts/run_headless_ci.sh` |
-| **Unit tests** | **172 passing**, 8 integration tests gated on a running UE editor (GUI 8/8, headless 6/8 + 2 explicit skips) |
-| **Plugin binary** | **~940 KB** dylib on macOS / UE 5.4.4 |
+| **v9.7.0** | ✅ Level/instance ops: `list_level_actors` / `get_actor_transform` / `set_actor_transform` / `set_actor_property` / `delete_actor` — LLM no longer blind to the scene |
+| **v9.8.0** | ✅ BP/variable lifecycle: `delete_blueprint` / `delete_variable` / `set_variable_flags` + `add_variable(instance_editable=)` |
+| **v9.9.0** | ✅ PIE input enhancements: `pie_press_key(duration_sec=)` + `pie_set_player_location` + `pie_move_player` — LLM can now actually walk into a trigger box |
+| **Unit tests** | **203 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -110,7 +113,7 @@ uv sync --extra dev    # if you want to run the tests
 Verify:
 
 ```bash
-uv run pytest    # → 172 passed, 8 skipped (integration tests)
+uv run pytest    # → 203 passed, 10 skipped (integration tests)
 ```
 
 ### 4. Optional — headless CI mode
@@ -149,7 +152,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 
 ## Tools
 
-**64 total.** Tools marked **(v7)** are new or significantly extended in v7; **(v8)** are the agentic-loop primitives; **(v9)** opens new editor surfaces (AnimGraph / UMG / Niagara) + headless CI. Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
+**74 total.** Tools marked **(v7)** are new or significantly extended in v7; **(v8)** are the agentic-loop primitives; **(v9)** opens new editor surfaces (AnimGraph / UMG / Niagara) + headless CI + closes the 7 feature-request gaps from the 2026-05-21 review (level ops / BP lifecycle / PIE input). Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
 
 ### Asset & project
 
@@ -163,6 +166,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`save_blueprint`** (v7) | Explicit `UEditorAssetLibrary::SaveAsset` |
 | **`save_all`** (v9.4) | Silently save every dirty package — call before any UE kill/restart |
 | **`shutdown_editor`** (v9.6) | Clean editor exit — works in BOTH GUI and headless commandlet modes |
+| **`delete_blueprint`** (v9.8) | Delete an entire BP asset (defensive class check refuses non-UBlueprint assets) |
 
 ### Introspection
 
@@ -176,7 +180,9 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 |------|--------------|
 | `add_component` | Add a component to the BP's SCS (BoxCollision, StaticMesh, Camera, ...) |
 | **`set_component_property`** (v7) | **Set component template defaults via FProperty reflection: mesh asset, box extent, collision preset, with dot-notation for nested struct fields (`BodyInstance.CollisionProfileName`)** |
-| `add_variable` | Add a member variable. Types: primitives, `TimerHandle`, arrays, **`object:Actor` / `class:Pawn` references (v7)** |
+| `add_variable` | Add a member variable. Types: primitives, `TimerHandle`, arrays, **`object:Actor` / `class:Pawn` references (v7)**. v9.8 adds `instance_editable=` kwarg |
+| **`set_variable_flags`** (v9.8) | Flip flags on an existing var: `instance_editable` / `blueprint_read_only` / `expose_on_spawn` (tri-state — None = unchanged) |
+| **`delete_variable`** (v9.8) | Remove a member variable (recompile + save) |
 | `add_variable_get` / `add_variable_set` | Read/write nodes for BP variables |
 
 ### Function & dispatcher authoring
@@ -231,16 +237,28 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | `disconnect_pins` (v4) | Break a single pin link |
 | `delete_node` (v4) | Delete a node and break all its connections |
 
-### Agentic closed loop (v8)
+### Agentic closed loop (v8 + v9.9)
 
 | Tool | What it does |
 |------|--------------|
 | **`start_pie`** (v8) | Begin a PIE session (`GEditor->RequestPlaySession`). Returns `queued:true` — wait a tick before `pie_press_key` |
 | **`stop_pie`** (v8) | End the active PIE session (`RequestEndPlayMap`) |
 | **`is_pie_running`** (v8) | Query PIE state — `running` (active) + `start_queued` (requested but not yet ticked) |
-| **`pie_press_key`** (v8) | Simulate press + release on `APlayerController` (works for legacy + Enhanced Input) |
+| **`pie_press_key`** (v8, **v9.9-extended**) | Simulate key on `APlayerController`. **v9.9 adds `duration_sec=` for held keys** (non-blocking — release scheduled via FTSTicker) |
+| **`pie_set_player_location`** (v9.9) | Teleport the controlled pawn to a world-space location (`SetActorLocation` w/ TeleportPhysics) |
+| **`pie_move_player`** (v9.9) | Simulate continuous movement input — equivalent to holding WASD. Per-tick `AddMovementInput(dir, scale)` via FTSTicker. **The right tool for character pawns** (axis-based) |
 | **`read_log_capture`** (v8) | Read recent UE log lines from a thread-safe FOutputDevice buffer. Filter by `category` (substring) / `verbosity` / `contains` / `max_lines`. **Sees MCP commands at category `BlueprintMCP_TCP` (v8.0.1+)** |
 | **`clear_log_capture`** (v8) | Drop the log buffer before triggering an action |
+
+### Level / instance manipulation (v9.7)
+
+| Tool | What it does |
+|------|--------------|
+| **`list_level_actors`** (v9.7) | `UEditorActorSubsystem::GetAllLevelActors` + class + name filter. Returns `[{name, label, class, location}, ...]`. The LLM is no longer blind to the scene |
+| **`get_actor_transform`** (v9.7) | World-space location / rotation / scale of an actor |
+| **`set_actor_transform`** (v9.7) | Move / rotate / scale a single instance (no re-spawn). Any of location/rotation/scale may be omitted |
+| **`set_actor_property`** (v9.7) | Per-instance FProperty setter (different from `set_component_property` — that writes to the BP CDO). For AActor-typed properties, value can be **another actor's name** (resolved against the level) — canonical "double portal" wiring |
+| **`delete_actor`** (v9.7) | Remove an actor from the level (`DestroyActor`) |
 
 ### Asset/class discovery (v9.1)
 
@@ -313,7 +331,7 @@ The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies i
 .
 ├── plugin/BlueprintMCP/                            # UE C++ plugin (drop into <UE_PROJECT>/Plugins/)
 │   ├── BlueprintMCP.uplugin
-│   └── Source/BlueprintMCP/                        # ~6700 lines C++ (v9.6.0)
+│   └── Source/BlueprintMCP/                        # ~7400 lines C++ (v9.9.0)
 │       ├── Private/TCPServer.cpp                   # Main dispatch + all OnGameThread helpers
 │       ├── Private/BlueprintMCPRunCommandlet.cpp   # v9.6 — headless CI entry point
 │       └── Public/BlueprintMCPRunCommandlet.h
@@ -323,10 +341,10 @@ The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies i
 └── server/                                         # Python MCP server (FastMCP)
     ├── pyproject.toml
     ├── unreal_blueprint_mcp/
-    │   └── server.py                               # ~2700 lines Python (64 @mcp.tool decorators)
+    │   └── server.py                               # ~3000 lines Python (74 @mcp.tool decorators)
     └── tests/
         ├── conftest.py                             # requires_ue_editor() + skip_if_headless()
-        └── test_server.py                          # 172 unit + 8 integration tests
+        └── test_server.py                          # 203 unit + 10 integration tests
 ```
 
 ## Design notes
@@ -344,8 +362,9 @@ The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies i
 **v8** delivered the agentic closed loop — PIE control + simulated input + log capture
 + MCP command stream visible to the log reader.
 
-**v9** opened three new editor surfaces (AnimGraph / UMG / Niagara) plus the
-headless CI test harness:
+**v9** opened three new editor surfaces (AnimGraph / UMG / Niagara), shipped
+the headless CI test harness, and closed all 7 feature-request gaps from the
+2026-05-21 agentic-loop review:
 - **v9.0/v9.2** — `create_anim_blueprint` + FSM authoring (`add_anim_state_machine`,
   `add_anim_state`, `add_anim_transition`, `set_anim_state_pose`)
 - **v9.1** — asset/class discovery (`list_assets`, `list_skeletons`, `list_meshes`,
@@ -353,9 +372,19 @@ headless CI test harness:
 - **v9.3** — `create_niagara_system` + drive-by `list_assets` non-Engine class fallback
 - **v9.4** — `create_widget_blueprint` (UMG) + `save_all`
 - **v9.5** — silent dispatcher auto-migration (`auto_migrate_dispatchers`,
-  `auto_migrate_all_dispatchers`) — closes the legacy-repair roadmap item
+  `auto_migrate_all_dispatchers`)
 - **v9.6** — headless CI: `BlueprintMCPRun` commandlet + `shutdown_editor` +
   `scripts/run_headless_ci.sh`
+- **v9.7** — level/instance manipulation: `list_level_actors` /
+  `get_actor_transform` / `set_actor_transform` / `set_actor_property` /
+  `delete_actor` (closes feature gaps #2 / #3 / #6 — the LLM is no longer
+  blind to the scene)
+- **v9.8** — BP/variable lifecycle: `delete_blueprint` / `delete_variable` /
+  `set_variable_flags` + `add_variable(instance_editable=)` (closes gaps
+  #1 / #5 / #8)
+- **v9.9** — PIE input enhancements: `pie_press_key(duration_sec=)` /
+  `pie_set_player_location` / `pie_move_player` (closes gap #7 — the LLM
+  can now actually walk a character into a trigger box)
 
 Possible future directions:
 - **Widget tree composition** — beyond the v9.4 door-opener: programmatic
@@ -364,8 +393,8 @@ Possible future directions:
   set module parameters, wire material inputs.
 - **AnimGraph blend spaces & IK** — extend v9.2's FSM authoring with
   blend-space nodes, two-bone IK, control rigs.
-- **Multi-PIE / dedicated-server testing** — extend v8's PIE tools to support
-  multi-window play + dedicated-server PIE.
+- **Multi-PIE / dedicated-server testing** — extend v8/v9.9's PIE tools to
+  support multi-window play + dedicated-server PIE.
 
 ## Acknowledgments
 
