@@ -565,6 +565,42 @@ def add_event_dispatcher(
 
 
 @mcp.tool()
+def migrate_dispatchers(blueprint: str) -> dict[str, Any]:
+    """Repair old-format event dispatchers in-place — v8.0.2 (ISSUE-1).
+
+    Scans the Blueprint for dispatcher signature graphs that were created by a
+    pre-v7.1.2 plugin version (missing the PC_MCDelegate member variable) and
+    back-fills the missing variable. Recompiles + saves only if anything was
+    actually changed.
+
+    Use this once per old project after upgrading the plugin. Healthy BPs
+    pass through unchanged.
+
+    Args:
+        blueprint: BP asset path to scan.
+
+    Returns:
+        ``{"ok": True, "blueprint": "...",
+           "migrated_count": N, "migrated": [...names...],
+           "already_healthy_count": N, "already_healthy": [...],
+           "orphan_variable_count": N, "orphan_variables": [...names...],
+           "compiled": bool, "saved": bool}``
+
+        - ``migrated`` = dispatchers that were repaired (variable added)
+        - ``already_healthy`` = dispatchers that were already correct
+        - ``orphan_variables`` = PC_MCDelegate variables WITHOUT a signature graph
+          (rare; use ``delete_event_dispatcher`` to clean those)
+        - ``compiled`` / ``saved`` only true when ``migrated_count > 0``
+    """
+    if not blueprint:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "migrate_dispatchers",
+        "blueprint": blueprint,
+    })
+
+
+@mcp.tool()
 def delete_event_dispatcher(
     blueprint: str,
     dispatcher_name: str,

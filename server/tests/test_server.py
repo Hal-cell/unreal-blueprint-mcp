@@ -2349,6 +2349,87 @@ def test_pie_press_key_local_validation_missing_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# v8.0.2 — migrate_dispatchers + plugin_version in ping
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_dispatchers_repairs_old() -> None:
+    response = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP_Old",'
+        b'"migrated_count":2,"already_healthy_count":0,"orphan_variable_count":0,'
+        b'"migrated":["OnHit","OnDeath"],"already_healthy":[],"orphan_variables":[],'
+        b'"compiled":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.migrate_dispatchers(blueprint="/Game/BP_Old")
+    assert r["ok"] is True
+    assert r["migrated_count"] == 2
+    assert set(r["migrated"]) == {"OnHit", "OnDeath"}
+    assert r["compiled"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "migrate_dispatchers", "blueprint": "/Game/BP_Old"}
+
+
+def test_migrate_dispatchers_nothing_to_do() -> None:
+    """Healthy BP: 0 migrated, compiled=false, saved=false."""
+    response = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP_Healthy",'
+        b'"migrated_count":0,"already_healthy_count":1,"orphan_variable_count":0,'
+        b'"migrated":[],"already_healthy":["OnHit"],"orphan_variables":[],'
+        b'"compiled":false,"saved":false}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.migrate_dispatchers(blueprint="/Game/BP_Healthy")
+    assert r["ok"] is True
+    assert r["migrated_count"] == 0
+    assert r["already_healthy_count"] == 1
+    assert r["compiled"] is False
+
+
+def test_migrate_dispatchers_local_validation() -> None:
+    r = server.migrate_dispatchers(blueprint="")
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+def test_ping_returns_plugin_version() -> None:
+    """v8.0.2: ping now surfaces plugin_version + build_date so users can verify dylib."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"8.0.2","build_date":"May 21 2026 11:35:00",'
+        b'"timestamp":"2026-05-21T11:35:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "8.0.2"
+    assert "build_date" in r
+
+
+@pytest.mark.skip(reason="Requires UE editor + a pre-v7.1.2 BP with broken dispatchers")
+def test_migrate_dispatchers_against_real_plugin() -> None:
+    """Manual integration: scan + repair an old BP, then verify add_call_dispatcher works."""
+    bp = "/Game/Blueprints/BP_V76_v2"
+    r = server.migrate_dispatchers(blueprint=bp)
+    assert r["ok"] is True
+    # Old BP_V76_v2 had a broken OnDeath; depending on what remained, this may or
+    # may not migrate it. The point: this tool is idempotent + observable.
+
+    if r["migrated_count"] > 0:
+        # Verify the now-repaired dispatcher produces real param pins
+        call_r = server.add_call_dispatcher(
+            blueprint=bp, dispatcher_name=r["migrated"][0],
+            anchor_name="post_migrate_broadcast",
+        )
+        pin_names = {p["name"] for p in call_r["pins"]}
+        # If the dispatcher has params, they should appear
+        assert "execute" in pin_names and "self" in pin_names
+
+
+# ---------------------------------------------------------------------------
 # v8.0.1 — delete_event_dispatcher (OPEN-1 recovery path)
 # ---------------------------------------------------------------------------
 

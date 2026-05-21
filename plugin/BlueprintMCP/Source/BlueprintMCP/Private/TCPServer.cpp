@@ -3795,6 +3795,111 @@ namespace
     }
 
     /**
+     * v8.0.2 ISSUE-1 fix: scan a Blueprint for old-format event dispatchers (pre-v7.1.2
+     * style — signature graph present but no PC_MCDelegate member variable) and
+     * back-fill the missing variable. Programmatic upgrade path that avoids the
+     * manual delete + recreate dance.
+     *
+     * Also detects the opposite imbalance (member variable but no signature graph,
+     * which shouldn't happen normally but might from interrupted operations) and
+     * reports it but doesn't auto-remove the orphan variable — caller can use
+     * delete_event_dispatcher.
+     */
+    FString MigrateDispatchersOnGameThread(const FString& BlueprintPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("migrate_dispatchers");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        TArray<FString> Migrated;
+        TArray<FString> AlreadyHealthy;
+        TArray<FString> OrphanVariables;   // variable but no signature graph (rare)
+
+        // Pass 1: every signature graph should have a matching PC_MCDelegate member variable
+        for (UEdGraph* SigGraph : Blueprint->DelegateSignatureGraphs)
+        {
+            if (SigGraph == nullptr) continue;
+            const FName SigName = SigGraph->GetFName();
+
+            if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, SigName) != INDEX_NONE)
+            {
+                AlreadyHealthy.Add(SigName.ToString());
+                continue;
+            }
+
+            FEdGraphPinType DelegateType;
+            DelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+            if (FBlueprintEditorUtils::AddMemberVariable(Blueprint, SigName, DelegateType))
+            {
+                Migrated.Add(SigName.ToString());
+                UE_LOG(LogBlueprintMCP_TCP, Log,
+                    TEXT("migrate_dispatchers: back-filled member variable '%s' for %s"),
+                    *SigName.ToString(), *BlueprintPath);
+            }
+        }
+
+        // Pass 2: detect orphan PC_MCDelegate variables (no signature graph) — read-only
+        for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarType.PinCategory != UEdGraphSchema_K2::PC_MCDelegate) continue;
+            const FName VarName = Var.VarName;
+            bool bHasGraph = false;
+            for (UEdGraph* SigGraph : Blueprint->DelegateSignatureGraphs)
+            {
+                if (SigGraph != nullptr && SigGraph->GetFName() == VarName)
+                {
+                    bHasGraph = true;
+                    break;
+                }
+            }
+            if (!bHasGraph)
+            {
+                OrphanVariables.Add(VarName.ToString());
+            }
+        }
+
+        // Compile only if we actually changed something — avoids triggering
+        // unnecessary editor work on healthy BPs.
+        bool bCompiled = false;
+        bool bSaved = false;
+        if (Migrated.Num() > 0)
+        {
+            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+            FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
+            bCompiled = true;
+            bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+        }
+
+        // Build JSON via writer so the string arrays are safely escaped
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), TEXT("migrate_dispatchers"));
+        Writer->WriteValue(TEXT("blueprint"), BlueprintPath);
+        Writer->WriteValue(TEXT("migrated_count"), Migrated.Num());
+        Writer->WriteValue(TEXT("already_healthy_count"), AlreadyHealthy.Num());
+        Writer->WriteValue(TEXT("orphan_variable_count"), OrphanVariables.Num());
+        Writer->WriteArrayStart(TEXT("migrated"));
+        for (const FString& Name : Migrated) Writer->WriteValue(Name);
+        Writer->WriteArrayEnd();
+        Writer->WriteArrayStart(TEXT("already_healthy"));
+        for (const FString& Name : AlreadyHealthy) Writer->WriteValue(Name);
+        Writer->WriteArrayEnd();
+        Writer->WriteArrayStart(TEXT("orphan_variables"));
+        for (const FString& Name : OrphanVariables) Writer->WriteValue(Name);
+        Writer->WriteArrayEnd();
+        Writer->WriteValue(TEXT("compiled"), bCompiled);
+        Writer->WriteValue(TEXT("saved"), bSaved);
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
+    /**
      * v8.0.1 OPEN-1 fix: delete an event dispatcher (signature graph + member variable)
      * so users can remove dispatchers built by pre-v7.1.2 dylibs (which were missing
      * the member variable and therefore can't be repaired by add_call_dispatcher).
@@ -4241,12 +4346,14 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return TEXT("{\"ok\":false,\"error\":\"missing_command_field\"}\n");
     }
 
-    // --- ping (Spike A1) ---
+    // --- ping (Spike A1 + v8.0.2 plugin_version + build_date) ---
     if (Command.Equals(TEXT("ping"), ESearchCase::IgnoreCase))
     {
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
+        // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.0.2\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
 
@@ -5226,6 +5333,25 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_event_dispatcher"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- migrate_dispatchers (v8.0.2 ISSUE-1) ---
+    if (Command.Equals(TEXT("migrate_dispatchers"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("migrate_dispatchers"), TEXT("missing_field"), TEXT("blueprint"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint]() mutable
+            {
+                Promise.SetValue(MigrateDispatchersOnGameThread(Blueprint));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("migrate_dispatchers"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
