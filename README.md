@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v8.0.3](https://img.shields.io/badge/version-v8.0.3-brightgreen)](#status)
-[![48 tools](https://img.shields.io/badge/tools-48-blue)](#tools)
-[![125 tests](https://img.shields.io/badge/tests-125%20passing-success)](#requirements)
+[![v9.6.0](https://img.shields.io/badge/version-v9.6.0-brightgreen)](#status)
+[![64 tools](https://img.shields.io/badge/tools-64-blue)](#tools)
+[![172 tests](https://img.shields.io/badge/tests-172%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -36,6 +36,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 - **FProperty reflection for component defaults** — `set_component_property` configures mesh asset / box extent / collision preset via dot-notation paths (v7.1+)
 - **Native struct break/make** — `add_break_struct HitResult` returns full member pins instead of an empty K2Node (v7.1.0+)
 - **Agentic closed loop** — `start_pie` / `pie_press_key` / `read_log_capture` lets the LLM run + verify its own work (v8+)
+- **Multi-surface coverage** — door-openers for **AnimGraph** (v9.0/v9.2) + **Niagara** (v9.3) + **UMG** (v9.4) so the LLM can author beyond just gameplay BPs
+- **Headless CI test harness** — `scripts/run_headless_ci.sh` boots a commandlet in `-nullrhi` mode, runs the integration suite, exits cleanly (v9.6+)
 - **Quality over breadth** — fewer tools, every one with docstrings written for an LLM consumer
 - **Game-thread safety** as a first-class invariant — all UObject ops marshaled via `TPromise`/`TFuture` with a 10s deadline
 
@@ -57,8 +59,18 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v8.0.1** | ✅ MCP command stream visible to `read_log_capture` + `delete_event_dispatcher` recovery tool |
 | **v8.0.2** | ✅ `migrate_dispatchers` (programmatic legacy repair) + `ping` reports `plugin_version` + `build_date` |
 | **v8.0.3** | ✅ `read_log_capture` category filter is **real substring match** as documented |
-| **Unit tests** | **125 passing**, 16 integration tests gated on a running UE editor |
-| **Plugin binary** | **~717 KB** dylib on macOS / UE 5.4.4 |
+| **v8.1.0** | ✅ `migrate_dispatchers` ghost-detection + opt-in recreate (full 3-mode coverage) |
+| **v8.2.0** | ✅ Integration test harness (`requires_ue_editor()` decorator + `scripts/run_integration_tests.sh`) |
+| **v8.2.1** | ✅ Swept 14 stale `_against_real_plugin` tests; hardened agentic-loop test |
+| **v9.0.0** | ✅ `create_anim_blueprint` — AnimGraph domain opens |
+| **v9.1.0** | ✅ Asset/class discovery: `list_assets` / `list_skeletons` / `list_meshes` / `list_blueprints` / `list_classes` |
+| **v9.2.0** | ✅ AnimGraph FSM: `add_anim_state_machine` / `add_anim_state` / `add_anim_transition` / `set_anim_state_pose` |
+| **v9.3.0** | ✅ `create_niagara_system` — Niagara VFX domain opens + `list_assets` non-Engine class fallback |
+| **v9.4.0** | ✅ `create_widget_blueprint` (UMG door-opener) + `save_all` (no-prompt save-all-dirty) |
+| **v9.5.0** | ✅ Silent dispatcher migration: `auto_migrate_dispatchers` + `auto_migrate_all_dispatchers` (Python-only) |
+| **v9.6.0** | ✅ Headless CI: `BlueprintMCPRun` commandlet + `shutdown_editor` + `scripts/run_headless_ci.sh` |
+| **Unit tests** | **172 passing**, 8 integration tests gated on a running UE editor (GUI 8/8, headless 6/8 + 2 explicit skips) |
+| **Plugin binary** | **~940 KB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -98,7 +110,18 @@ uv sync --extra dev    # if you want to run the tests
 Verify:
 
 ```bash
-uv run pytest    # → 125 passed, 16 skipped
+uv run pytest    # → 172 passed, 8 skipped (integration tests)
+```
+
+### 4. Optional — headless CI mode
+
+For CI pipelines or clean local test cycles, `scripts/run_headless_ci.sh` boots
+UE via the `BlueprintMCPRun` commandlet in `-nullrhi -unattended` mode, runs
+the integration suite, and exits cleanly. No GUI editor required.
+
+```bash
+./scripts/run_headless_ci.sh
+# → boots UE-Cmd → polls TCP → pytest → shutdown_editor → exit
 ```
 
 ### 3. Wire to Claude Desktop
@@ -126,7 +149,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 
 ## Tools
 
-**48 total.** Tools marked **(v7)** are new or significantly extended in v7; **(v8)** are the agentic-loop primitives. Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
+**64 total.** Tools marked **(v7)** are new or significantly extended in v7; **(v8)** are the agentic-loop primitives; **(v9)** opens new editor surfaces (AnimGraph / UMG / Niagara) + headless CI. Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
 
 ### Asset & project
 
@@ -138,6 +161,8 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |
 | `spawn_actor` | Place a compiled BP instance into the current level |
 | **`save_blueprint`** (v7) | Explicit `UEditorAssetLibrary::SaveAsset` |
+| **`save_all`** (v9.4) | Silently save every dirty package — call before any UE kill/restart |
+| **`shutdown_editor`** (v9.6) | Clean editor exit — works in BOTH GUI and headless commandlet modes |
 
 ### Introspection
 
@@ -165,7 +190,9 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`add_bind_dispatcher`** (v7) | `K2Node_AddDelegate` — bind a custom event to the dispatcher |
 | **`add_unbind_dispatcher`** (v7) | `K2Node_RemoveDelegate` — unbind |
 | **`delete_event_dispatcher`** (v8) | Remove a dispatcher's signature graph + member variable (legacy recovery + cleanup) |
-| **`migrate_dispatchers`** (v8) | Programmatic repair: backfill missing PC_MCDelegate member variable on pre-v7.1.2 dispatchers |
+| **`migrate_dispatchers`** (v8) | Programmatic repair: backfill missing PC_MCDelegate member variable on pre-v7.1.2 dispatchers. v8.1+ also detects + opt-in recreates "ghost" dispatchers |
+| **`auto_migrate_dispatchers`** (v9.5) | Convenience alias — silently fix all 3 dispatcher damage modes in one BP |
+| **`auto_migrate_all_dispatchers`** (v9.5) | Project-wide sweep: list_blueprints → fix each → aggregate report. The "I just upgraded the plugin" command |
 
 ### Node creation
 
@@ -215,6 +242,38 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`read_log_capture`** (v8) | Read recent UE log lines from a thread-safe FOutputDevice buffer. Filter by `category` (substring) / `verbosity` / `contains` / `max_lines`. **Sees MCP commands at category `BlueprintMCP_TCP` (v8.0.1+)** |
 | **`clear_log_capture`** (v8) | Drop the log buffer before triggering an action |
 
+### Asset/class discovery (v9.1)
+
+| Tool | What it does |
+|------|--------------|
+| **`list_assets`** (v9.1) | `IAssetRegistry::GetAssetsByClass` + path filter. Class arg is class name (`StaticMesh`, `NiagaraSystem`) or `/Script/Module.Class`. v9.3+ falls back to name-match for non-Engine classes |
+| **`list_skeletons`** (v9.1) | `USkeleton` shortcut — use to find a skeleton for `create_anim_blueprint` |
+| **`list_meshes`** (v9.1) | `StaticMesh + SkeletalMesh` (batched in one game-thread hop) |
+| **`list_blueprints`** (v9.1) | `Blueprint` shortcut |
+| **`list_classes`** (v9.1) | Walk loaded `UClass`es via `TObjectIterator`. Filter by `parent_class` / `name_contains` / `native_only` |
+
+### AnimGraph (v9.0 + v9.2)
+
+| Tool | What it does |
+|------|--------------|
+| **`create_anim_blueprint`** (v9.0) | Blank `UAnimBlueprint` via `UAnimBlueprintFactory` (parent = `UAnimInstance`, target = user-supplied `USkeleton`) |
+| **`add_anim_state_machine`** (v9.2) | Spawn `UAnimGraphNode_StateMachine` in the AnimGraph; UE auto-creates interior `EditorStateMachineGraph` |
+| **`add_anim_state`** (v9.2) | Spawn `UAnimStateNode` inside a named state machine; auto-creates the state's interior `BoundGraph` |
+| **`add_anim_transition`** (v9.2) | `UAnimStateTransitionNode` + canonical `CreateConnections(From, To)` |
+| **`set_anim_state_pose`** (v9.2) | Load `UAnimSequence`, validate skeleton match, wire SequencePlayer pose into state's `GetPoseSinkPinInsideState` |
+
+### UMG / Widget Blueprint (v9.4)
+
+| Tool | What it does |
+|------|--------------|
+| **`create_widget_blueprint`** (v9.4) | Blank `UWidgetBlueprint` via `UWidgetBlueprintFactory` (parent = `UUserWidget` by default, or a user-supplied subclass) |
+
+### Niagara VFX (v9.3)
+
+| Tool | What it does |
+|------|--------------|
+| **`create_niagara_system`** (v9.3) | Blank `UNiagaraSystem` via `UNiagaraSystemFactoryNew` (resolved at runtime — factory class is not `NIAGARAEDITOR_API`-exported) |
+
 ## v1 Collision-Timer demo
 
 One prompt to Claude:
@@ -252,14 +311,22 @@ The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies i
 
 ```
 .
-├── plugin/BlueprintMCP/       # UE C++ plugin (drop into <UE_PROJECT>/Plugins/)
+├── plugin/BlueprintMCP/                            # UE C++ plugin (drop into <UE_PROJECT>/Plugins/)
 │   ├── BlueprintMCP.uplugin
-│   └── Source/BlueprintMCP/   # ~5300 lines C++ (v8.0.3)
-└── server/                     # Python MCP server (FastMCP)
+│   └── Source/BlueprintMCP/                        # ~6700 lines C++ (v9.6.0)
+│       ├── Private/TCPServer.cpp                   # Main dispatch + all OnGameThread helpers
+│       ├── Private/BlueprintMCPRunCommandlet.cpp   # v9.6 — headless CI entry point
+│       └── Public/BlueprintMCPRunCommandlet.h
+├── scripts/
+│   ├── run_integration_tests.sh                    # v8.2 — pytest against running GUI editor
+│   └── run_headless_ci.sh                          # v9.6 — boots UE-Cmd, runs tests, cleans up
+└── server/                                         # Python MCP server (FastMCP)
     ├── pyproject.toml
     ├── unreal_blueprint_mcp/
-    │   └── server.py          # ~2200 lines Python
-    └── tests/test_server.py   # 125 unit tests + 16 integration (skipped)
+    │   └── server.py                               # ~2700 lines Python (64 @mcp.tool decorators)
+    └── tests/
+        ├── conftest.py                             # requires_ue_editor() + skip_if_headless()
+        └── test_server.py                          # 172 unit + 8 integration tests
 ```
 
 ## Design notes
@@ -275,21 +342,30 @@ The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies i
 ## Roadmap
 
 **v8** delivered the agentic closed loop — PIE control + simulated input + log capture
-+ MCP command stream visible to the log reader. The LLM-writes-runs-verifies story
-fits in one MCP session. See the v8 Agentic-loop demo above and
-`tests/test_server.py::test_v8_agentic_loop_against_real_plugin` for the canonical
-end-to-end shape.
++ MCP command stream visible to the log reader.
+
+**v9** opened three new editor surfaces (AnimGraph / UMG / Niagara) plus the
+headless CI test harness:
+- **v9.0/v9.2** — `create_anim_blueprint` + FSM authoring (`add_anim_state_machine`,
+  `add_anim_state`, `add_anim_transition`, `set_anim_state_pose`)
+- **v9.1** — asset/class discovery (`list_assets`, `list_skeletons`, `list_meshes`,
+  `list_blueprints`, `list_classes`)
+- **v9.3** — `create_niagara_system` + drive-by `list_assets` non-Engine class fallback
+- **v9.4** — `create_widget_blueprint` (UMG) + `save_all`
+- **v9.5** — silent dispatcher auto-migration (`auto_migrate_dispatchers`,
+  `auto_migrate_all_dispatchers`) — closes the legacy-repair roadmap item
+- **v9.6** — headless CI: `BlueprintMCPRun` commandlet + `shutdown_editor` +
+  `scripts/run_headless_ci.sh`
 
 Possible future directions:
-- **Auto-migration of legacy dispatchers** — auto-detect + repair pre-v7.1.2
-  damaged dispatchers on BP load, removing the manual `migrate_dispatchers`
-  step (currently the only standing limitation, documented as the
-  "ghost dispatcher" case).
-- **Animation Blueprint surface** — author AnimGraph state machines, blend spaces.
-- **UMG Widget Blueprint surface** — author UI hierarchies + bindings.
-- **Niagara node surface** — emitter modules, parameter bindings.
-- **Headless integration test harness** — run the test BPs in CI without a human-launched
-  editor window.
+- **Widget tree composition** — beyond the v9.4 door-opener: programmatic
+  Canvas / Button / Text widget authoring, binding events.
+- **Niagara module authoring** — beyond the v9.3 door-opener: add emitters,
+  set module parameters, wire material inputs.
+- **AnimGraph blend spaces & IK** — extend v9.2's FSM authoring with
+  blend-space nodes, two-bone IK, control rigs.
+- **Multi-PIE / dedicated-server testing** — extend v8's PIE tools to support
+  multi-window play + dedicated-server PIE.
 
 ## Acknowledgments
 

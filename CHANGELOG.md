@@ -6,12 +6,250 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Roadmap (3 directions from rev4 close-out):
-- **AnimGraph / UMG / Niagara node support** — each is a separate editor subsystem
-  with its own graph schema. Targeting minimum slices in v9.x.
-- (Done in v8.1.0) Auto-migration of legacy dispatchers — including the
-  "ghost dispatcher" recreate case.
-- (Done in v8.2.0) Headless test harness — gated integration tests + script.
+All four rev4 roadmap items shipped:
+- (Done in v9.0.0–v9.3.0) AnimGraph / UMG / Niagara door-openers — every editor
+  subsystem now has at least asset-creation parity.
+- (Done in v8.1.0 + v9.5.0) Auto-migration of legacy dispatchers — detect +
+  recreate + project-wide silent sweep.
+- (Done in v9.6.0) Headless CI test harness — commandlet boots in `-nullrhi`
+  mode, pumps the game thread, runs the integration suite, exits cleanly.
+
+Future work: complete the AnimGraph / UMG / Niagara surfaces (parameter bindings,
+widget trees, emitter modules) beyond the door-opener asset creation.
+
+---
+
+## [v9.6.0] — 2026-05-21 — Headless CI test harness
+
+### Added — 1 new tool (63 → 64)
+
+- **`UBlueprintMCPRunCommandlet`** — new C++ commandlet (`-run=BlueprintMCPRun`).
+  Boots minimal editor environment (`IsEditor=true`), forces a synchronous
+  `IAssetRegistry::SearchAllAssets` on /Game so list_*/skeleton lookups work,
+  then enters a 60 Hz pump loop that drains the `ENamedThreads::GameThread`
+  task queue (critical — `AsyncTask` payloads never run otherwise in commandlet
+  mode) + ticks `FTSTicker::GetCoreTicker`.
+- **`shutdown_editor`** — TCP command + Python wrapper. Flips
+  `UBlueprintMCPRunCommandlet::bShouldExit` AND schedules
+  `FPlatformMisc::RequestExit(false)` so it works in BOTH headless commandlet
+  AND GUI editor modes. Returns immediately without waiting.
+- **`scripts/run_headless_ci.sh`** — boots UnrealEditor-Cmd with
+  `-run=BlueprintMCPRun -nullrhi -unattended -nopause -nosplash -nosound`,
+  polls TCP up to 180s, runs pytest with `BLUEPRINTMCP_HEADLESS=1` +
+  `BLUEPRINTMCP_INTEGRATION=1`, then sends `shutdown_editor` and reaps the
+  process (graceful → SIGTERM → SIGKILL fallbacks).
+- **`conftest.skip_if_headless(reason)`** — new pytest marker for tests that
+  fundamentally need a GUI editor.
+
+### Test results
+
+- **GUI mode**: 8/8 integration tests pass (no regression)
+- **Headless mode**: 6/8 pass + 2 explicit skips:
+  - `test_v8_agentic_loop_against_real_plugin` (PIE needs game world)
+  - `test_create_niagara_system_against_real_plugin` (shader compile races
+    Python's 12s socket timeout in cold-boot headless)
+
+### Documented headless limitations
+
+- PIE doesn't tick under `-nullrhi`
+- `save_all` returns `saved=false` in commandlet mode even when packages persist
+  (UI-notification path skipped; integration test now asserts `ok=true` only)
+- Cold-boot Niagara shader compile can exceed Python timeout
+
+### `ping.plugin_version`
+"9.4.0" → **"9.6.0"** (skips 9.5.0 — that was Python-only).
+
+---
+
+## [v9.5.0] — 2026-05-21 — Silent dispatcher auto-migration (Python-only)
+
+### Added — 2 new tools (61 → 63)
+
+- **`auto_migrate_dispatchers(blueprint)`** — convenience alias for
+  `migrate_dispatchers(blueprint, recreate_ghosts=True)`. Where the v8.1.0
+  default is "dry-run + report ghosts," this one actually rebuilds them.
+- **`auto_migrate_all_dispatchers(folder="/Game", dry_run=False)`** —
+  project-wide sweep: `list_blueprints(folder)` → per-BP fix → aggregate.
+  Returns per-BP results + totals + errors[]. Single bad BP doesn't abort.
+  Designed for the upgrade scenario: "I just bumped the plugin, fix every
+  legacy dispatcher in my project in one shot."
+
+### Pure Python — no plugin changes
+
+`plugin_version` stays at 9.4.0. Server.py + tests only.
+
+### Tests
+
+167 → **172** unit tests (+5: recreate-flag propagation / aggregation /
+dry-run flag / per-BP errors / list-failure propagation).
+
+---
+
+## [v9.4.0] — 2026-05-21 — UMG door-opener + save_all
+
+### Added — 2 new tools (59 → 61)
+
+- **`create_widget_blueprint(name, parent_class="", path="/Game/UI")`** —
+  opens the UMG surface. Creates a blank `UWidgetBlueprint` via
+  `UWidgetBlueprintFactory` (parent = `UUserWidget` by default, or a
+  user-supplied subclass). UMGEditor's factory is `MinimalAPI` so we
+  link directly (no FindObject dance like Niagara). v9.4.0 scope is
+  asset creation only.
+- **`save_all()`** — mirrors UE's File → Save All but with no prompts.
+  Calls `FEditorFileUtils::SaveDirtyPackages(bPromptUserToSave=false,
+  bSaveMapPackages=true, bSaveContentPackages=true)`. Returns
+  `{saved, packages_needed_saving}`. Call before any UE editor kill or
+  restart to prevent the "Save changes?" dialog on next launch.
+
+### Build deps
+
+`+UMG` `+UMGEditor` in Build.cs PrivateDependencyModuleNames. UMG is an
+Engine module (not plugin) — no .uplugin change needed.
+
+### `ping.plugin_version`
+"9.3.0" → **"9.4.0"**.
+
+---
+
+## [v9.3.0] — 2026-05-21 — Niagara door-opener
+
+### Added — 1 new tool (58 → 59)
+
+- **`create_niagara_system(name, path="/Game/VFX")`** — opens the Niagara VFX
+  surface. Creates a blank `UNiagaraSystem` via `UNiagaraSystemFactoryNew`
+  with no `SystemToCopy` / `EmittersToAddToNewSystem` — runs the factory's
+  default `InitializeSystem` path (SystemSpawnScript + SystemUpdateScript +
+  default effect type).
+
+### Implementation notes (gotchas)
+
+- `UNiagaraSystemFactoryNew` is NOT `NIAGARAEDITOR_API`-exported, so we
+  cannot link to its `StaticClass()` symbol directly. **Resolved at runtime
+  via `FindObject("/Script/NiagaraEditor.NiagaraSystemFactoryNew")`** and
+  instantiated through the `UFactory` base — `IAssetTools::CreateAsset`
+  only needs a valid `UFactory*`. Build.cs lists only `"Niagara"` (not
+  `"NiagaraEditor"`), avoiding the link error entirely.
+- `.uplugin` lists `"Niagara"` as a plugin dependency for proper load
+  ordering. (Niagara IS a plugin, unlike UMG which is an Engine module.)
+
+### Drive-by fix surfaced by v9.3.0 integration test
+
+- **`list_assets(asset_class="X")` non-Engine class fallback**. Previously
+  assumed the class lived in `/Script/Engine.` — broke for Niagara (and
+  would have for UMG/etc.). Now falls back to enumerating assets in path
+  and matching by class name when the `/Script/Engine.X` lookup returns empty.
+
+### `ping.plugin_version`
+"9.2.0" → **"9.3.0"**.
+
+---
+
+## [v9.2.0] — 2026-05-21 — AnimGraph FSM tools
+
+### Added — 4 new tools (54 → 58)
+
+Builds on v9.0.0's `create_anim_blueprint` to take an AnimBP from empty
+asset to fully-wired skeletal animation state machine:
+
+- **`add_anim_state_machine(blueprint, name, pos_x=0, pos_y=0)`** —
+  spawn `UAnimGraphNode_StateMachine` in the main AnimGraph. UE's
+  `PostPlacedNewNode` auto-creates the interior `EditorStateMachineGraph`.
+- **`add_anim_state(blueprint, state_machine, name, pos_x=0, pos_y=0)`** —
+  spawn `UAnimStateNode` inside a state machine. Auto-creates the state's
+  interior `BoundGraph` (mini AnimGraph for pose).
+- **`add_anim_transition(blueprint, state_machine, from_state, to_state)`** —
+  `UAnimStateTransitionNode` + canonical `CreateConnections(From, To)`.
+- **`set_anim_state_pose(blueprint, state_machine, state, sequence)`** —
+  load `UAnimSequence`, validate skeleton matches AnimBP's `TargetSkeleton`,
+  find/create `UAnimGraphNode_SequencePlayer` in state's `BoundGraph`,
+  wire pose pin to state's `GetPoseSinkPinInsideState`.
+
+### Naming convention
+
+State machines + states are addressed by user-given names stored as
+`NodeComment`, consistent with the AnchorName convention from v0.
+
+### Build deps
+
+`+AnimGraph` in Build.cs PrivateDependencyModuleNames.
+
+### `ping.plugin_version`
+"9.1.0" → **"9.2.0"**.
+
+---
+
+## [v9.1.0] — 2026-05-21 — Asset/class discovery tools
+
+### Added — 5 new tools (49 → 54)
+
+- **`list_assets(folder, asset_class="", recursive=true, max_results=200)`** —
+  base discovery via `IAssetRegistry::GetAssetsByClass` + path filter.
+- **`list_skeletons(folder)`** — `USkeleton` shortcut.
+- **`list_meshes(folder)`** — `StaticMesh + SkeletalMesh` (batched in one
+  game-thread hop).
+- **`list_blueprints(folder)`** — `Blueprint` shortcut.
+- **`list_classes(parent_class, name_contains, native_only, max_results)`** —
+  walk loaded `UClass`es via `TObjectIterator`.
+
+### Bug found + fixed during initial v9.1.0 testing
+
+- **IAssetRegistry game-thread assertion crash**. First attempt called
+  `GetAssetsByClass` from the TCP thread → UE crashed with
+  `Assertion failed: IsInGameThread() ... Enumerating in-memory assets can
+  only be done on the game thread`. Wrapped all 4 asset-listing dispatch
+  branches in `AsyncTask(ENamedThreads::GameThread, ...)` with the
+  `TPromise/TFuture` pattern. `list_meshes` batches static + skeletal in
+  ONE game-thread hop.
+
+### Build deps
+
+`+AssetRegistry` in Build.cs PrivateDependencyModuleNames.
+
+### `ping.plugin_version`
+"9.0.0" → **"9.1.0"**.
+
+---
+
+## [v9.0.0] — 2026-05-21 — AnimGraph domain opens
+
+### Added — 1 new tool (48 → 49)
+
+- **`create_anim_blueprint(name, skeleton, path="/Game/Blueprints")`** —
+  creates a blank Animation Blueprint via `UAnimBlueprintFactory`
+  (parent = `UAnimInstance`, target = user-supplied `USkeleton`).
+  Asset opens in the AnimGraph editor. v9.0.0 scope is asset creation
+  only — state machine authoring shipped in v9.2.0.
+
+### `ping.plugin_version`
+"8.2.1" → **"9.0.0"**.
+
+---
+
+## [v8.2.1] — 2026-05-21 — Integration test cleanup
+
+### Test suite hardening (no functional change)
+
+Swept **14 stale `_against_real_plugin` tests** that were left over from
+the v6/v7 mock era and had drifted into "always fail" since the test bed
+moved to live UE. Kept the 3 tests that ARE live-meaningful:
+
+- `test_ping_ue_against_real_plugin`
+- `test_v8_agentic_loop_against_real_plugin`
+- `test_create_anim_blueprint_against_real_plugin` (added later in v9.0)
+
+### Four bugs caught in `test_v8_agentic_loop_against_real_plugin`
+
+1. `add_node` requires `node_type="K2Node_CallFunction:PrintString"` — not
+   bare `"PrintString"`. Format is `<K2NodeClass>:<param>`.
+2. `start_pie` fails with `pie_already_running` if a previous test left PIE
+   running → defensive `is_pie_running` + `stop_pie` + 1s sleep at test start.
+3. `start_pie` returns `queued:true` initially → sleep 3s before reading log.
+4. `spawn_actor` must be BEFORE `start_pie` — `UEditorActorSubsystem` targets
+   the editor world, which is suspended during PIE.
+
+### No dylib changes
+
+`ping.plugin_version` stays at 8.1.0.
 
 ---
 
