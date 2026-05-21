@@ -4167,19 +4167,49 @@ namespace
         // Snapshot copies under lock; safe to filter/serialize without holding mutex.
         TArray<FString> All = GBlueprintMCPLogCapture->Snapshot(/*MaxLines=*/ 0);  // 0 = all
 
-        // Apply category/verbosity/substring filters (cheap string scans)
+        // v8.0.3 BUG-A fix: previously we wrapped CategoryFilter in `[%s]` and looked for
+        // that as a substring of the line. That made the filter act as prefix-match
+        // ("BlueprintMCP" wouldn't match "[LogBlueprintMCP_TCP]" because of the trailing
+        // bracket). Now we parse the line's bracketed prefix and substring-match the
+        // user's filter against the category/verbosity tokens individually, matching the
+        // documented "contains, case-insensitive" behavior.
         const bool bHasCat   = !CategoryFilter.IsEmpty();
         const bool bHasVerb  = !VerbosityFilter.IsEmpty();
         const bool bHasSub   = !Substring.IsEmpty();
+
+        auto ExtractBracketToken = [](const FString& Line, int32 NthBracket /*0-based*/) -> FString {
+            int32 SearchStart = 0;
+            for (int32 i = 0; i <= NthBracket; ++i)
+            {
+                const int32 Open = Line.Find(TEXT("["), ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchStart);
+                if (Open == INDEX_NONE) return FString();
+                const int32 Close = Line.Find(TEXT("]"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Open + 1);
+                if (Close == INDEX_NONE) return FString();
+                if (i == NthBracket)
+                {
+                    return Line.Mid(Open + 1, Close - Open - 1);
+                }
+                SearchStart = Close + 1;
+            }
+            return FString();
+        };
 
         TArray<FString> Filtered;
         Filtered.Reserve(All.Num());
         for (const FString& Line : All)
         {
-            if (bHasCat && !Line.Contains(FString::Printf(TEXT("[%s]"), *CategoryFilter), ESearchCase::IgnoreCase))
-                continue;
-            if (bHasVerb && !Line.Contains(FString::Printf(TEXT("[%s]"), *VerbosityFilter), ESearchCase::IgnoreCase))
-                continue;
+            if (bHasCat)
+            {
+                const FString LineCat = ExtractBracketToken(Line, /*Nth=*/ 0);
+                if (!LineCat.Contains(CategoryFilter, ESearchCase::IgnoreCase))
+                    continue;
+            }
+            if (bHasVerb)
+            {
+                const FString LineVerb = ExtractBracketToken(Line, /*Nth=*/ 1);
+                if (!LineVerb.Contains(VerbosityFilter, ESearchCase::IgnoreCase))
+                    continue;
+            }
             if (bHasSub && !Line.Contains(Substring, ESearchCase::IgnoreCase))
                 continue;
             Filtered.Add(Line);
@@ -4352,7 +4382,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.0.2\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"8.0.3\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }

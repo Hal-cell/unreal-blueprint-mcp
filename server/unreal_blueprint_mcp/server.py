@@ -576,6 +576,15 @@ def migrate_dispatchers(blueprint: str) -> dict[str, Any]:
     Use this once per old project after upgrading the plugin. Healthy BPs
     pass through unchanged.
 
+    **Coverage limit — "ghost dispatcher" state is NOT recoverable here:**
+    Some pre-v7.1.2 builds left even worse-damaged BPs where neither the
+    signature graph NOR the member variable survived. There's literally
+    nothing on the BP to detect or recover; `migrate_dispatchers` returns
+    all zeros and `delete_event_dispatcher` returns `dispatcher_not_found`.
+    For those, just call ``add_event_dispatcher`` to recreate from scratch
+    (and delete any stale `add_call_dispatcher` / `add_bind_dispatcher`
+    nodes referencing the lost name with ``delete_node``).
+
     Args:
         blueprint: BP asset path to scan.
 
@@ -591,6 +600,8 @@ def migrate_dispatchers(blueprint: str) -> dict[str, Any]:
         - ``orphan_variables`` = PC_MCDelegate variables WITHOUT a signature graph
           (rare; use ``delete_event_dispatcher`` to clean those)
         - ``compiled`` / ``saved`` only true when ``migrated_count > 0``
+        - **all zeros for "ghost dispatcher" state** — no manifest survived;
+          recreate via ``add_event_dispatcher``
     """
     if not blueprint:
         return {"ok": False, "error": "missing_argument"}
@@ -619,6 +630,11 @@ def delete_event_dispatcher(
     - Signature graph (in ``Blueprint->DelegateSignatureGraphs``)
     - Member variable (PC_MCDelegate)
 
+    **Coverage limit:** Returns ``dispatcher_not_found`` for "ghost dispatcher"
+    state (pre-v7.1.2 BPs where neither piece survived). That's not an error
+    state to fix — there's literally nothing on the BP referencing the
+    dispatcher anymore. Just ``add_event_dispatcher`` to recreate.
+
     Args:
         blueprint: BP asset path.
         dispatcher_name: Name of the dispatcher to remove.
@@ -629,7 +645,8 @@ def delete_event_dispatcher(
 
     Errors:
         dispatcher_not_found — neither a signature graph nor a member variable
-            of that name exists.
+            of that name exists. For "ghost dispatcher" state this is expected;
+            use ``add_event_dispatcher`` to recreate from scratch.
     """
     if not blueprint or not dispatcher_name:
         return {"ok": False, "error": "missing_argument"}
@@ -1948,13 +1965,18 @@ def read_log_capture(
 
     Args:
         max_lines: Limit on returned lines (default 100). 0 = no cap.
-        category: If non-empty, only return lines whose log category contains
-            this string (case-insensitive). E.g. ``"BlueprintUserMessages"``
-            for PrintString output.
-        verbosity: If non-empty, only return lines whose verbosity contains this
-            string. E.g. ``"Warning"``, ``"Error"``.
-        contains: If non-empty, only return lines containing this substring
-            (case-insensitive).
+        category: If non-empty, return only lines whose **extracted category token**
+            (the contents of the first ``[...]`` in the line) contains this string,
+            case-insensitive. So ``"BlueprintMCP"`` matches ``[LogBlueprintMCP_TCP]``,
+            ``"PlayLevel"`` matches ``[LogPlayLevel]``, etc. v8.0.3 fix — previously
+            this was effectively a prefix match.
+            Useful category names: ``BlueprintMCP_TCP`` (MCP commands), ``BlueprintUserMessages``
+            (PrintString), ``PlayLevel`` (PIE start/stop), ``BlueprintCompile`` (compile errors).
+        verbosity: If non-empty, return only lines whose **extracted verbosity token**
+            (second ``[...]``) contains this string, case-insensitive. E.g. ``"Warning"``,
+            ``"Error"``, ``"Log"``.
+        contains: If non-empty, only return lines containing this substring (anywhere
+            in the line, case-insensitive).
 
     Returns:
         ``{"ok": True, "total_captured": N, "returned": M, "lines": [...]}``

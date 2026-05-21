@@ -2252,6 +2252,22 @@ def test_read_log_capture_success() -> None:
     assert sent_dict["category"] == "Blueprint"
 
 
+def test_read_log_capture_passes_category_substring_through() -> None:
+    """v8.0.3 BUG-A: short forms like 'BlueprintMCP' should reach the wire as-is;
+    the substring-match happens server-side against the extracted [Category] token."""
+    response = b'{"ok":true,"command":"read_log_capture","total_captured":2,"returned":1,"lines":["[LogBlueprintMCP_TCP][Log] MCP recv: ..."]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.read_log_capture(category="BlueprintMCP")
+    assert r["ok"] is True
+    assert r["returned"] == 1
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    # Filter is passed through verbatim; the server-side fix interprets it as substring
+    assert sent_dict["category"] == "BlueprintMCP"
+
+
 def test_read_log_capture_omits_empty_filters() -> None:
     """Empty filter strings should not appear in the wire payload."""
     response = b'{"ok":true,"command":"read_log_capture","total_captured":0,"returned":0,"lines":[]}\n'
