@@ -6,11 +6,117 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Likely directions for **v8**:
-- PIE control (start / stop / read state)
-- Simulated input (keyboard / mouse / gamepad press during PIE)
-- Output Log capture (read what `PrintString` produced, surface compile warnings)
-- Goal: agentic loop — LLM writes → runs → reads log → iterates without human
+No outstanding bugs. Hal's rev4 smoke-test report (2026-05-21) closed all of:
+- 7 original bugs (BUG-1..7 from v7 testing)
+- 3 follow-up issues (`call_blueprint_function` compile order, MCP command
+  logging, `read_log_capture` category filter)
+- 2 plugin enhancements (dispatcher recovery: `delete_event_dispatcher`
+  + `migrate_dispatchers`)
+
+Only standing item: legacy "ghost dispatcher" assets created by pre-v7.1.2
+builds (where both signature graph AND member variable were lost) need
+manual recreation via `add_event_dispatcher`. Has a clear recovery path;
+documented in the relevant tool docstrings.
+
+---
+
+## [v8.0.3] — 2026-05-21 — BUG-A: read_log_capture category substring match
+
+### Fixed
+- **`read_log_capture`** category filter now does **real substring match** against
+  the extracted `[Category]` token instead of prefix-matching `[%s]` against
+  the whole line. So `category="BlueprintMCP"` matches `[LogBlueprintMCP_TCP]`
+  as documented. Same fix applied to verbosity filter.
+
+### Doc
+- `read_log_capture` docstring lists useful category names
+  (`BlueprintMCP_TCP`, `BlueprintUserMessages`, `PlayLevel`, `BlueprintCompile`).
+- `migrate_dispatchers` + `delete_event_dispatcher` document the
+  "ghost dispatcher" coverage limit (some pre-v7.1.2 BPs lost both signature
+  graph and member variable; recovery = `add_event_dispatcher` recreate).
+
+### Internal
+- `ping.plugin_version` → `"8.0.3"`.
+
+---
+
+## [v8.0.2] — 2026-05-21 — migrate_dispatchers + plugin_version
+
+### Added
+- **`migrate_dispatchers(blueprint=...)`** — scans a BP for pre-v7.1.2 dispatcher
+  signature graphs missing the PC_MCDelegate member variable; back-fills the
+  variable + recompiles. Idempotent — healthy BPs return `compiled=false` /
+  `saved=false`. Reports `migrated` / `already_healthy` / `orphan_variables`
+  arrays for full visibility.
+- **`ping`** response now includes `plugin_version` (semver, baked into source)
+  and `build_date` (`__DATE__` + `__TIME__`) — answers "which dylib is loaded?"
+  in one tool call.
+
+### Tool count
+46 → **48**
+
+---
+
+## [v8.0.1] — 2026-05-21 — MCP command logging + delete_event_dispatcher
+
+### Added
+- **`delete_event_dispatcher(blueprint, dispatcher_name)`** — removes the
+  signature graph (via `FBlueprintEditorUtils::RemoveGraph(Recompile)`) AND the
+  PC_MCDelegate member variable for a dispatcher. Either piece is optional;
+  returns `removed_graph` / `removed_variable` flags showing what was actually
+  cleaned. Provides the recovery path for legacy broken dispatchers.
+
+### Fixed
+- **OPEN-2** `read_log_capture` couldn't see MCP traffic. Root cause: HandleClient
+  used `Verbose` log level which GLog filters out before reaching FOutputDevice.
+  Changed both `MCP recv:` and `MCP send:` to `Log` level + 800-char truncation
+  to keep buffer readable. LLM self-diagnostic loop now sees every MCP call.
+
+### Tool count
+46 → **47**
+
+---
+
+## [v8.0.0] — 2026-05-21 — Agentic closed loop
+
+The big one: LLM writes a Blueprint → spawns → starts PIE → presses keys →
+reads the log → verifies its own work — all from one MCP session, no human.
+
+### Added — 6 new tools (40 → 46)
+
+**v8.1 — Log capture (`FBlueprintMCPLogCapture : public FOutputDevice`):**
+- Installed by the module at startup as a global on GLog. Captures every
+  `UE_LOG` line (including `PrintString` output via `LogBlueprintUserMessages`)
+  into a thread-safe 1000-line circular buffer.
+- **`read_log_capture(max_lines, category, verbosity, contains)`** — snapshot
+  the buffer with optional filters. Each line formatted `[Category][Verbosity] message`.
+- **`clear_log_capture()`** — drop the buffer (typical pattern: clear, trigger
+  action, read).
+
+**v8.2 — PIE control:**
+- **`start_pie()`** — `GEditor->RequestPlaySession(FRequestPlaySessionParams{WorldType=PlayInEditor})`.
+  Returns `queued=true` because actual start fires on next editor tick.
+- **`stop_pie()`** — `GEditor->RequestEndPlayMap()`.
+- **`is_pie_running()`** — checks `GEditor->PlayWorld != nullptr`; also surfaces
+  `start_queued` so callers can poll between request and actual start.
+
+**v8.3 — Simulated input:**
+- **`pie_press_key(key, player_index=0)`** — press + release a key on the active
+  PlayerController via `APlayerController::InputKey(FInputKeyParams)`. Works for
+  both legacy and Enhanced Input. Reuses `ResolveFKeyWithAliases` so
+  `"Space"` → `"SpaceBar"` etc.
+
+### Stats
+- Tools: **40 → 46** (+6)
+- Unit tests: **106 → 116** (+10)
+- Integration tests: **13 → 14** (+1: full agentic-loop demo)
+- Plugin dylib: **688 KB → 717 KB**
+
+### Caveats
+- `start_pie` is queued — `is_pie_running` may briefly disagree with what was
+  just requested. Poll `is_pie_running` before `pie_press_key`.
+- Log capture is always-on; no need to start/stop. Use `clear_log_capture`
+  before triggering an action to make `read_log_capture` show only new lines.
 
 ---
 

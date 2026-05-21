@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v7.7.1](https://img.shields.io/badge/version-v7.7.1-brightgreen)](#status)
-[![40 tools](https://img.shields.io/badge/tools-40-blue)](#tools)
-[![106 tests](https://img.shields.io/badge/tests-106%20passing-success)](#requirements)
+[![v8.0.3](https://img.shields.io/badge/version-v8.0.3-brightgreen)](#status)
+[![48 tools](https://img.shields.io/badge/tools-48-blue)](#tools)
+[![125 tests](https://img.shields.io/badge/tests-125%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -35,6 +35,7 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 - **Function-body editing** — every graph-writing tool accepts `graph_name=` to target a user function instead of EventGraph (v7.7+)
 - **FProperty reflection for component defaults** — `set_component_property` configures mesh asset / box extent / collision preset via dot-notation paths (v7.1+)
 - **Native struct break/make** — `add_break_struct HitResult` returns full member pins instead of an empty K2Node (v7.1.0+)
+- **Agentic closed loop** — `start_pie` / `pie_press_key` / `read_log_capture` lets the LLM run + verify its own work (v8+)
 - **Quality over breadth** — fewer tools, every one with docstrings written for an LLM consumer
 - **Game-thread safety** as a first-class invariant — all UObject ops marshaled via `TPromise`/`TFuture` with a 10s deadline
 
@@ -52,8 +53,12 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v7.0** | ✅ 12 new tools: `set_component_property` + `add_switch`/`add_sequence`/`add_make_array`/`add_select` + `add_make_struct`/`add_break_struct` + 4 event-dispatcher tools + `save_blueprint`. Extended: object/class ref variables, custom event params, function-body editing via `graph_name=` |
 | **v7.1** | ✅ 4 hotfixes (`add_call_dispatcher` real fix via `AddMemberVariable PC_MCDelegate`, native-break struct → `K2Node_CallFunction` substitution, function entry well-known anchor, switch off-by-one + hidden-pin filter), `wire_imc_subscribe` splice-mode fallback, `call_blueprint_function` auto-compile on miss |
 | **v7.7.1** | ✅ `graph_name=` extended to **all 18 graph-writing tools** (was 5 in v7.0) |
-| **Unit tests** | **106 passing**, 13 integration tests gated on a running UE editor |
-| **Plugin binary** | **~688 KB** dylib on macOS / UE 5.4.4 |
+| **v8.0** | ✅ Agentic closed loop: `start_pie` / `stop_pie` / `is_pie_running` + `pie_press_key` + `read_log_capture` / `clear_log_capture` |
+| **v8.0.1** | ✅ MCP command stream visible to `read_log_capture` + `delete_event_dispatcher` recovery tool |
+| **v8.0.2** | ✅ `migrate_dispatchers` (programmatic legacy repair) + `ping` reports `plugin_version` + `build_date` |
+| **v8.0.3** | ✅ `read_log_capture` category filter is **real substring match** as documented |
+| **Unit tests** | **125 passing**, 16 integration tests gated on a running UE editor |
+| **Plugin binary** | **~717 KB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
 
@@ -93,7 +98,7 @@ uv sync --extra dev    # if you want to run the tests
 Verify:
 
 ```bash
-uv run pytest    # → 106 passed, 13 skipped
+uv run pytest    # → 125 passed, 16 skipped
 ```
 
 ### 3. Wire to Claude Desktop
@@ -121,13 +126,13 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 
 ## Tools
 
-40 total. Tools marked **(v7)** are new or significantly extended in v7. Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
+**48 total.** Tools marked **(v7)** are new or significantly extended in v7; **(v8)** are the agentic-loop primitives. Almost every graph-writing tool below accepts an optional `graph_name=` kwarg (v7.7.1+) — default empty = EventGraph, pass a function/macro name to operate inside that graph's body.
 
 ### Asset & project
 
 | Tool | What it does |
 |------|--------------|
-| `ping_ue` | Health check: are UE + the plugin alive? |
+| `ping_ue` | Health check: are UE + the plugin alive? Returns `plugin_version` + `build_date` (v8.0.2+) |
 | `echo` | MCP stdio plumbing sanity test |
 | `create_blueprint` | New BP asset in `/Game/...`, parent class from whitelist |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |
@@ -159,6 +164,8 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`add_call_dispatcher`** (v7) | `K2Node_CallDelegate` — broadcast the dispatcher |
 | **`add_bind_dispatcher`** (v7) | `K2Node_AddDelegate` — bind a custom event to the dispatcher |
 | **`add_unbind_dispatcher`** (v7) | `K2Node_RemoveDelegate` — unbind |
+| **`delete_event_dispatcher`** (v8) | Remove a dispatcher's signature graph + member variable (legacy recovery + cleanup) |
+| **`migrate_dispatchers`** (v8) | Programmatic repair: backfill missing PC_MCDelegate member variable on pre-v7.1.2 dispatchers |
 
 ### Node creation
 
@@ -197,6 +204,17 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | `disconnect_pins` (v4) | Break a single pin link |
 | `delete_node` (v4) | Delete a node and break all its connections |
 
+### Agentic closed loop (v8)
+
+| Tool | What it does |
+|------|--------------|
+| **`start_pie`** (v8) | Begin a PIE session (`GEditor->RequestPlaySession`). Returns `queued:true` — wait a tick before `pie_press_key` |
+| **`stop_pie`** (v8) | End the active PIE session (`RequestEndPlayMap`) |
+| **`is_pie_running`** (v8) | Query PIE state — `running` (active) + `start_queued` (requested but not yet ticked) |
+| **`pie_press_key`** (v8) | Simulate press + release on `APlayerController` (works for legacy + Enhanced Input) |
+| **`read_log_capture`** (v8) | Read recent UE log lines from a thread-safe FOutputDevice buffer. Filter by `category` (substring) / `verbosity` / `contains` / `max_lines`. **Sees MCP commands at category `BlueprintMCP_TCP` (v8.0.1+)** |
+| **`clear_log_capture`** (v8) | Drop the log buffer before triggering an action |
+
 ## v1 Collision-Timer demo
 
 One prompt to Claude:
@@ -213,18 +231,35 @@ Showcasing the new component-property + event-dispatcher tools:
 
 → Walk into the trigger → `OnHit` fires for every listener bound to the dummy.
 
+## v8 Agentic-loop demo
+
+```python
+# All from inside one MCP session, no human:
+create_blueprint("BP_HelloAuto") + add_node(PrintString) + ...   # 1. author
+compile_blueprint() + spawn_actor()                              # 2. deploy
+clear_log_capture()
+start_pie()
+# poll is_pie_running until running == True
+pie_press_key("Space")                                           # 3. drive
+log = read_log_capture(category="BlueprintUserMessages", contains="hello")
+assert log["returned"] >= 1, "BP didn't print — fall into self-debug"
+stop_pie()                                                       # 4. teardown
+```
+
+The LLM writes a BP, runs it, presses keys, reads what UE logged, and verifies its own work. If the assertion fails, `read_log_capture(verbosity="Warning")` and `read_log_capture(category="BlueprintMCP_TCP", contains="set_pin_default")` give it the diagnostic surface to figure out what went wrong.
+
 ## Project layout
 
 ```
 .
 ├── plugin/BlueprintMCP/       # UE C++ plugin (drop into <UE_PROJECT>/Plugins/)
 │   ├── BlueprintMCP.uplugin
-│   └── Source/BlueprintMCP/   # ~4700 lines C++ (v7.7.1)
+│   └── Source/BlueprintMCP/   # ~5300 lines C++ (v8.0.3)
 └── server/                     # Python MCP server (FastMCP)
     ├── pyproject.toml
     ├── unreal_blueprint_mcp/
-    │   └── server.py          # ~2000 lines Python
-    └── tests/test_server.py   # 106 unit tests + 13 integration (skipped)
+    │   └── server.py          # ~2200 lines Python
+    └── tests/test_server.py   # 125 unit tests + 16 integration (skipped)
 ```
 
 ## Design notes
@@ -239,12 +274,22 @@ Showcasing the new component-property + event-dispatcher tools:
 
 ## Roadmap
 
-Likely directions for **v8** — agentic closed loop:
+**v8** delivered the agentic closed loop — PIE control + simulated input + log capture
++ MCP command stream visible to the log reader. The LLM-writes-runs-verifies story
+fits in one MCP session. See the v8 Agentic-loop demo above and
+`tests/test_server.py::test_v8_agentic_loop_against_real_plugin` for the canonical
+end-to-end shape.
 
-- **PIE control** — start / stop / read play state from the plugin
-- **Simulated input** — keyboard / mouse / gamepad press during PIE so the LLM can drive its own tests
-- **Output Log capture** — read what `PrintString` produced, surface compile warnings
-- **Goal:** LLM writes a BP → spawns → starts PIE → presses keys → reads log → iterates without a human in the loop
+Possible future directions:
+- **Auto-migration of legacy dispatchers** — auto-detect + repair pre-v7.1.2
+  damaged dispatchers on BP load, removing the manual `migrate_dispatchers`
+  step (currently the only standing limitation, documented as the
+  "ghost dispatcher" case).
+- **Animation Blueprint surface** — author AnimGraph state machines, blend spaces.
+- **UMG Widget Blueprint surface** — author UI hierarchies + bindings.
+- **Niagara node surface** — emitter modules, parameter bindings.
+- **Headless integration test harness** — run the test BPs in CI without a human-launched
+  editor window.
 
 ## Acknowledgments
 
