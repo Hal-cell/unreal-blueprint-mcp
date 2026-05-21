@@ -2982,3 +2982,94 @@ def test_ping_returns_plugin_version_9_2_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.2.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.3.0 — Niagara door-opener
+# ---------------------------------------------------------------------------
+
+
+def test_create_niagara_system_success() -> None:
+    response = (
+        b'{"ok":true,"command":"create_niagara_system",'
+        b'"system_path":"/Game/VFX/NS_Sparkles","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_niagara_system(name="NS_Sparkles")
+    assert r["ok"] is True
+    assert r["system_path"] == "/Game/VFX/NS_Sparkles"
+    assert r["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "create_niagara_system",
+        "name": "NS_Sparkles",
+        "path": "/Game/VFX",
+    }
+
+
+def test_create_niagara_system_custom_path() -> None:
+    response = (
+        b'{"ok":true,"command":"create_niagara_system",'
+        b'"system_path":"/Game/Tests/NS_Probe","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_niagara_system(name="NS_Probe", path="/Game/Tests")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["path"] == "/Game/Tests"
+
+
+def test_create_niagara_system_asset_exists() -> None:
+    response = (
+        b'{"ok":false,"command":"create_niagara_system","error":"asset_exists",'
+        b'"detail":"/Game/VFX/NS_Existing"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_niagara_system(name="NS_Existing")
+    assert r["ok"] is False
+    assert r["error"] == "asset_exists"
+
+
+def test_create_niagara_system_local_validation() -> None:
+    assert server.create_niagara_system(name="")["error"] == "missing_argument"
+
+
+@requires_ue_editor(extra_reason="v9.3.0 Niagara creation end-to-end")
+def test_create_niagara_system_against_real_plugin() -> None:
+    """Integration: create a real UNiagaraSystem asset and verify."""
+    import uuid
+
+    unique_name = f"NS_V93Test_{uuid.uuid4().hex[:8]}"
+    r = server.create_niagara_system(name=unique_name, path="/Game/Tests")
+    assert r["ok"] is True, f"create_niagara_system failed: {r}"
+    assert r["system_path"] == f"/Game/Tests/{unique_name}"
+    assert r["saved"] is True
+
+    # Verify via list_assets discovery (round-trips through asset registry).
+    list_r = server.list_assets(
+        folder="/Game/Tests", asset_class="NiagaraSystem", max_results=100,
+    )
+    assert list_r["ok"] is True
+    names = [a["name"] for a in list_r["assets"]]
+    assert unique_name in names, (
+        f"Created system {unique_name} not visible via list_assets. "
+        f"Got: {names}"
+    )
+
+
+def test_ping_returns_plugin_version_9_3_0() -> None:
+    """v9.3.0: ping surfaces 9.3.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.3.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.3.0"

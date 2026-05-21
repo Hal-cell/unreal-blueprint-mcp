@@ -40,6 +40,9 @@ public class BlueprintMCP : ModuleRules
             "AssetRegistry",
             // v9.2.0: AnimGraph node types (StateMachine, State, Transition, SequencePlayer)
             "AnimGraph",
+            // v9.3.0: Niagara — UNiagaraSystem (factory class found via FindObject
+            // because UNiagaraSystemFactoryNew isn't NIAGARAEDITOR_API-exported)
+            "Niagara",
         });
     }
 }

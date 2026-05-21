@@ -2314,6 +2314,51 @@ def set_anim_state_pose(
     })
 
 
+# ---------------------------------------------------------------------------
+# v9.3.0 — Niagara door-opener
+# ---------------------------------------------------------------------------
+# Opens the Niagara VFX surface. v9.3.0 scope is asset creation only —
+# emitter authoring, module parameters, etc. are planned follow-ups.
+
+
+@mcp.tool()
+def create_niagara_system(
+    name: str,
+    path: str = "/Game/VFX",
+) -> dict[str, Any]:
+    """Create a blank Niagara System asset — v9.3.0.
+
+    Niagara is UE's modern VFX system. ``UNiagaraSystem`` is the top-level
+    asset that hosts one or more emitters. This tool creates an empty
+    system via ``UNiagaraSystemFactoryNew`` (with no source/template),
+    which runs the factory's default ``InitializeSystem`` path: sets up
+    SystemSpawnScript/SystemUpdateScript and the default effect type.
+
+    The system opens in the Niagara editor where emitters and modules can
+    be added manually. Programmatic emitter authoring is a planned
+    v9.3.x follow-up.
+
+    Args:
+        name: Asset name (e.g. ``"NS_Sparkles"``).
+        path: /Game-relative folder. Defaults to ``/Game/VFX``.
+
+    Returns:
+        ``{"ok": True, "system_path": "/Game/VFX/NS_Sparkles", "saved": True}``
+
+    Common errors:
+        asset_exists      — name already taken at that path
+        creation_failed   — IAssetTools::CreateAsset returned null
+        wrong_asset_type  — sanity check (factory misconfigured)
+    """
+    if not name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "create_niagara_system",
+        "name": name,
+        "path": path,
+    })
+
+
 @mcp.tool()
 def create_blueprint(
     name: str,

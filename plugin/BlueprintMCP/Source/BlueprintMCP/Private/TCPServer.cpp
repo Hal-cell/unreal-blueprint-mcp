@@ -125,6 +125,11 @@
 #include "AnimationStateMachineGraph.h"
 #include "Animation/AnimSequence.h"
 
+// v9.3.0 — Niagara
+// Note: UNiagaraSystemFactoryNew is NOT NIAGARAEDITOR_API-exported, so we
+// resolve its UClass at runtime via FindObject (see CreateNiagaraSystemOnGameThread).
+#include "NiagaraSystem.h"
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -3177,7 +3182,7 @@ namespace
         }
         else
         {
-            // Try as /Script/Engine.Foo path first; fall back to bare name → /Script/Engine.<Name>
+            // Fast path: try /Script/Engine.Foo (or user-provided /Script/Module.Foo).
             FTopLevelAssetPath ClassPath;
             if (AssetClass.StartsWith(TEXT("/Script/")))
             {
@@ -3190,6 +3195,24 @@ namespace
 
             TArray<FAssetData> ByClass;
             Reg.GetAssetsByClass(ClassPath, ByClass, /*bSearchSubClasses*/ true);
+
+            // v9.3.0 fallback: if no hits and the user gave a bare class name
+            // (no /Script/ prefix), the class might live in a non-Engine
+            // module (e.g. /Script/Niagara.NiagaraSystem). Enumerate assets
+            // in the path and match by class name. NOTE: this is the
+            // exact-class match path — bSearchSubClasses is lost in the
+            // fallback, but Niagara/UMG/etc. class names are usually leaf.
+            if (ByClass.Num() == 0 && !AssetClass.StartsWith(TEXT("/Script/")))
+            {
+                TArray<FAssetData> All;
+                Reg.GetAssetsByPath(PathName, All, bRecursive);
+                const FName ClassFName(*AssetClass);
+                for (const FAssetData& Data : All)
+                {
+                    if (Data.AssetClassPath.GetAssetName() == ClassFName)
+                        ByClass.Add(Data);
+                }
+            }
 
             // Path-filter the class-scoped results
             const FString FolderNorm = FolderPath.IsEmpty() ? FString(TEXT("/Game")) : FolderPath;
@@ -3655,6 +3678,73 @@ namespace
             *EscapeJsonString(StateMachineName),
             *EscapeJsonString(SequencePath),
             bWired ? TEXT("true") : TEXT("false"),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.3.0 — Niagara door-opener =====
+    //
+    // Opens the Niagara VFX surface. v9.3.0 ships only the asset-creation step;
+    // emitter authoring, module parameters, etc. are planned follow-ups.
+    //
+    // Implementation notes:
+    //
+    // 1. UNiagaraSystemFactoryNew is NOT NIAGARAEDITOR_API-exported, so we
+    //    cannot link to UNiagaraSystemFactoryNew::StaticClass() directly.
+    //    Resolve the UClass at runtime via FindObject and instantiate
+    //    through the UFactory base type — IAssetTools::CreateAsset only
+    //    needs a valid UFactory*.
+    //
+    // 2. The factory has a ConfigureProperties() that would pop a modal
+    //    asset-browser dialog, but IAssetTools::CreateAsset (the non-dialog
+    //    overload) skips it and calls FactoryCreateNew directly. With no
+    //    source set, the factory creates a blank system via NewObject +
+    //    InitializeSystem(bCreateDefaultNodes=true), which sets up
+    //    SystemSpawnScript/SystemUpdateScript + default effect type.
+
+    FString CreateNiagaraSystemOnGameThread(const FString& Name, const FString& Path)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("create_niagara_system");
+
+        const FString FullAssetPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullAssetPath))
+            return JsonError(CmdName, TEXT("asset_exists"), FullAssetPath);
+
+        // Resolve UNiagaraSystemFactoryNew dynamically — see note above.
+        UClass* FactoryClass = FindObject<UClass>(
+            nullptr, TEXT("/Script/NiagaraEditor.NiagaraSystemFactoryNew"));
+        if (FactoryClass == nullptr)
+            return JsonError(CmdName, TEXT("niagara_factory_not_found"),
+                TEXT("UNiagaraSystemFactoryNew UClass not found. Ensure NiagaraEditor plugin is enabled."));
+
+        UFactory* Factory = NewObject<UFactory>(GetTransientPackage(), FactoryClass);
+        if (Factory == nullptr)
+            return JsonError(CmdName, TEXT("factory_instantiation_failed"));
+
+        FAssetToolsModule& AssetToolsModule =
+            FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(
+            Name, Path, UNiagaraSystem::StaticClass(), Factory);
+
+        if (NewAsset == nullptr)
+            return JsonError(CmdName, TEXT("creation_failed"), FullAssetPath);
+
+        UNiagaraSystem* System = Cast<UNiagaraSystem>(NewAsset);
+        if (System == nullptr)
+            return JsonError(CmdName, TEXT("wrong_asset_type"),
+                FString::Printf(TEXT("Created asset is %s, not UNiagaraSystem"),
+                    *NewAsset->GetClass()->GetName()));
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullAssetPath, /*bOnlyIfIsDirty*/ false);
+        if (!bSaved)
+        {
+            UE_LOG(LogBlueprintMCP_TCP, Warning,
+                TEXT("create_niagara_system: created but save failed (%s)"), *FullAssetPath);
+        }
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_niagara_system\",\"system_path\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FullAssetPath),
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -5012,7 +5102,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.2.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.3.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -5261,6 +5351,27 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("set_anim_state_pose"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.3.0 Niagara door-opener ---
+    if (Command.Equals(TEXT("create_niagara_system"), ESearchCase::IgnoreCase))
+    {
+        FString Name, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_niagara_system"), TEXT("missing_field"), TEXT("name"));
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/VFX");
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, Path]() mutable
+            {
+                Promise.SetValue(CreateNiagaraSystemOnGameThread(Name, Path));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_niagara_system"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
