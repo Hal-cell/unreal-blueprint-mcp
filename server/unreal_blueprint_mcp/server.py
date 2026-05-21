@@ -234,6 +234,7 @@ def add_switch(
     enum_class: str = "",
     case_count: int = 2,
     case_labels: str = "",
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a Switch node (multi-way branch) — v7.2.
 
@@ -263,7 +264,7 @@ def add_switch(
     """
     if not blueprint or not anchor_name or not switch_type:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_switch",
         "blueprint": blueprint,
         "switch_type": switch_type,
@@ -273,7 +274,10 @@ def add_switch(
         "enum_class": enum_class,
         "case_count": case_count,
         "case_labels": case_labels,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -283,6 +287,7 @@ def add_sequence(
     position_x: int = 0,
     position_y: int = 0,
     then_count: int = 2,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add an Execution Sequence node (``K2Node_ExecutionSequence``) — v7.2.
 
@@ -302,14 +307,17 @@ def add_sequence(
     """
     if not blueprint or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_sequence",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
         "then_count": then_count,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -319,6 +327,7 @@ def add_make_array(
     position_x: int = 0,
     position_y: int = 0,
     num_inputs: int = 1,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a Make Array node (``K2Node_MakeArray``) — v7.2.
 
@@ -336,14 +345,17 @@ def add_make_array(
     """
     if not blueprint or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_make_array",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
         "num_inputs": num_inputs,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -353,6 +365,7 @@ def add_make_struct(
     struct_type: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a Make Struct node (``K2Node_MakeStruct``) — v7.3.
 
@@ -385,14 +398,17 @@ def add_make_struct(
     """
     if not blueprint or not anchor_name or not struct_type:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_make_struct",
         "blueprint": blueprint,
         "struct_type": struct_type,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -402,6 +418,7 @@ def add_break_struct(
     struct_type: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a Break Struct node (``K2Node_BreakStruct``) — v7.3.
 
@@ -421,14 +438,17 @@ def add_break_struct(
     """
     if not blueprint or not anchor_name or not struct_type:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_break_struct",
         "blueprint": blueprint,
         "struct_type": struct_type,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -438,6 +458,7 @@ def add_select(
     position_x: int = 0,
     position_y: int = 0,
     num_options: int = 2,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a Select node (``K2Node_Select``) — v7.2.
 
@@ -456,14 +477,17 @@ def add_select(
     """
     if not blueprint or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_select",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
         "num_options": num_options,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -547,6 +571,7 @@ def add_call_dispatcher(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a ``K2Node_CallDelegate`` — broadcasts a dispatcher to all bound listeners — v7.6.
 
@@ -567,14 +592,17 @@ def add_call_dispatcher(
     """
     if not blueprint or not dispatcher_name or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_call_dispatcher",
         "blueprint": blueprint,
         "dispatcher_name": dispatcher_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -584,6 +612,7 @@ def add_bind_dispatcher(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a ``K2Node_AddDelegate`` — binds a custom event to a dispatcher — v7.6.
 
@@ -609,14 +638,17 @@ def add_bind_dispatcher(
     """
     if not blueprint or not dispatcher_name or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_bind_dispatcher",
         "blueprint": blueprint,
         "dispatcher_name": dispatcher_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -626,6 +658,7 @@ def add_unbind_dispatcher(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a ``K2Node_RemoveDelegate`` — unbinds an event from a dispatcher — v7.6.
 
@@ -643,14 +676,17 @@ def add_unbind_dispatcher(
     """
     if not blueprint or not dispatcher_name or not anchor_name:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_unbind_dispatcher",
         "blueprint": blueprint,
         "dispatcher_name": dispatcher_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1006,6 +1042,7 @@ def call_blueprint_function(
     position_x: int = 0,
     position_y: int = 0,
     target_pin: str = "",
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Call a function on another class / Blueprint from inside this BP's EventGraph.
 
@@ -1042,7 +1079,7 @@ def call_blueprint_function(
         function_not_found      - function doesn't exist on the resolved class
         anchor_name_exists      - anchor already used
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "call_blueprint_function",
         "blueprint": blueprint,
         "target_class": target_class,
@@ -1051,7 +1088,10 @@ def call_blueprint_function(
         "position_x": position_x,
         "position_y": position_y,
         "target_pin": target_pin,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1244,6 +1284,7 @@ def add_macro(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a macro node from UE's StandardMacros library (loops, gates, etc.).
 
@@ -1271,14 +1312,17 @@ def add_macro(
         macro_graph_not_found  - StandardMacros library missing (engine install issue?)
         anchor_name_exists     - anchor already used
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_macro",
         "blueprint": blueprint,
         "macro_type": macro_type,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1287,6 +1331,7 @@ def add_self_reference(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_Self` node — outputs a "self" reference to the owning Blueprint.
 
@@ -1301,13 +1346,16 @@ def add_self_reference(
     Returns:
         On success: {"ok": True, "anchor_name", "node_guid", "pins": [{"name": "self", "direction": "output", ...}], "saved": True}
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_self_reference",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1364,6 +1412,7 @@ def add_input_key(
 def delete_node(
     blueprint: str,
     anchor_name: str,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Delete a node from a Blueprint's EventGraph (breaks all its pin links).
 
@@ -1382,11 +1431,14 @@ def delete_node(
     Common errors:
         anchor_not_found  - the anchor doesn't match any existing node (strict lookup; no auto-spawn here)
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "delete_node",
         "blueprint": blueprint,
         "anchor_name": anchor_name,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1394,6 +1446,7 @@ def disconnect_pins(
     blueprint: str,
     from_pin: str,
     to_pin: str,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Break the connection between two pins. Inverse of `connect_pins`.
 
@@ -1413,12 +1466,15 @@ def disconnect_pins(
         pin_not_found     - pin name typo on one side
         not_connected     - the pins were never connected to begin with
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "disconnect_pins",
         "blueprint": blueprint,
         "from_pin": from_pin,
         "to_pin": to_pin,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1573,6 +1629,7 @@ def add_custom_event(
     position_x: int = 0,
     position_y: int = 0,
     params: list[dict[str, str]] | None = None,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_CustomEvent` (the **red event** node) to the EventGraph.
 
@@ -1632,6 +1689,8 @@ def add_custom_event(
             for p in params
             if "name" in p and "type" in p
         ]
+    if graph_name:
+        payload["graph_name"] = graph_name
     return _send_command(payload)
 
 
@@ -1686,6 +1745,7 @@ def add_variable_get(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_VariableGet` (read) node referencing a BP variable.
 
@@ -1702,14 +1762,17 @@ def add_variable_get(
         variable_not_found  - call `add_variable` first
         anchor_name_exists  - another node has this anchor
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_variable_get",
         "blueprint": blueprint,
         "variable_name": variable_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1719,6 +1782,7 @@ def add_variable_set(
     anchor_name: str,
     position_x: int = 0,
     position_y: int = 0,
+    graph_name: str = "",
 ) -> dict[str, Any]:
     """Add a `K2Node_VariableSet` (write) node referencing a BP variable.
 
@@ -1740,14 +1804,17 @@ def add_variable_set(
         variable_not_found  - call `add_variable` first
         anchor_name_exists  - another node has this anchor
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "add_variable_set",
         "blueprint": blueprint,
         "variable_name": variable_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,
-    })
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()

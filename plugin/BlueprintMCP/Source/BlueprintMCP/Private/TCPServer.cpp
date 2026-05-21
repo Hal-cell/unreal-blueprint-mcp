@@ -1223,7 +1223,8 @@ namespace
         const FString& AnchorName,
         int32 PosX, int32 PosY,
         const TArray<FString>& ParamNames,    // v7.5: parallel arrays of param specs
-        const TArray<FString>& ParamTypes)
+        const TArray<FString>& ParamTypes,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
@@ -1232,11 +1233,11 @@ namespace
         {
             return JsonError(TEXT("add_custom_event"), TEXT("blueprint_not_found"), BlueprintPath);
         }
-        if (Blueprint->UbergraphPages.Num() == 0)
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr)
         {
-            return JsonError(TEXT("add_custom_event"), TEXT("no_event_graph"), BlueprintPath);
+            return JsonGraphNotFound(TEXT("add_custom_event"), GraphName);
         }
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
 
         // anchor uniqueness
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
@@ -1366,7 +1367,8 @@ namespace
         const FString& VariableName,
         const FString& AnchorName,
         int32 PosX, int32 PosY,
-        bool bIsSet)
+        bool bIsSet,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = bIsSet ? TEXT("add_variable_set") : TEXT("add_variable_get");
@@ -1627,15 +1629,15 @@ namespace
         const FString& FunctionName,
         const FString& AnchorName,
         int32 PosX, int32 PosY,
-        const FString& TargetPinRef = FString())  // v6: optional, auto-wire self
+        const FString& TargetPinRef = FString(),  // v6: optional, auto-wire self
+        const FString& GraphName    = FString())  // v7.7.1
     {
         check(IsInGameThread());
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (!Blueprint) return JsonError(TEXT("call_blueprint_function"), TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(TEXT("call_blueprint_function"), TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(TEXT("call_blueprint_function"), GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName))
             return JsonError(TEXT("call_blueprint_function"), TEXT("anchor_name_exists"), AnchorName);
@@ -2195,7 +2197,8 @@ namespace
         const FString& BlueprintPath,
         const FString& MacroType,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
@@ -2207,8 +2210,8 @@ namespace
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (!Blueprint) return JsonError(TEXT("add_macro"), TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0) return JsonError(TEXT("add_macro"), TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(TEXT("add_macro"), GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(TEXT("add_macro"), TEXT("anchor_name_exists"), AnchorName);
@@ -2249,14 +2252,15 @@ namespace
     FString AddSelfReferenceOnGameThread(
         const FString& BlueprintPath,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (!Blueprint) return JsonError(TEXT("add_self_reference"), TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0) return JsonError(TEXT("add_self_reference"), TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(TEXT("add_self_reference"), GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(TEXT("add_self_reference"), TEXT("anchor_name_exists"), AnchorName);
@@ -2336,14 +2340,17 @@ namespace
 
     // ===== v4 — delete_node =====
 
-    FString DeleteNodeOnGameThread(const FString& BlueprintPath, const FString& AnchorName)
+    FString DeleteNodeOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (!Blueprint) return JsonError(TEXT("delete_node"), TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0) return JsonError(TEXT("delete_node"), TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(TEXT("delete_node"), GraphName);
 
         // Strict lookup (NOT FindOrSpawn — don't spawn just to delete)
         UEdGraphNode* TargetNode = FindNodeByAnchor(EventGraph, AnchorName);
@@ -2370,14 +2377,15 @@ namespace
     FString DisconnectPinsOnGameThread(
         const FString& BlueprintPath,
         const FString& FromPinRef,
-        const FString& ToPinRef)
+        const FString& ToPinRef,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (!Blueprint) return JsonError(TEXT("disconnect_pins"), TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0) return JsonError(TEXT("disconnect_pins"), TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(TEXT("disconnect_pins"), GraphName);
 
         FString FromErr, ToErr;
         UEdGraphPin* FromPin = ResolvePinRef(EventGraph, FromPinRef, TEXT("disconnect_pins"), FromErr);
@@ -3130,16 +3138,16 @@ namespace
         int32 PosX, int32 PosY,
         const FString& EnumClass,
         int32 CaseCount,
-        const FString& CaseLabels)
+        const FString& CaseLabels,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_switch");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3246,16 +3254,16 @@ namespace
         const FString& BlueprintPath,
         const FString& AnchorName,
         int32 PosX, int32 PosY,
-        int32 ThenCount)
+        int32 ThenCount,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_sequence");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3290,16 +3298,16 @@ namespace
         const FString& BlueprintPath,
         const FString& AnchorName,
         int32 PosX, int32 PosY,
-        int32 NumInputs)
+        int32 NumInputs,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_make_array");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3447,16 +3455,16 @@ namespace
         const FString& BlueprintPath,
         const FString& StructTypeName,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_make_struct");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3525,16 +3533,16 @@ namespace
         const FString& BlueprintPath,
         const FString& StructTypeName,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_break_struct");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3736,15 +3744,15 @@ namespace
         const FString& BlueprintPath,
         const FString& DispatcherName,
         const FString& AnchorName,
-        int32 PosX, int32 PosY)
+        int32 PosX, int32 PosY,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -3787,16 +3795,16 @@ namespace
         const FString& BlueprintPath,
         const FString& AnchorName,
         int32 PosX, int32 PosY,
-        int32 NumOptions)
+        int32 NumOptions,
+        const FString& GraphName = FString())   // v7.7.1
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("add_select");
 
         UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
         if (Blueprint == nullptr) return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
-        if (Blueprint->UbergraphPages.Num() == 0)
-            return JsonError(CmdName, TEXT("no_event_graph"), BlueprintPath);
-        UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+        UEdGraph* EventGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (EventGraph == nullptr) return JsonGraphNotFound(CmdName, GraphName);
 
         if (FindNodeByAnchor(EventGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -4061,12 +4069,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             }
         }
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);   // v7.7.1
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes, GraphName]() mutable
             {
-                Promise.SetValue(AddCustomEventOnGameThread(Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes));
+                Promise.SetValue(AddCustomEventOnGameThread(Blueprint, EventName, AnchorName, PosX, PosY, ParamNames, ParamTypes, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_custom_event"), TEXT("game_thread_timeout"));
@@ -4116,12 +4127,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, VariableName, AnchorName, PosX, PosY, bIsSet]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, VariableName, AnchorName, PosX, PosY, bIsSet, GraphName]() mutable
             {
-                Promise.SetValue(AddVariableRefOnGameThread(Blueprint, VariableName, AnchorName, PosX, PosY, bIsSet));
+                Promise.SetValue(AddVariableRefOnGameThread(Blueprint, VariableName, AnchorName, PosX, PosY, bIsSet, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(CmdName, TEXT("game_thread_timeout"));
@@ -4164,10 +4178,13 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);   // v7.7.1
+
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin]() mutable
-            { Promise.SetValue(CallBlueprintFunctionOnGameThread(Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin)); });
+            [Promise = MoveTemp(Promise), Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin, GraphName]() mutable
+            { Promise.SetValue(CallBlueprintFunctionOnGameThread(Blueprint, TargetClass, FunctionName, AnchorName, PosX, PosY, TargetPin, GraphName)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("call_blueprint_function"), TEXT("game_thread_timeout"));
         return Future.Get();
@@ -4276,7 +4293,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_macro (v4) ---
+    // --- add_macro (v4 + v7.7.1 graph_name) ---
     if (Command.Equals(TEXT("add_macro"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, MacroType, AnchorName;
@@ -4289,17 +4306,19 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         int32 PosX = 0, PosY = 0;
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, MacroType, AnchorName, PosX, PosY]() mutable
-            { Promise.SetValue(AddMacroOnGameThread(Blueprint, MacroType, AnchorName, PosX, PosY)); });
+            [Promise = MoveTemp(Promise), Blueprint, MacroType, AnchorName, PosX, PosY, GraphName]() mutable
+            { Promise.SetValue(AddMacroOnGameThread(Blueprint, MacroType, AnchorName, PosX, PosY, GraphName)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_macro"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
-    // --- add_self_reference (v4) ---
+    // --- add_self_reference (v4 + v7.7.1 graph_name) ---
     if (Command.Equals(TEXT("add_self_reference"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, AnchorName;
@@ -4310,11 +4329,13 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         int32 PosX = 0, PosY = 0;
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY]() mutable
-            { Promise.SetValue(AddSelfReferenceOnGameThread(Blueprint, AnchorName, PosX, PosY)); });
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, GraphName]() mutable
+            { Promise.SetValue(AddSelfReferenceOnGameThread(Blueprint, AnchorName, PosX, PosY, GraphName)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_self_reference"), TEXT("game_thread_timeout"));
         return Future.Get();
@@ -4343,7 +4364,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- delete_node (v4) ---
+    // --- delete_node (v4 + v7.7.1 graph_name) ---
     if (Command.Equals(TEXT("delete_node"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, AnchorName;
@@ -4351,17 +4372,19 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("delete_node"), TEXT("missing_field"), TEXT("blueprint"));
         if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
             return JsonError(TEXT("delete_node"), TEXT("missing_field"), TEXT("anchor_name"));
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName]() mutable
-            { Promise.SetValue(DeleteNodeOnGameThread(Blueprint, AnchorName)); });
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, GraphName]() mutable
+            { Promise.SetValue(DeleteNodeOnGameThread(Blueprint, AnchorName, GraphName)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("delete_node"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
-    // --- disconnect_pins (v4) ---
+    // --- disconnect_pins (v4 + v7.7.1 graph_name) ---
     if (Command.Equals(TEXT("disconnect_pins"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, FromPin, ToPin;
@@ -4371,11 +4394,13 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("disconnect_pins"), TEXT("missing_field"), TEXT("from_pin"));
         if (!JsonObject->TryGetStringField(TEXT("to_pin"), ToPin) || ToPin.IsEmpty())
             return JsonError(TEXT("disconnect_pins"), TEXT("missing_field"), TEXT("to_pin"));
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, FromPin, ToPin]() mutable
-            { Promise.SetValue(DisconnectPinsOnGameThread(Blueprint, FromPin, ToPin)); });
+            [Promise = MoveTemp(Promise), Blueprint, FromPin, ToPin, GraphName]() mutable
+            { Promise.SetValue(DisconnectPinsOnGameThread(Blueprint, FromPin, ToPin, GraphName)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("disconnect_pins"), TEXT("game_thread_timeout"));
         return Future.Get();
@@ -4701,13 +4726,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
         JsonObject->TryGetNumberField(TEXT("case_count"), CaseCount);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels, GraphName]() mutable
             {
-                Promise.SetValue(AddSwitchOnGameThread(Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels));
+                Promise.SetValue(AddSwitchOnGameThread(Blueprint, SwitchType, AnchorName, PosX, PosY, EnumClass, CaseCount, CaseLabels, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_switch"), TEXT("game_thread_timeout"));
@@ -4727,13 +4754,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
         JsonObject->TryGetNumberField(TEXT("then_count"), ThenCount);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, ThenCount]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, ThenCount, GraphName]() mutable
             {
-                Promise.SetValue(AddSequenceOnGameThread(Blueprint, AnchorName, PosX, PosY, ThenCount));
+                Promise.SetValue(AddSequenceOnGameThread(Blueprint, AnchorName, PosX, PosY, ThenCount, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_sequence"), TEXT("game_thread_timeout"));
@@ -4753,13 +4782,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
         JsonObject->TryGetNumberField(TEXT("num_inputs"), NumInputs);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumInputs]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumInputs, GraphName]() mutable
             {
-                Promise.SetValue(AddMakeArrayOnGameThread(Blueprint, AnchorName, PosX, PosY, NumInputs));
+                Promise.SetValue(AddMakeArrayOnGameThread(Blueprint, AnchorName, PosX, PosY, NumInputs, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_make_array"), TEXT("game_thread_timeout"));
@@ -4779,13 +4810,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
         JsonObject->TryGetNumberField(TEXT("num_options"), NumOptions);
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumOptions]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, PosX, PosY, NumOptions, GraphName]() mutable
             {
-                Promise.SetValue(AddSelectOnGameThread(Blueprint, AnchorName, PosX, PosY, NumOptions));
+                Promise.SetValue(AddSelectOnGameThread(Blueprint, AnchorName, PosX, PosY, NumOptions, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_select"), TEXT("game_thread_timeout"));
@@ -4807,12 +4840,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY, GraphName]() mutable
             {
-                Promise.SetValue(AddMakeStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY));
+                Promise.SetValue(AddMakeStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_make_struct"), TEXT("game_thread_timeout"));
@@ -4834,12 +4870,15 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
         JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
 
+        FString GraphName;
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, StructType, AnchorName, PosX, PosY, GraphName]() mutable
             {
-                Promise.SetValue(AddBreakStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY));
+                Promise.SetValue(AddBreakStructOnGameThread(Blueprint, StructType, AnchorName, PosX, PosY, GraphName));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_break_struct"), TEXT("game_thread_timeout"));
@@ -4930,19 +4969,21 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             int32 PosX = 0, PosY = 0;
             JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
             JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+            FString GraphName;
+            JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);   // v7.7.1
 
             TPromise<FString> Promise;
             TFuture<FString> Future = Promise.GetFuture();
             AsyncTask(ENamedThreads::GameThread,
-                [Promise = MoveTemp(Promise), CmdName, bCall, bBind, bUnbind, Blueprint, DispatcherName, AnchorName, PosX, PosY]() mutable
+                [Promise = MoveTemp(Promise), CmdName, bCall, bBind, bUnbind, Blueprint, DispatcherName, AnchorName, PosX, PosY, GraphName]() mutable
                 {
                     FString Result;
                     if (bCall)
-                        Result = AddDelegateNodeOnGameThread<UK2Node_CallDelegate>(CmdName, TEXT("K2Node_CallDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                        Result = AddDelegateNodeOnGameThread<UK2Node_CallDelegate>(CmdName, TEXT("K2Node_CallDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY, GraphName);
                     else if (bBind)
-                        Result = AddDelegateNodeOnGameThread<UK2Node_AddDelegate>(CmdName, TEXT("K2Node_AddDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                        Result = AddDelegateNodeOnGameThread<UK2Node_AddDelegate>(CmdName, TEXT("K2Node_AddDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY, GraphName);
                     else
-                        Result = AddDelegateNodeOnGameThread<UK2Node_RemoveDelegate>(CmdName, TEXT("K2Node_RemoveDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY);
+                        Result = AddDelegateNodeOnGameThread<UK2Node_RemoveDelegate>(CmdName, TEXT("K2Node_RemoveDelegate"), Blueprint, DispatcherName, AnchorName, PosX, PosY, GraphName);
                     Promise.SetValue(MoveTemp(Result));
                 });
             if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
