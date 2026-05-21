@@ -433,12 +433,16 @@ namespace
         return Found;
     }
 
-    /** Build the JSON array string describing a node's pins. */
+    /** Build the JSON array string describing a node's pins.
+     *  v7.1.1 (BUG-4 fix): skip Pin->bHidden so internal pins (e.g. K2Node_Switch's
+     *  NotEqual_IntInt function-ref pin, K2Node_CallFunction's self when implicit)
+     *  don't leak into the public pin list. */
     FString BuildPinsJsonArray(const UEdGraphNode* Node)
     {
         TArray<FString> PinJsonItems;
         for (const UEdGraphPin* Pin : Node->Pins)
         {
+            if (Pin->bHidden) continue;   // BUG-4 fix
             const FString PinName = Pin->PinName.ToString();
             const FString Direction = (Pin->Direction == EGPD_Input) ? TEXT("input") : TEXT("output");
             const FString TypeCategory = Pin->PinType.PinCategory.ToString();
@@ -1568,11 +1572,24 @@ namespace
         FBlueprintEditorUtils::AddFunctionGraph<UClass>(
             Blueprint, NewFuncGraph, /*bIsUserCreated*/ true, /*SignatureClass*/ nullptr);
 
+        // BUG-3 fix (a): tag the auto-created K2Node_FunctionEntry node with a well-known
+        // anchor ("entry") so connect_pins(graph_name="MyFunc", from_pin="entry.then", ...)
+        // can address it via FindNodeByAnchor.
+        for (UEdGraphNode* N : NewFuncGraph->Nodes)
+        {
+            if (Cast<UK2Node_FunctionEntry>(N) != nullptr)
+            {
+                N->NodeComment = TEXT("entry");
+                N->bCommentBubbleVisible = true;
+                break;
+            }
+        }
+
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_function\",\"function_name\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_function\",\"function_name\":%s,\"entry_anchor\":\"entry\",\"saved\":%s}\n"),
             *EscapeJsonString(FunctionName), bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -2676,6 +2693,57 @@ namespace
         }
         Writer->WriteArrayEnd();
 
+        // BUG-3 fix (b): functions { "MyFunc": { "anchors": {...}, "connections": [...] } }
+        // So callers can inspect function-body graphs (created via add_function), not just EventGraph.
+        Writer->WriteObjectStart(TEXT("functions"));
+        for (UEdGraph* FuncGraph : Blueprint->FunctionGraphs)
+        {
+            if (FuncGraph == nullptr) continue;
+            Writer->WriteObjectStart(*FuncGraph->GetName());
+
+            // Per-graph anchor map
+            TMap<const UEdGraphNode*, FString> FuncNodeToAnchor;
+            for (UEdGraphNode* Node : FuncGraph->Nodes)
+            {
+                if (Node != nullptr) FuncNodeToAnchor.Add(Node, DeriveAnchorForNode(Node));
+            }
+
+            Writer->WriteObjectStart(TEXT("anchors"));
+            for (const TPair<const UEdGraphNode*, FString>& Kvp : FuncNodeToAnchor)
+            {
+                Writer->WriteIdentifierPrefix(*Kvp.Value);
+                WriteNodeAnchor(Writer, Kvp.Key);
+            }
+            Writer->WriteObjectEnd();
+
+            Writer->WriteArrayStart(TEXT("connections"));
+            for (const UEdGraphNode* Node : FuncGraph->Nodes)
+            {
+                if (Node == nullptr) continue;
+                const FString FromAnchor = FuncNodeToAnchor.FindRef(Node);
+                for (const UEdGraphPin* Pin : Node->Pins)
+                {
+                    if (Pin->Direction != EGPD_Output) continue;
+                    for (const UEdGraphPin* Linked : Pin->LinkedTo)
+                    {
+                        if (Linked == nullptr || Linked->GetOwningNode() == nullptr) continue;
+                        const FString ToAnchor = FuncNodeToAnchor.FindRef(Linked->GetOwningNode());
+                        if (ToAnchor.IsEmpty()) continue;
+                        Writer->WriteObjectStart();
+                        Writer->WriteValue(TEXT("from"),
+                            FString::Printf(TEXT("%s.%s"), *FromAnchor, *Pin->PinName.ToString()));
+                        Writer->WriteValue(TEXT("to"),
+                            FString::Printf(TEXT("%s.%s"), *ToAnchor, *Linked->PinName.ToString()));
+                        Writer->WriteObjectEnd();
+                    }
+                }
+            }
+            Writer->WriteArrayEnd();
+
+            Writer->WriteObjectEnd();   // function obj end
+        }
+        Writer->WriteObjectEnd();   // functions obj end
+
         // variables [{name, type, subcategory, container}]  — v6.0.2 P4: add container info
         Writer->WriteArrayStart(TEXT("variables"));
         for (const FBPVariableDescription& Var : Blueprint->NewVariables)
@@ -3063,12 +3131,24 @@ namespace
 
         FinalizeK2Node(EventGraph, NewNode);
 
-        // For integer switch: add extra case pins to reach CaseCount.
-        // Default IntSwitch has 1 case ("0") after AllocateDefaultPins.
+        // BUG-4 fix: count existing case output exec pins at runtime rather than
+        // assuming UE 5.4's default state. SwitchInteger may create 0 or 1 default
+        // case depending on engine version. Skip "Default" pin and exec input.
         if (UK2Node_SwitchInteger* IntSwitch = Cast<UK2Node_SwitchInteger>(NewNode))
         {
-            const int32 DefaultCount = 1;
-            for (int32 i = DefaultCount; i < CaseCount; ++i)
+            int32 ExistingCases = 0;
+            for (UEdGraphPin* P : IntSwitch->Pins)
+            {
+                if (P->Direction == EGPD_Output
+                    && P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+                    && !P->PinName.IsNone()
+                    && !P->PinName.ToString().Equals(TEXT("Default"), ESearchCase::IgnoreCase))
+                {
+                    ExistingCases++;
+                }
+            }
+            const int32 ToAdd = FMath::Max(0, CaseCount - ExistingCases);
+            for (int32 i = 0; i < ToAdd; ++i)
             {
                 IntSwitch->AddPinToSwitchNode();
             }
@@ -3240,6 +3320,57 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    /**
+     * BUG-2 helper: structs like FHitResult / FOverlapResult / FRotator declare a
+     * `HasNativeBreak` / `HasNativeMake` USTRUCT meta pointing at a native UFunction
+     * (e.g. `/Script/Engine.GameplayStatics.BreakHitResult`). K2Node_BreakStruct /
+     * K2Node_MakeStruct on these structs DON'T expose member pins at AllocateDefaultPins
+     * time — UE expects the user to use a K2Node_CallFunction on the native function
+     * instead, and ExpandNode substitutes at compile time.
+     *
+     * For LLM authoring we need pins visible immediately, so this helper substitutes
+     * the make/break node with a K2Node_CallFunction at spawn time.
+     *
+     * MetaKey is "HasNativeBreak" or "HasNativeMake"; format of value is a fully
+     * qualified function path like "/Script/Engine.GameplayStatics.BreakHitResult".
+     */
+    UK2Node_CallFunction* SpawnNativeStructFunctionNode(
+        UEdGraph* EventGraph,
+        UScriptStruct* StructType,
+        const FName& MetaKey,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        FString& OutErrorDetail)
+    {
+        const FString MetaData = StructType->GetMetaData(MetaKey);
+        if (MetaData.IsEmpty())
+        {
+            OutErrorDetail = FString::Printf(TEXT("Struct '%s' has %s meta but empty value"),
+                *StructType->GetName(), *MetaKey.ToString());
+            return nullptr;
+        }
+        // FindObject<UFunction>(nullptr, "/Script/Engine.GameplayStatics.BreakHitResult", true)
+        // mirrors K2Node_BreakStruct.cpp:454
+        UFunction* NativeFn = FindObject<UFunction>(nullptr, *MetaData, /*bExactClass*/ true);
+        if (NativeFn == nullptr)
+        {
+            OutErrorDetail = FString::Printf(TEXT("Struct '%s' has %s='%s' but function not found"),
+                *StructType->GetName(), *MetaKey.ToString(), *MetaData);
+            return nullptr;
+        }
+        UClass* OwnerClass = NativeFn->GetOuterUClass();
+        if (OwnerClass == nullptr)
+        {
+            OutErrorDetail = FString::Printf(TEXT("Native function '%s' has no outer class"), *MetaData);
+            return nullptr;
+        }
+
+        UK2Node_CallFunction* CallNode = SpawnK2NodeBare<UK2Node_CallFunction>(EventGraph, AnchorName, PosX, PosY);
+        CallNode->FunctionReference.SetExternalMember(NativeFn->GetFName(), OwnerClass);
+        FinalizeK2Node(EventGraph, CallNode);
+        return CallNode;
+    }
+
     FString AddMakeStructOnGameThread(
         const FString& BlueprintPath,
         const FString& StructTypeName,
@@ -3262,20 +3393,57 @@ namespace
         if (StructType == nullptr)
             return JsonError(CmdName, TEXT("unknown_struct_type"), StructTypeName);
 
-        UK2Node_MakeStruct* NewNode = SpawnK2NodeBare<UK2Node_MakeStruct>(EventGraph, AnchorName, PosX, PosY);
-        NewNode->StructType = StructType;  // MUST set before AllocateDefaultPins so pins reflect struct fields
-        FinalizeK2Node(EventGraph, NewNode);
+        UEdGraphNode* SpawnedNode = nullptr;
+        FString NodeTypeName;
+        FString NativeFnLabel;   // empty unless we substituted
+
+        // BUG-2 fix: detect HasNativeMake and substitute with K2Node_CallFunction
+        if (StructType->HasMetaData(FName(TEXT("HasNativeMake"))))
+        {
+            FString ErrDetail;
+            UK2Node_CallFunction* CallNode = SpawnNativeStructFunctionNode(
+                EventGraph, StructType, FName(TEXT("HasNativeMake")),
+                AnchorName, PosX, PosY, ErrDetail);
+            if (CallNode == nullptr)
+                return JsonError(CmdName, TEXT("native_make_unresolved"), ErrDetail);
+            SpawnedNode = CallNode;
+            NodeTypeName = TEXT("K2Node_CallFunction");
+            NativeFnLabel = FString::Printf(TEXT("%s::%s"),
+                *CallNode->FunctionReference.GetMemberParentClass()->GetName(),
+                *CallNode->FunctionReference.GetMemberName().ToString());
+        }
+        else
+        {
+            UK2Node_MakeStruct* NewNode = SpawnK2NodeBare<UK2Node_MakeStruct>(EventGraph, AnchorName, PosX, PosY);
+            NewNode->StructType = StructType;  // MUST set before AllocateDefaultPins
+            FinalizeK2Node(EventGraph, NewNode);
+            SpawnedNode = NewNode;
+            NodeTypeName = TEXT("K2Node_MakeStruct");
+        }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
-        const FString PinsJson = BuildPinsJsonArray(NewNode);
-        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const FString PinsJson = BuildPinsJsonArray(SpawnedNode);
+        const FString GuidStr = SpawnedNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
 
+        if (NativeFnLabel.IsEmpty())
+        {
+            return FString::Printf(
+                TEXT("{\"ok\":true,\"command\":\"add_make_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_type\":\"%s\",\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+                *EscapeJsonString(AnchorName),
+                *EscapeJsonString(StructType->GetName()),
+                *NodeTypeName,
+                *EscapeJsonString(GuidStr),
+                *PinsJson,
+                bSaved ? TEXT("true") : TEXT("false"));
+        }
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_make_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_make_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_type\":\"%s\",\"native_function\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName),
             *EscapeJsonString(StructType->GetName()),
+            *NodeTypeName,
+            *EscapeJsonString(NativeFnLabel),
             *EscapeJsonString(GuidStr),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
@@ -3303,20 +3471,57 @@ namespace
         if (StructType == nullptr)
             return JsonError(CmdName, TEXT("unknown_struct_type"), StructTypeName);
 
-        UK2Node_BreakStruct* NewNode = SpawnK2NodeBare<UK2Node_BreakStruct>(EventGraph, AnchorName, PosX, PosY);
-        NewNode->StructType = StructType;
-        FinalizeK2Node(EventGraph, NewNode);
+        UEdGraphNode* SpawnedNode = nullptr;
+        FString NodeTypeName;
+        FString NativeFnLabel;
+
+        // BUG-2 fix: detect HasNativeBreak (FHitResult etc.) and use K2Node_CallFunction
+        if (StructType->HasMetaData(FName(TEXT("HasNativeBreak"))))
+        {
+            FString ErrDetail;
+            UK2Node_CallFunction* CallNode = SpawnNativeStructFunctionNode(
+                EventGraph, StructType, FName(TEXT("HasNativeBreak")),
+                AnchorName, PosX, PosY, ErrDetail);
+            if (CallNode == nullptr)
+                return JsonError(CmdName, TEXT("native_break_unresolved"), ErrDetail);
+            SpawnedNode = CallNode;
+            NodeTypeName = TEXT("K2Node_CallFunction");
+            NativeFnLabel = FString::Printf(TEXT("%s::%s"),
+                *CallNode->FunctionReference.GetMemberParentClass()->GetName(),
+                *CallNode->FunctionReference.GetMemberName().ToString());
+        }
+        else
+        {
+            UK2Node_BreakStruct* NewNode = SpawnK2NodeBare<UK2Node_BreakStruct>(EventGraph, AnchorName, PosX, PosY);
+            NewNode->StructType = StructType;
+            FinalizeK2Node(EventGraph, NewNode);
+            SpawnedNode = NewNode;
+            NodeTypeName = TEXT("K2Node_BreakStruct");
+        }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
-        const FString PinsJson = BuildPinsJsonArray(NewNode);
-        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const FString PinsJson = BuildPinsJsonArray(SpawnedNode);
+        const FString GuidStr = SpawnedNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
 
+        if (NativeFnLabel.IsEmpty())
+        {
+            return FString::Printf(
+                TEXT("{\"ok\":true,\"command\":\"add_break_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_type\":\"%s\",\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+                *EscapeJsonString(AnchorName),
+                *EscapeJsonString(StructType->GetName()),
+                *NodeTypeName,
+                *EscapeJsonString(GuidStr),
+                *PinsJson,
+                bSaved ? TEXT("true") : TEXT("false"));
+        }
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_break_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_break_struct\",\"anchor_name\":%s,\"struct_type\":%s,\"node_type\":\"%s\",\"native_function\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(AnchorName),
             *EscapeJsonString(StructType->GetName()),
+            *NodeTypeName,
+            *EscapeJsonString(NativeFnLabel),
             *EscapeJsonString(GuidStr),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
@@ -3393,10 +3598,19 @@ namespace
         }
 
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+        // BUG-1 fix: K2Node_CallDelegate's AllocateDefaultPins resolves the multicast
+        // delegate signature via FMemberReference::ResolveMember on the BP's GeneratedClass.
+        // Without an actual compile, GeneratedClass lacks the new FMulticastDelegateProperty,
+        // so signature resolution fails and call_dispatcher node gets no parameter pins.
+        // Compile here so subsequent add_call_dispatcher / add_bind_dispatcher have a
+        // valid delegate signature to introspect.
+        FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
+
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_event_dispatcher\",\"dispatcher_name\":%s,\"param_count\":%d,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"add_event_dispatcher\",\"dispatcher_name\":%s,\"param_count\":%d,\"compiled\":true,\"saved\":%s}\n"),
             *EscapeJsonString(DispatcherName),
             ParamNames.Num(),
             bSaved ? TEXT("true") : TEXT("false"));
