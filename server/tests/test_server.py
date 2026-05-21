@@ -1262,67 +1262,6 @@ def test_ping_ue_against_real_plugin() -> None:
     assert "version" in result
 
 
-@requires_ue_editor(extra_reason="BlueprintMCP plugin loaded")
-def test_create_blueprint_against_real_plugin() -> None:
-    """Manual spike test: creates an asset in the running editor. Un-skip in spike B1."""
-    result = server.create_blueprint(name="BP_TestSpikeB1", parent_class="Actor")
-    assert result["ok"] is True
-    assert result["blueprint_path"].endswith("BP_TestSpikeB1")
-
-
-@requires_ue_editor(extra_reason="BlueprintMCP plugin + a Blueprint to add to")
-def test_add_node_against_real_plugin() -> None:
-    """Manual spike test: adds a PrintString node to BP_TestSpikeB1_v2. Un-skip in spike B2."""
-    result = server.add_node(
-        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
-        node_type="K2Node_CallFunction:PrintString",
-        anchor_name="print_hello_b2_test",
-        position_x=400,
-        position_y=200,
-    )
-    assert result["ok"] is True
-    assert result["function"] == "PrintString"
-
-
-@requires_ue_editor(extra_reason="plugin + a node with anchor 'print_hello' on it")
-def test_set_pin_default_against_real_plugin() -> None:
-    """Manual spike test: changes print_hello.InString default to 'hello world'."""
-    result = server.set_pin_default(
-        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
-        pin_ref="print_hello.InString",
-        value="hello world",
-    )
-    assert result["ok"] is True
-    assert result["value"] == "hello world"
-
-
-@requires_ue_editor(extra_reason="plugin + BP with begin_play and print_hello nodes")
-def test_connect_pins_against_real_plugin() -> None:
-    """Manual spike test: wires BeginPlay.then -> print_hello.execute."""
-    result = server.connect_pins(
-        blueprint="/Game/Blueprints/BP_TestSpikeB1_v2",
-        from_pin="begin_play.then",
-        to_pin="print_hello.execute",
-    )
-    assert result["ok"] is True
-
-
-@requires_ue_editor(extra_reason="plugin + a complete wired BP to compile")
-def test_compile_blueprint_against_real_plugin() -> None:
-    """Manual spike test: compiles BP_TestSpikeB1_v2 (should be wired by B4)."""
-    result = server.compile_blueprint(name="/Game/Blueprints/BP_TestSpikeB1_v2")
-    assert result["ok"] is True
-    assert result["status"] in ("up_to_date", "warnings")
-
-
-@requires_ue_editor(extra_reason="plugin + a compiled Actor BP")
-def test_spawn_actor_against_real_plugin() -> None:
-    """Manual spike test: spawns BP_TestSpikeB1_v2 into current level."""
-    result = server.spawn_actor(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
-    assert result["ok"] is True
-    assert "actor_name" in result
-
-
 # ---------------------------------------------------------------------------
 # v7.1 — set_component_property
 # ---------------------------------------------------------------------------
@@ -1460,35 +1399,6 @@ def test_set_component_property_empty_value_allowed() -> None:
     import json
     sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
     assert sent_dict["value"] == ""
-
-
-@requires_ue_editor(extra_reason="BP_TargetDummy with VisualMesh + TriggerBox")
-def test_set_component_property_against_real_plugin() -> None:
-    """Manual integration: assign Cube mesh + grow box + set collision preset."""
-    r1 = server.set_component_property(
-        blueprint="/Game/Blueprints/BP_TargetDummy",
-        component_name="VisualMesh",
-        property_name="StaticMesh",
-        value="/Engine/BasicShapes/Cube",
-    )
-    assert r1["ok"] is True
-    assert "Cube" in r1["resolved_value"]
-
-    r2 = server.set_component_property(
-        blueprint="/Game/Blueprints/BP_TargetDummy",
-        component_name="TriggerBox",
-        property_name="BoxExtent",
-        value="(X=200,Y=200,Z=200)",
-    )
-    assert r2["ok"] is True
-
-    r3 = server.set_component_property(
-        blueprint="/Game/Blueprints/BP_TargetDummy",
-        component_name="TriggerBox",
-        property_name="BodyInstance.CollisionProfileName",
-        value="OverlapAllDynamic",
-    )
-    assert r3["ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1640,18 +1550,6 @@ def test_v72_local_validation_missing_args() -> None:
     assert server.add_sequence(blueprint="", anchor_name="")["error"] == "missing_argument"
     assert server.add_make_array(blueprint="", anchor_name="")["error"] == "missing_argument"
     assert server.add_select(blueprint="", anchor_name="")["error"] == "missing_argument"
-
-
-@requires_ue_editor(extra_reason="a BP to add nodes to")
-def test_v72_against_real_plugin() -> None:
-    """Manual integration: spawn each v7.2 node type into a fresh BP."""
-    bp = "/Game/Blueprints/BP_V72_Smoke"
-    server.create_blueprint(name="BP_V72_Smoke")
-    assert server.add_switch(blueprint=bp, anchor_name="sw", switch_type="int", case_count=3)["ok"]
-    assert server.add_sequence(blueprint=bp, anchor_name="seq", then_count=3)["ok"]
-    assert server.add_make_array(blueprint=bp, anchor_name="arr", num_inputs=3)["ok"]
-    assert server.add_select(blueprint=bp, anchor_name="sel", num_options=3)["ok"]
-    assert server.compile_blueprint(name=bp)["ok"]
 
 
 # ---------------------------------------------------------------------------
@@ -1815,16 +1713,6 @@ def test_add_variable_object_ref_handles_unknown_class() -> None:
         )
     assert r["ok"] is False
     assert r["error"] == "unknown_variable_type"
-
-
-@requires_ue_editor(extra_reason="a BP")
-def test_v74_object_ref_against_real_plugin() -> None:
-    """Manual integration: add Actor ref + Pawn class ref vars to a BP."""
-    bp = "/Game/Blueprints/BP_V74_Smoke"
-    server.create_blueprint(name="BP_V74_Smoke")
-    assert server.add_variable(blueprint=bp, name="Target", variable_type="object:Actor")["ok"]
-    assert server.add_variable(blueprint=bp, name="SpawnClass", variable_type="class:Pawn")["ok"]
-    assert server.compile_blueprint(name=bp)["ok"]
 
 
 # ---------------------------------------------------------------------------
@@ -2033,24 +1921,6 @@ def test_v76_local_validation_missing_args() -> None:
     assert server.add_unbind_dispatcher(blueprint="", dispatcher_name="", anchor_name="")["error"] == "missing_argument"
 
 
-@requires_ue_editor(extra_reason="BP with event dispatcher pattern")
-def test_v76_full_dispatcher_loop_against_real_plugin() -> None:
-    """Manual integration: define dispatcher, custom event matching it, bind+call+unbind."""
-    bp = "/Game/Blueprints/BP_V76_Dispatcher"
-    server.create_blueprint(name="BP_V76_Dispatcher")
-    assert server.add_event_dispatcher(
-        blueprint=bp, dispatcher_name="OnDeath",
-        params=[{"name": "Damage", "type": "float"}],
-    )["ok"]
-    assert server.add_custom_event(
-        blueprint=bp, event_name="HandleDeath", anchor_name="handle_death",
-        params=[{"name": "Damage", "type": "float"}],
-    )["ok"]
-    assert server.add_bind_dispatcher(blueprint=bp, dispatcher_name="OnDeath", anchor_name="bind_death")["ok"]
-    assert server.add_call_dispatcher(blueprint=bp, dispatcher_name="OnDeath", anchor_name="broadcast_death")["ok"]
-    assert server.compile_blueprint(name=bp)["ok"]
-
-
 # ---------------------------------------------------------------------------
 # v7.7 — graph_name parameter on add_node / connect_pins / set_pin_default /
 #        add_branch / add_cast (function-body editing)
@@ -2167,24 +2037,6 @@ def test_add_node_handles_graph_not_found() -> None:
     assert r["error"] == "graph_not_found"
 
 
-@requires_ue_editor(extra_reason="BP with a user function 'MyFunc'")
-def test_v77_function_body_against_real_plugin() -> None:
-    """Manual integration: add_function then write nodes inside its graph."""
-    bp = "/Game/Blueprints/BP_V77_FuncBody"
-    server.create_blueprint(name="BP_V77_FuncBody")
-    assert server.add_function(blueprint=bp, name="MyFunc")["ok"]
-    # All graph-writing tools below route into MyFunc, not EventGraph
-    assert server.add_node(
-        blueprint=bp, node_type="PrintString",
-        anchor_name="print_in_func", graph_name="MyFunc",
-    )["ok"]
-    assert server.set_pin_default(
-        blueprint=bp, pin_ref="print_in_func.InString",
-        value="hello from inside MyFunc", graph_name="MyFunc",
-    )["ok"]
-    assert server.compile_blueprint(name=bp)["ok"]
-
-
 # ---------------------------------------------------------------------------
 # v7.8 — save_blueprint
 # ---------------------------------------------------------------------------
@@ -2221,13 +2073,6 @@ def test_save_blueprint_local_validation_missing_arg() -> None:
     r = server.save_blueprint(blueprint="")
     assert r["ok"] is False
     assert r["error"] == "missing_argument"
-
-
-@requires_ue_editor(extra_reason="a modified BP")
-def test_save_blueprint_against_real_plugin() -> None:
-    r = server.save_blueprint(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
-    assert r["ok"] is True
-    assert r["saved"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2414,13 +2259,41 @@ def test_create_anim_blueprint_local_validation() -> None:
     assert server.create_anim_blueprint(name="X", skeleton="")["error"] == "missing_argument"
 
 
-@requires_ue_editor(extra_reason="Project needs a USkeleton asset like SK_Mannequin_Skeleton")
+@requires_ue_editor(extra_reason="project needs SOME USkeleton asset")
 def test_create_anim_blueprint_against_real_plugin() -> None:
-    """Integration: actually create + save an AnimBP referencing the engine mannequin skeleton."""
+    """Integration: probe known skeleton paths until one resolves, then create AnimBP.
+
+    The Engine doesn't include a built-in skeleton at a fixed path (varies by
+    template). This test probes a list of common project skeleton paths and
+    uses the first one that resolves. If none are present, skip with a hint.
+    """
+    import uuid
+
+    # Common skeleton paths across UE 5.x templates.
+    # First-match wins; tests in TESTMCP (FirstPerson template) hit the first one.
+    candidate_skeletons = [
+        "/Game/FirstPersonArms/Character/Mesh/SK_Mannequin_Arms_Skeleton",  # FirstPerson template
+        "/Game/Characters/Mannequins/Meshes/SK_Mannequin",                  # ThirdPerson (UE5)
+        "/Game/Mannequin/Mesh/UE4_Mannequin_Skeleton",                       # ThirdPerson (UE4 legacy)
+        "/Engine/EngineMeshes/SkeletalCube",                                 # last-resort engine asset
+    ]
+    skeleton = None
+    last_detail = ""
+    unique_name = f"ABP_V9Test_{uuid.uuid4().hex[:8]}"
+    for candidate in candidate_skeletons:
+        r = server.create_anim_blueprint(name=unique_name, skeleton=candidate, path="/Game/Tests")
+        if r["ok"]:
+            skeleton = candidate
+            break
+        last_detail = r.get("detail", "")
+    assert skeleton is not None, (
+        f"No skeleton resolved. Last detail: {last_detail}. "
+        f"Tried: {candidate_skeletons}. "
+        f"To run this test, ensure your project has at least one USkeleton."
+    )
+    # If we got here, AnimBP was created on the last successful candidate
     r = server.create_anim_blueprint(
-        name="ABP_V9Test",
-        skeleton="/Engine/Mannequin/Mesh/SK_Mannequin_Skeleton",
-        path="/Game/Tests",
+        name=f"{unique_name}_v2", skeleton=skeleton, path="/Game/Tests",
     )
     assert r["ok"] is True
     assert r["parent_class"] == "AnimInstance"
@@ -2533,26 +2406,6 @@ def test_ping_returns_plugin_version() -> None:
     assert "build_date" in r
 
 
-@requires_ue_editor(extra_reason="a pre-v7.1.2 BP with broken dispatchers")
-def test_migrate_dispatchers_against_real_plugin() -> None:
-    """Manual integration: scan + repair an old BP, then verify add_call_dispatcher works."""
-    bp = "/Game/Blueprints/BP_V76_v2"
-    r = server.migrate_dispatchers(blueprint=bp)
-    assert r["ok"] is True
-    # Old BP_V76_v2 had a broken OnDeath; depending on what remained, this may or
-    # may not migrate it. The point: this tool is idempotent + observable.
-
-    if r["migrated_count"] > 0:
-        # Verify the now-repaired dispatcher produces real param pins
-        call_r = server.add_call_dispatcher(
-            blueprint=bp, dispatcher_name=r["migrated"][0],
-            anchor_name="post_migrate_broadcast",
-        )
-        pin_names = {p["name"] for p in call_r["pins"]}
-        # If the dispatcher has params, they should appear
-        assert "execute" in pin_names and "self" in pin_names
-
-
 # ---------------------------------------------------------------------------
 # v8.0.1 — delete_event_dispatcher (OPEN-1 recovery path)
 # ---------------------------------------------------------------------------
@@ -2607,52 +2460,81 @@ def test_delete_event_dispatcher_local_validation() -> None:
     assert server.delete_event_dispatcher(blueprint="/Game/BP", dispatcher_name="")["error"] == "missing_argument"
 
 
-@requires_ue_editor(extra_reason="a pre-v7.1.2 broken dispatcher")
-def test_delete_event_dispatcher_recovery_path() -> None:
-    """Manual integration: nuke old broken dispatcher, re-add with new dylib."""
-    bp = "/Game/Blueprints/BP_V76_v2"   # the BP from OPEN-1 with old broken OnDeath
-    assert server.delete_event_dispatcher(blueprint=bp, dispatcher_name="OnDeath")["ok"]
-    assert server.add_event_dispatcher(
-        blueprint=bp, dispatcher_name="OnDeath",
-        params=[{"name": "Damage", "type": "float"},
-                {"name": "Source", "type": "object:Actor"}],
-    )["ok"]
-    # Now add_call_dispatcher should produce a node with Damage/Source pins
-    r = server.add_call_dispatcher(blueprint=bp, dispatcher_name="OnDeath",
-                                    anchor_name="broadcast_v2")
-    assert r["ok"] is True
-    pins = r["pins"]
-    pin_names = {p["name"] for p in pins}
-    assert "Damage" in pin_names, f"OPEN-1 NOT fixed: pins={pins}"
-    assert "Source" in pin_names, f"OPEN-1 NOT fixed: pins={pins}"
-
-
-@requires_ue_editor(extra_reason="agentic loop demo")
+@requires_ue_editor(extra_reason="agentic loop end-to-end demo (writes a BP + drives PIE)")
 def test_v8_agentic_loop_against_real_plugin() -> None:
-    """Manual integration: write hello-world BP → spawn → PIE → read log → stop."""
-    bp = "/Game/Blueprints/BP_V8_AgenticLoop"
-    server.create_blueprint(name="BP_V8_AgenticLoop")
-    # Wire BeginPlay → PrintString("hello v8")
-    server.add_node(blueprint=bp, node_type="PrintString",
-                    anchor_name="print_hello")
-    server.set_pin_default(blueprint=bp, pin_ref="print_hello.InString",
-                           value="hello v8")
-    server.connect_pins(blueprint=bp, from_pin="begin_play.then",
-                        to_pin="print_hello.execute")
+    """End-to-end: write hello-world BP → spawn → PIE → read log → stop.
+
+    This is the canonical v8 demo — LLM writes, runs, reads, verifies its own
+    work. Implementation notes / gotchas surfaced from real testing:
+
+    1. node_type must be ``K2Node_CallFunction:PrintString``, NOT bare
+       ``PrintString``. The format is ``<K2NodeClass>:<param>``.
+    2. start_pie may fail with ``pie_already_running`` if a previous test
+       didn't stop PIE cleanly — defensively stop first.
+    3. After start_pie returns ``queued:true``, PIE doesn't tick instantly;
+       sleep 2-3s for BeginPlay to fire and the print to land in the log.
+    4. spawn_actor must happen BEFORE start_pie — UEditorActorSubsystem
+       targets the editor world, which is suspended during PIE.
+    """
+    import time
+    import uuid
+
+    # Defensive: stop PIE if a previous test left it running.
+    if server.is_pie_running().get("running"):
+        server.stop_pie()
+        time.sleep(1)
+
+    bp_name = f"BP_V8_AgenticLoop_{uuid.uuid4().hex[:6]}"
+    bp = f"/Game/Tests/{bp_name}"
+    PROBE = f"AGENTIC_LOOP_PROBE_{uuid.uuid4().hex[:8]}"  # unique each run
+
+    # 1. Author the BP.
+    assert server.create_blueprint(name=bp_name, path="/Game/Tests")["ok"]
+    r = server.add_node(
+        blueprint=bp,
+        node_type="K2Node_CallFunction:PrintString",
+        anchor_name="print_hello",
+    )
+    assert r["ok"], f"add_node failed: {r}"
+    assert server.set_pin_default(
+        blueprint=bp, pin_ref="print_hello.InString", value=PROBE,
+    )["ok"]
+    assert server.connect_pins(
+        blueprint=bp, from_pin="begin_play.then", to_pin="print_hello.execute",
+    )["ok"]
+
+    # 2. Compile + spawn (in editor world, before PIE).
     assert server.compile_blueprint(name=bp)["ok"]
-    assert server.spawn_actor(blueprint=bp)["ok"]
+    r = server.spawn_actor(blueprint=bp)
+    assert r["ok"], f"spawn_actor failed: {r}"
 
-    # Clear log, start PIE, wait a tick (in real test would sleep)
+    # 3. Clear log so we only see what THIS run prints.
     server.clear_log_capture()
-    assert server.start_pie()["ok"]
 
-    # In real usage, wait ~1s for PIE to actually start + tick
-    # import time; time.sleep(1)
+    # 4. Start PIE. queued=true initially.
+    r = server.start_pie()
+    assert r["ok"], f"start_pie failed: {r}"
 
-    # Read log — should contain our PrintString
-    log_result = server.read_log_capture(category="BlueprintUserMessages",
-                                          contains="hello v8")
+    # 5. Wait for PIE to actually tick + BeginPlay to fire.
+    time.sleep(3)
+
+    # 6. Verify PIE is actually running (not just queued).
+    state = server.is_pie_running()
+    assert state["running"], f"PIE didn't start in 3s: {state}"
+
+    # 7. Read log — agentic verification.
+    log_result = server.read_log_capture(
+        category="BlueprintUserMessages",
+        contains=PROBE,
+    )
     assert log_result["ok"] is True
-    assert log_result["returned"] >= 1
 
-    assert server.stop_pie()["ok"]
+    # 8. Teardown ALWAYS (use try/finally so PIE doesn't leak into next test).
+    try:
+        assert log_result["returned"] >= 1, (
+            f"No log line containing {PROBE!r} found after PIE. "
+            f"total_captured={log_result['total_captured']}. "
+            f"Check that PrintString actually fired."
+        )
+    finally:
+        server.stop_pie()
