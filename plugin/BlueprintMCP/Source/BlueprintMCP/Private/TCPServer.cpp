@@ -3593,12 +3593,15 @@ namespace
 
         const FName DispatcherFName(*DispatcherName);
 
-        // Name uniqueness across delegate signature graphs (BP-defined dispatchers)
+        // Uniqueness: against existing signature graphs AND existing member variables
         for (UEdGraph* G : Blueprint->DelegateSignatureGraphs)
         {
             if (G != nullptr && G->GetFName() == DispatcherFName)
                 return JsonError(CmdName, TEXT("dispatcher_exists"), DispatcherName);
         }
+        if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, DispatcherFName) != INDEX_NONE)
+            return JsonError(CmdName, TEXT("variable_name_collision"),
+                FString::Printf(TEXT("Member variable '%s' already exists"), *DispatcherName));
 
         // Pre-validate param types BEFORE creating the graph
         if (ParamNames.Num() != ParamTypes.Num())
@@ -3615,39 +3618,73 @@ namespace
             ResolvedParamTypes.Add(PinType);
         }
 
-        // Create the delegate-signature graph
+        const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+        if (K2Schema == nullptr)
+            return JsonError(CmdName, TEXT("no_k2_schema"));
+
+        // ----- v7.1.2 BUG-1 fix — mirror FBlueprintEditor::OnAddNewDelegate flow -----
+        // The PREVIOUS implementation built only the signature graph; that's NOT enough.
+        // The compiler needs an actual member variable of type PC_MCDelegate to generate
+        // an FMulticastDelegateProperty on the GeneratedClass. Without that property,
+        // K2Node_CallDelegate.AllocateDefaultPins can't resolve the signature → no param pins.
+
+        Blueprint->Modify();
+
+        // (1) Add the member variable of multicast-delegate type. This is what becomes
+        //     the FMulticastDelegateProperty on the BP's GeneratedClass at compile time.
+        FEdGraphPinType DelegateType;
+        DelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+        if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, DispatcherFName, DelegateType))
+            return JsonError(CmdName, TEXT("add_member_variable_failed"), DispatcherName);
+
+        // (2) Create the signature graph
         UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
             Blueprint, DispatcherFName,
             UEdGraph::StaticClass(),
             UEdGraphSchema_K2::StaticClass());
         if (NewGraph == nullptr)
+        {
+            FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, DispatcherFName);
             return JsonError(CmdName, TEXT("graph_create_failed"), DispatcherName);
+        }
+        NewGraph->bEditable = false;
+
+        // (3) Schema-driven graph setup: creates FunctionEntry/FunctionResult, sets flags.
+        K2Schema->CreateDefaultNodesForGraph(*NewGraph);
+        K2Schema->CreateFunctionGraphTerminators(*NewGraph, (UClass*)nullptr);
+        K2Schema->AddExtraFunctionFlags(NewGraph, (FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public));
+        K2Schema->MarkFunctionEntryAsEditable(NewGraph, true);
+
+        // (4) Register the signature graph with the BP
         Blueprint->DelegateSignatureGraphs.Add(NewGraph);
 
-        // Add a FunctionEntry node — its user-defined output pins are the delegate's params
-        UK2Node_FunctionEntry* EntryNode = NewObject<UK2Node_FunctionEntry>(NewGraph);
-        EntryNode->SetFlags(RF_Transactional);
-        EntryNode->FunctionReference.SetSelfMember(DispatcherFName);
-        EntryNode->AddExtraFlags(FUNC_BlueprintCallable | FUNC_Public);
-        NewGraph->AddNode(EntryNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
-        EntryNode->CreateNewGuid();
-        EntryNode->PostPlacedNewNode();
-        EntryNode->AllocateDefaultPins();
-
-        // Params: output pins on the entry node (delegate consumers receive these as outputs)
+        // (5) Locate the FunctionEntry node created in step 3 and add our user-defined params
+        UK2Node_FunctionEntry* EntryNode = nullptr;
+        for (UEdGraphNode* N : NewGraph->Nodes)
+        {
+            if (UK2Node_FunctionEntry* FE = Cast<UK2Node_FunctionEntry>(N))
+            {
+                EntryNode = FE;
+                break;
+            }
+        }
+        if (EntryNode == nullptr)
+        {
+            // CreateFunctionGraphTerminators normally creates an entry; if missing we can't add params.
+            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+            const bool bSavedPartial = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+            return JsonError(CmdName, TEXT("no_function_entry"),
+                FString::Printf(TEXT("CreateFunctionGraphTerminators didn't create a FunctionEntry (saved=%d)"),
+                    bSavedPartial ? 1 : 0));
+        }
         for (int32 i = 0; i < ParamNames.Num(); ++i)
         {
-            EntryNode->CreateUserDefinedPin(FName(*ParamNames[i]), ResolvedParamTypes[i], EGPD_Output, /*bUseUniqueName*/ false);
+            EntryNode->CreateUserDefinedPin(FName(*ParamNames[i]), ResolvedParamTypes[i],
+                EGPD_Output, /*bUseUniqueName*/ false);
         }
 
+        // (6) Mark + compile so GeneratedClass gets the FMulticastDelegateProperty + linked SignatureFunction
         FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
-
-        // BUG-1 fix: K2Node_CallDelegate's AllocateDefaultPins resolves the multicast
-        // delegate signature via FMemberReference::ResolveMember on the BP's GeneratedClass.
-        // Without an actual compile, GeneratedClass lacks the new FMulticastDelegateProperty,
-        // so signature resolution fails and call_dispatcher node gets no parameter pins.
-        // Compile here so subsequent add_call_dispatcher / add_bind_dispatcher have a
-        // valid delegate signature to introspect.
         FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None);
 
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
