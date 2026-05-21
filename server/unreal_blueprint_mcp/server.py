@@ -2119,6 +2119,201 @@ def create_anim_blueprint(
     })
 
 
+# ---------------------------------------------------------------------------
+# v9.2.0 — AnimGraph state-machine tools
+# ---------------------------------------------------------------------------
+# Four tools that take ``create_anim_blueprint`` (v9.0.0) from an empty asset
+# to a fully-wired skeletal animation FSM:
+#
+#   1. ``add_anim_state_machine`` — spawn a state-machine node in the main
+#      AnimGraph. UE auto-creates the interior ``EditorStateMachineGraph``.
+#   2. ``add_anim_state`` — spawn a state inside a state machine. UE
+#      auto-creates the interior ``BoundGraph`` (a mini AnimGraph for the
+#      state's pose).
+#   3. ``add_anim_transition`` — wire one state to another via a
+#      ``UAnimStateTransitionNode``. UE provides ``CreateConnections(From,To)``
+#      as the canonical API.
+#   4. ``set_anim_state_pose`` — populate a state's interior pose by binding
+#      it to a ``UAnimSequence``. Validates skeleton compatibility.
+#
+# Naming: state machines + states are addressed by user-given names (stored
+# as ``NodeComment``), consistent with the AnchorName convention used since v0.
+
+
+@mcp.tool()
+def add_anim_state_machine(
+    blueprint: str,
+    name: str,
+    pos_x: int = 0,
+    pos_y: int = 0,
+) -> dict[str, Any]:
+    """Add a state-machine node to an AnimBlueprint's AnimGraph — v9.2.0.
+
+    Spawns a ``UAnimGraphNode_StateMachine`` in the AnimBlueprint's main
+    AnimGraph. UE's ``PostPlacedNewNode`` automatically creates the interior
+    ``EditorStateMachineGraph`` where states + transitions live. The name
+    is stored as ``NodeComment`` so subsequent calls (``add_anim_state``,
+    ``add_anim_transition``, ``set_anim_state_pose``) can address it.
+
+    Args:
+        blueprint: Path to the AnimBlueprint (e.g. ``"/Game/Blueprints/ABP_X"``).
+        name: User-chosen state-machine name. Must be unique within the
+            AnimGraph. Used as anchor for follow-up calls.
+        pos_x: Node X position in the graph. Default 0.
+        pos_y: Node Y position in the graph. Default 0.
+
+    Returns:
+        ``{"ok": True, "state_machine": "...", "interior_graph": "...",
+            "node_guid": "...", "saved": True}``
+
+    Common errors:
+        anim_blueprint_not_found — blueprint path doesn't resolve to a UAnimBlueprint
+        no_anim_graph            — AnimBP has no FunctionGraph named "AnimGraph"
+        state_machine_exists     — name already used
+    """
+    if not blueprint or not name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_anim_state_machine",
+        "blueprint": blueprint,
+        "name": name,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+    })
+
+
+@mcp.tool()
+def add_anim_state(
+    blueprint: str,
+    state_machine: str,
+    name: str,
+    pos_x: int = 0,
+    pos_y: int = 0,
+) -> dict[str, Any]:
+    """Add a state to a state-machine's interior graph — v9.2.0.
+
+    Spawns a ``UAnimStateNode`` inside the named state machine's
+    ``EditorStateMachineGraph``. UE's ``PostPlacedNewNode`` automatically
+    creates the state's interior ``BoundGraph`` (a mini AnimGraph for the
+    pose). Wire a sequence into it via ``set_anim_state_pose``.
+
+    Args:
+        blueprint: Path to the AnimBlueprint.
+        state_machine: Name (anchor) of the parent state machine, as set by
+            ``add_anim_state_machine``.
+        name: User-chosen state name. Must be unique within the state machine.
+        pos_x: Node X position. Default 0.
+        pos_y: Node Y position. Default 0.
+
+    Returns:
+        ``{"ok": True, "state": "...", "state_machine": "...",
+            "bound_graph": "...", "node_guid": "...", "saved": True}``
+
+    Common errors:
+        anim_blueprint_not_found
+        no_anim_graph
+        state_machine_not_found  — no state machine with that NodeComment
+        no_state_machine_graph   — state machine exists but has no interior graph (unusual)
+        state_exists             — name already used in this state machine
+    """
+    if not blueprint or not state_machine or not name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_anim_state",
+        "blueprint": blueprint,
+        "state_machine": state_machine,
+        "name": name,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+    })
+
+
+@mcp.tool()
+def add_anim_transition(
+    blueprint: str,
+    state_machine: str,
+    from_state: str,
+    to_state: str,
+) -> dict[str, Any]:
+    """Wire a transition between two states — v9.2.0.
+
+    Spawns a ``UAnimStateTransitionNode`` and calls the canonical
+    ``CreateConnections(From, To)`` API to link two ``UAnimStateNode``s.
+    The transition rule itself (a bool expression) lives in the transition's
+    auto-created ``BoundGraph`` — populate it manually in-editor for now,
+    or accept the default (always-fire) rule.
+
+    Args:
+        blueprint: Path to the AnimBlueprint.
+        state_machine: Name (anchor) of the parent state machine.
+        from_state: Source state name (anchor).
+        to_state: Destination state name (anchor).
+
+    Returns:
+        ``{"ok": True, "from_state": "...", "to_state": "...",
+            "state_machine": "...", "node_guid": "...", "saved": True}``
+
+    Common errors:
+        anim_blueprint_not_found
+        state_machine_not_found
+        from_state_not_found
+        to_state_not_found
+    """
+    if not blueprint or not state_machine or not from_state or not to_state:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_anim_transition",
+        "blueprint": blueprint,
+        "state_machine": state_machine,
+        "from_state": from_state,
+        "to_state": to_state,
+    })
+
+
+@mcp.tool()
+def set_anim_state_pose(
+    blueprint: str,
+    state_machine: str,
+    state: str,
+    sequence: str,
+) -> dict[str, Any]:
+    """Bind a state's pose to an animation sequence — v9.2.0.
+
+    Loads the ``UAnimSequence`` at ``sequence``, validates its skeleton
+    matches the AnimBlueprint's ``TargetSkeleton``, then finds or creates a
+    ``UAnimGraphNode_SequencePlayer`` in the state's interior ``BoundGraph``
+    and wires its output pose pin to the state's pose-sink pin (via
+    ``GetPoseSinkPinInsideState``).
+
+    Args:
+        blueprint: Path to the AnimBlueprint.
+        state_machine: Name (anchor) of the parent state machine.
+        state: Name (anchor) of the state to populate.
+        sequence: Path to the ``UAnimSequence`` asset.
+
+    Returns:
+        ``{"ok": True, "state": "...", "state_machine": "...",
+            "sequence": "...", "wired": True, "saved": True}``
+
+    Common errors:
+        anim_blueprint_not_found
+        state_machine_not_found
+        state_not_found
+        no_bound_graph        — state exists but has no interior BoundGraph (unusual)
+        sequence_not_found    — path doesn't resolve to a UAnimSequence
+        skeleton_mismatch     — sequence and AnimBP have different skeletons
+    """
+    if not blueprint or not state_machine or not state or not sequence:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_anim_state_pose",
+        "blueprint": blueprint,
+        "state_machine": state_machine,
+        "state": state,
+        "sequence": sequence,
+    })
+
+
 @mcp.tool()
 def create_blueprint(
     name: str,

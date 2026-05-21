@@ -2680,3 +2680,305 @@ def test_v8_agentic_loop_against_real_plugin() -> None:
         )
     finally:
         server.stop_pie()
+
+
+# ---------------------------------------------------------------------------
+# v9.2.0 — AnimGraph state-machine tools
+# ---------------------------------------------------------------------------
+
+
+def test_add_anim_state_machine_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_anim_state_machine","state_machine":"Locomotion",'
+        b'"interior_graph":"Locomotion","node_guid":"AAAA-BBBB","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_anim_state_machine(
+            blueprint="/Game/Blueprints/ABP_X",
+            name="Locomotion",
+            pos_x=100,
+            pos_y=200,
+        )
+    assert r["ok"] is True
+    assert r["state_machine"] == "Locomotion"
+    assert r["saved"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_anim_state_machine",
+        "blueprint": "/Game/Blueprints/ABP_X",
+        "name": "Locomotion",
+        "pos_x": 100,
+        "pos_y": 200,
+    }
+
+
+def test_add_anim_state_machine_already_exists() -> None:
+    response = (
+        b'{"ok":false,"command":"add_anim_state_machine","error":"state_machine_exists",'
+        b'"detail":"Locomotion"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_anim_state_machine(blueprint="/Game/X", name="Locomotion")
+    assert r["ok"] is False
+    assert r["error"] == "state_machine_exists"
+
+
+def test_add_anim_state_machine_local_validation() -> None:
+    assert server.add_anim_state_machine(blueprint="", name="X")["error"] == "missing_argument"
+    assert server.add_anim_state_machine(blueprint="/Game/X", name="")["error"] == "missing_argument"
+
+
+def test_add_anim_state_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_anim_state","state":"Idle","state_machine":"Locomotion",'
+        b'"bound_graph":"Idle","node_guid":"CCCC-DDDD","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_anim_state(
+            blueprint="/Game/Blueprints/ABP_X",
+            state_machine="Locomotion",
+            name="Idle",
+            pos_x=-100,
+            pos_y=0,
+        )
+    assert r["ok"] is True
+    assert r["state"] == "Idle"
+    assert r["state_machine"] == "Locomotion"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_anim_state",
+        "blueprint": "/Game/Blueprints/ABP_X",
+        "state_machine": "Locomotion",
+        "name": "Idle",
+        "pos_x": -100,
+        "pos_y": 0,
+    }
+
+
+def test_add_anim_state_state_machine_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"add_anim_state","error":"state_machine_not_found",'
+        b'"detail":"Ghost"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_anim_state(
+            blueprint="/Game/X", state_machine="Ghost", name="Idle",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "state_machine_not_found"
+
+
+def test_add_anim_state_local_validation() -> None:
+    assert server.add_anim_state(blueprint="", state_machine="A", name="B")["error"] == "missing_argument"
+    assert server.add_anim_state(blueprint="/Game/X", state_machine="", name="B")["error"] == "missing_argument"
+    assert server.add_anim_state(blueprint="/Game/X", state_machine="A", name="")["error"] == "missing_argument"
+
+
+def test_add_anim_transition_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_anim_transition","from_state":"Idle","to_state":"Run",'
+        b'"state_machine":"Locomotion","node_guid":"EEEE-FFFF","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_anim_transition(
+            blueprint="/Game/Blueprints/ABP_X",
+            state_machine="Locomotion",
+            from_state="Idle",
+            to_state="Run",
+        )
+    assert r["ok"] is True
+    assert r["from_state"] == "Idle"
+    assert r["to_state"] == "Run"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_anim_transition",
+        "blueprint": "/Game/Blueprints/ABP_X",
+        "state_machine": "Locomotion",
+        "from_state": "Idle",
+        "to_state": "Run",
+    }
+
+
+def test_add_anim_transition_from_state_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"add_anim_transition","error":"from_state_not_found",'
+        b'"detail":"Ghost"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_anim_transition(
+            blueprint="/Game/X", state_machine="L", from_state="Ghost", to_state="Run",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "from_state_not_found"
+
+
+def test_add_anim_transition_local_validation() -> None:
+    assert server.add_anim_transition(blueprint="", state_machine="L", from_state="A", to_state="B")["error"] == "missing_argument"
+    assert server.add_anim_transition(blueprint="/G/X", state_machine="", from_state="A", to_state="B")["error"] == "missing_argument"
+    assert server.add_anim_transition(blueprint="/G/X", state_machine="L", from_state="", to_state="B")["error"] == "missing_argument"
+    assert server.add_anim_transition(blueprint="/G/X", state_machine="L", from_state="A", to_state="")["error"] == "missing_argument"
+
+
+def test_set_anim_state_pose_success() -> None:
+    response = (
+        b'{"ok":true,"command":"set_anim_state_pose","state":"Idle","state_machine":"Locomotion",'
+        b'"sequence":"/Game/Anims/Idle_Loop","wired":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_anim_state_pose(
+            blueprint="/Game/Blueprints/ABP_X",
+            state_machine="Locomotion",
+            state="Idle",
+            sequence="/Game/Anims/Idle_Loop",
+        )
+    assert r["ok"] is True
+    assert r["wired"] is True
+    assert r["sequence"] == "/Game/Anims/Idle_Loop"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_anim_state_pose",
+        "blueprint": "/Game/Blueprints/ABP_X",
+        "state_machine": "Locomotion",
+        "state": "Idle",
+        "sequence": "/Game/Anims/Idle_Loop",
+    }
+
+
+def test_set_anim_state_pose_skeleton_mismatch() -> None:
+    response = (
+        b'{"ok":false,"command":"set_anim_state_pose","error":"skeleton_mismatch",'
+        b'"detail":"Sequence skeleton=/Game/A, AnimBP skeleton=/Game/B"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_anim_state_pose(
+            blueprint="/Game/X", state_machine="L", state="Idle", sequence="/Game/A",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "skeleton_mismatch"
+
+
+def test_set_anim_state_pose_sequence_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"set_anim_state_pose","error":"sequence_not_found",'
+        b'"detail":"/Game/NoSeq"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_anim_state_pose(
+            blueprint="/Game/X", state_machine="L", state="Idle", sequence="/Game/NoSeq",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "sequence_not_found"
+
+
+def test_set_anim_state_pose_local_validation() -> None:
+    assert server.set_anim_state_pose(blueprint="", state_machine="L", state="S", sequence="Q")["error"] == "missing_argument"
+    assert server.set_anim_state_pose(blueprint="/G/X", state_machine="", state="S", sequence="Q")["error"] == "missing_argument"
+    assert server.set_anim_state_pose(blueprint="/G/X", state_machine="L", state="", sequence="Q")["error"] == "missing_argument"
+    assert server.set_anim_state_pose(blueprint="/G/X", state_machine="L", state="S", sequence="")["error"] == "missing_argument"
+
+
+@requires_ue_editor(extra_reason="v9.2.0 AnimGraph state-machine end-to-end")
+def test_v9_2_anim_state_machine_against_real_plugin() -> None:
+    """End-to-end: AnimBP → state machine → 2 states → transition → sequence binding.
+
+    Builds a minimal 2-state FSM (Idle ⇄ Run) and verifies each step. The
+    test is robust to missing animation sequences — it probes a list of
+    candidate sequence paths and skips the ``set_anim_state_pose`` step if
+    none exist (still asserts the prior state-machine + state + transition
+    calls).
+    """
+    import uuid
+
+    # Step 1: Find a skeleton (same probe as the v9.0.0 test).
+    candidate_skeletons = [
+        "/Game/FirstPersonArms/Character/Mesh/SK_Mannequin_Arms_Skeleton",
+        "/Game/Characters/Mannequins/Meshes/SK_Mannequin",
+        "/Game/Mannequin/Mesh/UE4_Mannequin_Skeleton",
+    ]
+    skeleton = None
+    abp_name = f"ABP_V92_FSM_{uuid.uuid4().hex[:8]}"
+    for candidate in candidate_skeletons:
+        r = server.create_anim_blueprint(
+            name=abp_name, skeleton=candidate, path="/Game/Tests",
+        )
+        if r["ok"]:
+            skeleton = candidate
+            break
+    assert skeleton is not None, (
+        "No skeleton resolved. Run the v9.0.0 test first to debug."
+    )
+    abp_path = f"/Game/Tests/{abp_name}"
+
+    # Step 2: Add a state machine.
+    r = server.add_anim_state_machine(blueprint=abp_path, name="Locomotion")
+    assert r["ok"] is True, f"add_anim_state_machine failed: {r}"
+    assert r["state_machine"] == "Locomotion"
+    assert r["saved"] is True
+
+    # Step 3: Add two states.
+    r = server.add_anim_state(
+        blueprint=abp_path, state_machine="Locomotion", name="Idle",
+        pos_x=-200, pos_y=0,
+    )
+    assert r["ok"] is True, f"add_anim_state Idle failed: {r}"
+    r = server.add_anim_state(
+        blueprint=abp_path, state_machine="Locomotion", name="Run",
+        pos_x=200, pos_y=0,
+    )
+    assert r["ok"] is True, f"add_anim_state Run failed: {r}"
+
+    # Step 4: Add a transition Idle → Run.
+    r = server.add_anim_transition(
+        blueprint=abp_path, state_machine="Locomotion",
+        from_state="Idle", to_state="Run",
+    )
+    assert r["ok"] is True, f"add_anim_transition failed: {r}"
+
+    # Step 5: (best-effort) Try to wire Idle to a sequence.
+    # Use list_assets to discover an AnimSequence on the same skeleton.
+    list_r = server.list_assets(asset_class="AnimSequence", max_results=50)
+    assert list_r["ok"] is True
+    sequences = list_r.get("assets", [])
+    if sequences:
+        # Try each until one's skeleton matches the AnimBP's skeleton.
+        # Without per-asset skeleton metadata we just attempt the first;
+        # skeleton_mismatch is a legitimate skip path.
+        for seq in sequences[:5]:
+            seq_path = seq["path"]
+            r = server.set_anim_state_pose(
+                blueprint=abp_path, state_machine="Locomotion",
+                state="Idle", sequence=seq_path,
+            )
+            if r["ok"]:
+                assert r["wired"] is True, (
+                    f"sequence loaded but pose not wired: {r}"
+                )
+                break
+        # If no sequences had matching skeleton, that's an acceptable skip.
+    # If no AnimSequences exist in the project, also acceptable —
+    # the structural FSM build passed.
+
+
+def test_ping_returns_plugin_version_9_2_0() -> None:
+    """v9.2.0: ping surfaces 9.2.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.2.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.2.0"

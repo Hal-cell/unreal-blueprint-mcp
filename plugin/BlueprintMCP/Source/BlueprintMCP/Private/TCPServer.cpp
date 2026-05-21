@@ -117,6 +117,14 @@
 #include "Animation/Skeleton.h"
 #include "Factories/AnimBlueprintFactory.h"
 
+// v9.2.0 — AnimGraph state machine authoring
+#include "AnimGraphNode_StateMachine.h"
+#include "AnimStateNode.h"
+#include "AnimStateTransitionNode.h"
+#include "AnimGraphNode_SequencePlayer.h"
+#include "AnimationStateMachineGraph.h"
+#include "Animation/AnimSequence.h"
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -3356,6 +3364,300 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.2.0 — AnimGraph state machine authoring =====
+    //
+    // Builds on v9.0.0's create_anim_blueprint. Provides:
+    //   add_anim_state_machine  — spawn UAnimGraphNode_StateMachine in main AnimGraph
+    //   add_anim_state          — spawn UAnimStateNode inside a state machine
+    //   add_anim_transition     — wire two states via UAnimStateTransitionNode
+    //   set_anim_state_pose     — set a state's interior pose to a sequence asset
+    //
+    // Naming convention: state machines and states are addressed by user-given
+    // names, stored as NodeComment (same anchor system as v0+).
+
+    /** Find the main AnimGraph in an AnimBlueprint. Named "AnimGraph" by convention. */
+    UEdGraph* FindAnimGraph(UAnimBlueprint* AnimBP)
+    {
+        if (AnimBP == nullptr) return nullptr;
+        for (UEdGraph* G : AnimBP->FunctionGraphs)
+        {
+            if (G != nullptr && G->GetFName() == FName(TEXT("AnimGraph")))
+                return G;
+        }
+        // Fallback: first function graph (some AnimBP variants name differently)
+        return AnimBP->FunctionGraphs.Num() > 0 ? AnimBP->FunctionGraphs[0] : nullptr;
+    }
+
+    /** Find an anim graph node by NodeComment in a graph. */
+    template<typename TNode>
+    TNode* FindAnimNodeByComment(UEdGraph* Graph, const FString& AnchorName)
+    {
+        if (Graph == nullptr) return nullptr;
+        for (UEdGraphNode* N : Graph->Nodes)
+        {
+            if (TNode* Cast = ::Cast<TNode>(N))
+            {
+                if (Cast->NodeComment.Equals(AnchorName, ESearchCase::CaseSensitive))
+                    return Cast;
+            }
+        }
+        return nullptr;
+    }
+
+    FString AddAnimStateMachineOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StateMachineName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_anim_state_machine");
+
+        UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+        if (AnimBP == nullptr)
+            return JsonError(CmdName, TEXT("anim_blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+        if (AnimGraph == nullptr)
+            return JsonError(CmdName, TEXT("no_anim_graph"), BlueprintPath);
+
+        if (FindAnimNodeByComment<UAnimGraphNode_StateMachine>(AnimGraph, StateMachineName) != nullptr)
+            return JsonError(CmdName, TEXT("state_machine_exists"), StateMachineName);
+
+        UAnimGraphNode_StateMachine* SMNode = NewObject<UAnimGraphNode_StateMachine>(AnimGraph);
+        SMNode->SetFlags(RF_Transactional);
+        SMNode->NodePosX = PosX;
+        SMNode->NodePosY = PosY;
+        SMNode->NodeComment = StateMachineName;
+        SMNode->bCommentBubbleVisible = true;
+
+        AnimGraph->AddNode(SMNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        SMNode->CreateNewGuid();
+        SMNode->PostPlacedNewNode();   // Critical: creates EditorStateMachineGraph + populates default schema nodes
+        SMNode->AllocateDefaultPins();
+
+        UAnimationStateMachineGraph* InteriorGraph = SMNode->EditorStateMachineGraph;
+        const FString InteriorGraphName = InteriorGraph != nullptr ? InteriorGraph->GetName() : FString();
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_anim_state_machine\",\"state_machine\":%s,\"interior_graph\":%s,\"node_guid\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(StateMachineName),
+            *EscapeJsonString(InteriorGraphName),
+            *EscapeJsonString(SMNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens)),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddAnimStateOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StateMachineName,
+        const FString& StateName,
+        int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_anim_state");
+
+        UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+        if (AnimBP == nullptr) return JsonError(CmdName, TEXT("anim_blueprint_not_found"), BlueprintPath);
+        UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+        if (AnimGraph == nullptr) return JsonError(CmdName, TEXT("no_anim_graph"), BlueprintPath);
+
+        UAnimGraphNode_StateMachine* SMNode = FindAnimNodeByComment<UAnimGraphNode_StateMachine>(AnimGraph, StateMachineName);
+        if (SMNode == nullptr)
+            return JsonError(CmdName, TEXT("state_machine_not_found"), StateMachineName);
+        UAnimationStateMachineGraph* SMGraph = SMNode->EditorStateMachineGraph;
+        if (SMGraph == nullptr)
+            return JsonError(CmdName, TEXT("no_state_machine_graph"), StateMachineName);
+
+        if (FindAnimNodeByComment<UAnimStateNode>(SMGraph, StateName) != nullptr)
+            return JsonError(CmdName, TEXT("state_exists"), StateName);
+
+        UAnimStateNode* StateNode = NewObject<UAnimStateNode>(SMGraph);
+        StateNode->SetFlags(RF_Transactional);
+        StateNode->NodePosX = PosX;
+        StateNode->NodePosY = PosY;
+        StateNode->NodeComment = StateName;
+        StateNode->bCommentBubbleVisible = true;
+
+        SMGraph->AddNode(StateNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        StateNode->CreateNewGuid();
+        StateNode->PostPlacedNewNode();   // Creates BoundGraph (interior animation graph) + default pose sink
+        StateNode->AllocateDefaultPins();
+
+        UEdGraph* BoundGraph = StateNode->GetBoundGraph();
+        const FString BoundGraphName = BoundGraph != nullptr ? BoundGraph->GetName() : FString();
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_anim_state\",\"state\":%s,\"state_machine\":%s,\"bound_graph\":%s,\"node_guid\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(StateName),
+            *EscapeJsonString(StateMachineName),
+            *EscapeJsonString(BoundGraphName),
+            *EscapeJsonString(StateNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens)),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddAnimTransitionOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StateMachineName,
+        const FString& FromStateName,
+        const FString& ToStateName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_anim_transition");
+
+        UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+        if (AnimBP == nullptr) return JsonError(CmdName, TEXT("anim_blueprint_not_found"), BlueprintPath);
+        UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+        if (AnimGraph == nullptr) return JsonError(CmdName, TEXT("no_anim_graph"), BlueprintPath);
+
+        UAnimGraphNode_StateMachine* SMNode = FindAnimNodeByComment<UAnimGraphNode_StateMachine>(AnimGraph, StateMachineName);
+        if (SMNode == nullptr)
+            return JsonError(CmdName, TEXT("state_machine_not_found"), StateMachineName);
+        UAnimationStateMachineGraph* SMGraph = SMNode->EditorStateMachineGraph;
+        if (SMGraph == nullptr)
+            return JsonError(CmdName, TEXT("no_state_machine_graph"), StateMachineName);
+
+        UAnimStateNode* FromState = FindAnimNodeByComment<UAnimStateNode>(SMGraph, FromStateName);
+        UAnimStateNode* ToState   = FindAnimNodeByComment<UAnimStateNode>(SMGraph, ToStateName);
+        if (FromState == nullptr)
+            return JsonError(CmdName, TEXT("from_state_not_found"), FromStateName);
+        if (ToState == nullptr)
+            return JsonError(CmdName, TEXT("to_state_not_found"), ToStateName);
+
+        // Spawn transition node + wire with the canonical CreateConnections API
+        UAnimStateTransitionNode* TransNode = NewObject<UAnimStateTransitionNode>(SMGraph);
+        TransNode->SetFlags(RF_Transactional);
+        // Position halfway between the two states for visual sanity
+        TransNode->NodePosX = (FromState->NodePosX + ToState->NodePosX) / 2;
+        TransNode->NodePosY = (FromState->NodePosY + ToState->NodePosY) / 2;
+        TransNode->bCommentBubbleVisible = false;
+
+        SMGraph->AddNode(TransNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        TransNode->CreateNewGuid();
+        TransNode->PostPlacedNewNode();   // Creates BoundGraph for the transition rule (a bool expression)
+        TransNode->AllocateDefaultPins();
+        // The canonical API: wires output of From + input of To via the transition node
+        TransNode->CreateConnections(FromState, ToState);
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_anim_transition\",\"from_state\":%s,\"to_state\":%s,\"state_machine\":%s,\"node_guid\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FromStateName),
+            *EscapeJsonString(ToStateName),
+            *EscapeJsonString(StateMachineName),
+            *EscapeJsonString(TransNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens)),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString SetAnimStatePoseOnGameThread(
+        const FString& BlueprintPath,
+        const FString& StateMachineName,
+        const FString& StateName,
+        const FString& SequencePath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_anim_state_pose");
+
+        UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+        if (AnimBP == nullptr) return JsonError(CmdName, TEXT("anim_blueprint_not_found"), BlueprintPath);
+        UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+        if (AnimGraph == nullptr) return JsonError(CmdName, TEXT("no_anim_graph"), BlueprintPath);
+        UAnimGraphNode_StateMachine* SMNode = FindAnimNodeByComment<UAnimGraphNode_StateMachine>(AnimGraph, StateMachineName);
+        if (SMNode == nullptr)
+            return JsonError(CmdName, TEXT("state_machine_not_found"), StateMachineName);
+        UAnimationStateMachineGraph* SMGraph = SMNode->EditorStateMachineGraph;
+        if (SMGraph == nullptr)
+            return JsonError(CmdName, TEXT("no_state_machine_graph"), StateMachineName);
+
+        UAnimStateNode* StateNode = FindAnimNodeByComment<UAnimStateNode>(SMGraph, StateName);
+        if (StateNode == nullptr)
+            return JsonError(CmdName, TEXT("state_not_found"), StateName);
+
+        UEdGraph* BoundGraph = StateNode->GetBoundGraph();
+        if (BoundGraph == nullptr)
+            return JsonError(CmdName, TEXT("no_bound_graph"), StateName);
+
+        // Validate sequence asset
+        UAnimSequence* Sequence = LoadObject<UAnimSequence>(nullptr, *SequencePath);
+        if (Sequence == nullptr)
+            return JsonError(CmdName, TEXT("sequence_not_found"), SequencePath);
+
+        // Skeleton compatibility check — sequence and AnimBP must share a skeleton
+        if (Sequence->GetSkeleton() != AnimBP->TargetSkeleton)
+        {
+            const FString SeqSkel = Sequence->GetSkeleton() ? Sequence->GetSkeleton()->GetPathName() : FString(TEXT("<null>"));
+            const FString BPSkel  = AnimBP->TargetSkeleton ? AnimBP->TargetSkeleton->GetPathName() : FString(TEXT("<null>"));
+            return JsonError(CmdName, TEXT("skeleton_mismatch"),
+                FString::Printf(TEXT("Sequence skeleton=%s, AnimBP skeleton=%s"), *SeqSkel, *BPSkel));
+        }
+
+        // Find or create a SequencePlayer node in the BoundGraph
+        UAnimGraphNode_SequencePlayer* PlayerNode = nullptr;
+        for (UEdGraphNode* N : BoundGraph->Nodes)
+        {
+            if (UAnimGraphNode_SequencePlayer* SP = Cast<UAnimGraphNode_SequencePlayer>(N))
+            {
+                PlayerNode = SP;
+                break;
+            }
+        }
+
+        if (PlayerNode == nullptr)
+        {
+            PlayerNode = NewObject<UAnimGraphNode_SequencePlayer>(BoundGraph);
+            PlayerNode->SetFlags(RF_Transactional);
+            PlayerNode->NodePosX = -300;
+            PlayerNode->NodePosY = 0;
+            BoundGraph->AddNode(PlayerNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+            PlayerNode->CreateNewGuid();
+            PlayerNode->PostPlacedNewNode();
+            PlayerNode->AllocateDefaultPins();
+        }
+
+        // Set the sequence via the node's anim node struct
+        PlayerNode->Node.SetSequence(Sequence);
+
+        // Wire SequencePlayer.Pose → state's pose sink
+        UEdGraphPin* SinkInputPin = StateNode->GetPoseSinkPinInsideState();
+        UEdGraphPin* PlayerPoseOut = nullptr;
+        for (UEdGraphPin* P : PlayerNode->Pins)
+        {
+            if (P->Direction == EGPD_Output && P->PinType.PinCategory == FName(TEXT("struct")))
+            {
+                // Pose pin is a struct (FPoseLink). Pick the first output struct pin.
+                PlayerPoseOut = P;
+                break;
+            }
+        }
+        bool bWired = false;
+        if (SinkInputPin != nullptr && PlayerPoseOut != nullptr)
+        {
+            const UEdGraphSchema* Schema = BoundGraph->GetSchema();
+            if (Schema != nullptr)
+            {
+                Schema->TryCreateConnection(PlayerPoseOut, SinkInputPin);
+                bWired = (PlayerPoseOut->LinkedTo.Num() > 0);
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_anim_state_pose\",\"state\":%s,\"state_machine\":%s,\"sequence\":%s,\"wired\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(StateName),
+            *EscapeJsonString(StateMachineName),
+            *EscapeJsonString(SequencePath),
+            bWired ? TEXT("true") : TEXT("false"),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     FString CreateBlueprintOnGameThread(const FString& Name, const FString& ParentClassStr, const FString& Path)
     {
         check(IsInGameThread());
@@ -4710,7 +5012,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.1.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.2.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -4860,6 +5162,105 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("create_anim_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.2.0 AnimGraph state-machine tools ---
+    // All four go through AsyncTask(GameThread, ...) — AnimGraph mutations touch
+    // UObject graphs and must run on the game thread.
+    if (Command.Equals(TEXT("add_anim_state_machine"), ESearchCase::IgnoreCase))
+    {
+        FString BlueprintPath, StateMachineName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), BlueprintPath) || BlueprintPath.IsEmpty())
+            return JsonError(TEXT("add_anim_state_machine"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("name"), StateMachineName) || StateMachineName.IsEmpty())
+            return JsonError(TEXT("add_anim_state_machine"), TEXT("missing_field"), TEXT("name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("pos_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("pos_y"), PosY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), BlueprintPath, StateMachineName, PosX, PosY]() mutable
+            {
+                Promise.SetValue(AddAnimStateMachineOnGameThread(BlueprintPath, StateMachineName, PosX, PosY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_anim_state_machine"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("add_anim_state"), ESearchCase::IgnoreCase))
+    {
+        FString BlueprintPath, StateMachineName, StateName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), BlueprintPath) || BlueprintPath.IsEmpty())
+            return JsonError(TEXT("add_anim_state"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("state_machine"), StateMachineName) || StateMachineName.IsEmpty())
+            return JsonError(TEXT("add_anim_state"), TEXT("missing_field"), TEXT("state_machine"));
+        if (!JsonObject->TryGetStringField(TEXT("name"), StateName) || StateName.IsEmpty())
+            return JsonError(TEXT("add_anim_state"), TEXT("missing_field"), TEXT("name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("pos_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("pos_y"), PosY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), BlueprintPath, StateMachineName, StateName, PosX, PosY]() mutable
+            {
+                Promise.SetValue(AddAnimStateOnGameThread(BlueprintPath, StateMachineName, StateName, PosX, PosY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_anim_state"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("add_anim_transition"), ESearchCase::IgnoreCase))
+    {
+        FString BlueprintPath, StateMachineName, FromStateName, ToStateName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), BlueprintPath) || BlueprintPath.IsEmpty())
+            return JsonError(TEXT("add_anim_transition"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("state_machine"), StateMachineName) || StateMachineName.IsEmpty())
+            return JsonError(TEXT("add_anim_transition"), TEXT("missing_field"), TEXT("state_machine"));
+        if (!JsonObject->TryGetStringField(TEXT("from_state"), FromStateName) || FromStateName.IsEmpty())
+            return JsonError(TEXT("add_anim_transition"), TEXT("missing_field"), TEXT("from_state"));
+        if (!JsonObject->TryGetStringField(TEXT("to_state"), ToStateName) || ToStateName.IsEmpty())
+            return JsonError(TEXT("add_anim_transition"), TEXT("missing_field"), TEXT("to_state"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), BlueprintPath, StateMachineName, FromStateName, ToStateName]() mutable
+            {
+                Promise.SetValue(AddAnimTransitionOnGameThread(BlueprintPath, StateMachineName, FromStateName, ToStateName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_anim_transition"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("set_anim_state_pose"), ESearchCase::IgnoreCase))
+    {
+        FString BlueprintPath, StateMachineName, StateName, SequencePath;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), BlueprintPath) || BlueprintPath.IsEmpty())
+            return JsonError(TEXT("set_anim_state_pose"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("state_machine"), StateMachineName) || StateMachineName.IsEmpty())
+            return JsonError(TEXT("set_anim_state_pose"), TEXT("missing_field"), TEXT("state_machine"));
+        if (!JsonObject->TryGetStringField(TEXT("state"), StateName) || StateName.IsEmpty())
+            return JsonError(TEXT("set_anim_state_pose"), TEXT("missing_field"), TEXT("state"));
+        if (!JsonObject->TryGetStringField(TEXT("sequence"), SequencePath) || SequencePath.IsEmpty())
+            return JsonError(TEXT("set_anim_state_pose"), TEXT("missing_field"), TEXT("sequence"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), BlueprintPath, StateMachineName, StateName, SequencePath]() mutable
+            {
+                Promise.SetValue(SetAnimStatePoseOnGameThread(BlueprintPath, StateMachineName, StateName, SequencePath));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_anim_state_pose"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

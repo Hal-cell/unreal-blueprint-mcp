@@ -38,6 +38,8 @@ public class BlueprintMCP : ModuleRules
             "InputBlueprintNodes",
             // v9.1.0: asset discovery (IAssetRegistry, FAssetData)
             "AssetRegistry",
+            // v9.2.0: AnimGraph node types (StateMachine, State, Transition, SequencePlayer)
+            "AnimGraph",
         });
     }
 }
