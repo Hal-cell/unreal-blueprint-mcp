@@ -3201,3 +3201,154 @@ def test_ping_returns_plugin_version_9_4_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.4.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.5.0 — silent dispatcher auto-migration (Python-only)
+# ---------------------------------------------------------------------------
+# These tools wrap migrate_dispatchers + list_blueprints — pure Python
+# composition, no plugin changes. plugin_version stays at 9.4.0.
+
+
+def test_auto_migrate_dispatchers_passes_recreate_true() -> None:
+    """auto_migrate_dispatchers is just migrate_dispatchers(recreate_ghosts=True)."""
+    response = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/BP",'
+        b'"migrated_count":0,"already_healthy_count":0,"orphan_variable_count":0,'
+        b'"ghosts_detected_count":1,"ghosts_recreated_count":1,'
+        b'"migrated":[],"already_healthy":[],"orphan_variables":[],'
+        b'"ghosts_detected":["OnDeath"],"ghosts_recreated":["OnDeath"],'
+        b'"recreate_ghosts_requested":true,"compiled":true,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.auto_migrate_dispatchers(blueprint="/Game/BP")
+    assert r["ok"] is True
+    assert r["ghosts_recreated_count"] == 1
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["recreate_ghosts"] is True
+
+
+def test_auto_migrate_all_dispatchers_walks_blueprints() -> None:
+    """Project-wide sweep: list_blueprints → per-BP migrate, aggregated totals."""
+    # Mock 2 separate _send_command responses:
+    # 1. list_blueprints — returns 2 BPs
+    # 2 & 3. migrate_dispatchers on each BP
+    list_response = (
+        b'{"ok":true,"command":"list_blueprints","folder":"/Game","asset_class":"Blueprint",'
+        b'"recursive":true,"count":2,"assets":['
+        b'{"name":"BP_A","path":"/Game/Tests/BP_A.BP_A","package_path":"/Game/Tests","class":"Blueprint"},'
+        b'{"name":"BP_B","path":"/Game/Tests/BP_B.BP_B","package_path":"/Game/Tests","class":"Blueprint"}'
+        b']}\n'
+    )
+    migrate_a = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/Tests/BP_A",'
+        b'"migrated_count":1,"already_healthy_count":0,"orphan_variable_count":0,'
+        b'"ghosts_detected_count":2,"ghosts_recreated_count":2,'
+        b'"migrated":["OnHit"],"already_healthy":[],"orphan_variables":[],'
+        b'"ghosts_detected":["OnDeath","OnSpawn"],"ghosts_recreated":["OnDeath","OnSpawn"],'
+        b'"recreate_ghosts_requested":true,"compiled":true,"saved":true}\n'
+    )
+    migrate_b = (
+        b'{"ok":true,"command":"migrate_dispatchers","blueprint":"/Game/Tests/BP_B",'
+        b'"migrated_count":0,"already_healthy_count":1,"orphan_variable_count":0,'
+        b'"ghosts_detected_count":0,"ghosts_recreated_count":0,'
+        b'"migrated":[],"already_healthy":["OnReady"],"orphan_variables":[],'
+        b'"ghosts_detected":[],"ghosts_recreated":[],'
+        b'"recreate_ghosts_requested":true,"compiled":false,"saved":false}\n'
+    )
+    responses = [list_response, migrate_a, migrate_b]
+
+    def fake_create_connection(*args, **kwargs):
+        return _fake_sock(responses.pop(0))
+
+    with mock.patch.object(socket, "create_connection", side_effect=fake_create_connection):
+        r = server.auto_migrate_all_dispatchers(folder="/Game")
+
+    assert r["ok"] is True
+    assert r["blueprint_count"] == 2
+    assert r["total_migrated"] == 1
+    assert r["total_ghosts_recreated"] == 2
+    assert r["total_ghosts_detected"] == 2
+    assert r["compiled_count"] == 1   # only BP_A actually changed
+    assert r["saved_count"] == 1
+    assert len(r["results"]) == 2
+    assert len(r["errors"]) == 0
+
+
+def test_auto_migrate_all_dispatchers_dry_run_omits_recreate() -> None:
+    """dry_run=True calls migrate_dispatchers without recreate_ghosts."""
+    sent_payloads: list[dict] = []
+
+    def patched_send(payload):
+        sent_payloads.append(payload)
+        if payload["command"] == "list_blueprints":
+            return {
+                "ok": True, "assets": [
+                    {"name": "BP_A", "path": "/Game/BP_A.BP_A", "package_path": "/Game", "class": "Blueprint"},
+                ],
+            }
+        return {
+            "ok": True, "migrated_count": 0, "ghosts_recreated_count": 0,
+            "orphan_variable_count": 0, "ghosts_detected_count": 1,
+            "compiled": False, "saved": False,
+        }
+
+    with mock.patch("unreal_blueprint_mcp.server._send_command", side_effect=patched_send):
+        r = server.auto_migrate_all_dispatchers(folder="/Game", dry_run=True)
+
+    assert r["ok"] is True
+    assert r["dry_run"] is True
+    # First call is list_blueprints, second is migrate_dispatchers without recreate
+    assert sent_payloads[1]["command"] == "migrate_dispatchers"
+    assert "recreate_ghosts" not in sent_payloads[1]
+
+
+def test_auto_migrate_all_dispatchers_collects_errors() -> None:
+    """A bad BP doesn't abort the sweep — it's logged in errors[]."""
+    def patched_send(payload):
+        if payload["command"] == "list_blueprints":
+            return {
+                "ok": True, "assets": [
+                    {"name": "BP_X", "path": "/Game/BP_X.BP_X", "package_path": "/Game", "class": "Blueprint"},
+                ],
+            }
+        return {"ok": False, "error": "blueprint_load_failed", "detail": "asset corrupted"}
+
+    with mock.patch("unreal_blueprint_mcp.server._send_command", side_effect=patched_send):
+        r = server.auto_migrate_all_dispatchers(folder="/Game")
+    assert r["ok"] is True
+    assert r["blueprint_count"] == 1
+    assert len(r["errors"]) == 1
+    assert r["errors"][0]["error"] == "blueprint_load_failed"
+    assert r["total_migrated"] == 0
+
+
+def test_auto_migrate_all_dispatchers_list_failure_propagates() -> None:
+    """If list_blueprints itself fails, return early."""
+    def patched_send(payload):
+        return {"ok": False, "error": "asset_registry_unavailable"}
+
+    with mock.patch("unreal_blueprint_mcp.server._send_command", side_effect=patched_send):
+        r = server.auto_migrate_all_dispatchers(folder="/Game")
+    assert r["ok"] is False
+    assert r["error"] == "list_blueprints_failed"
+
+
+@requires_ue_editor(extra_reason="v9.5.0 project-wide silent dispatcher migration")
+def test_v9_5_auto_migrate_all_dispatchers_against_real_plugin() -> None:
+    """Integration: sweep /Game/Tests for any legacy dispatchers. Idempotent."""
+    # Run once — should fix anything legacy that exists, or be a no-op on
+    # a healthy project.
+    r = server.auto_migrate_all_dispatchers(folder="/Game/Tests")
+    assert r["ok"] is True, f"auto_migrate_all_dispatchers failed: {r}"
+    assert "results" in r
+    assert "errors" in r
+
+    # Re-run — should now be a complete no-op (idempotent).
+    r2 = server.auto_migrate_all_dispatchers(folder="/Game/Tests")
+    assert r2["ok"] is True
+    # After first pass, no further changes should be needed
+    assert r2["total_migrated"] == 0
+    assert r2["total_ghosts_recreated"] == 0

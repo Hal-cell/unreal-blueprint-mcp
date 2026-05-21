@@ -635,6 +635,133 @@ def migrate_dispatchers(
     return _send_command(payload)
 
 
+# ---------------------------------------------------------------------------
+# v9.5.0 — silent dispatcher auto-migration (Python-only conveniences)
+# ---------------------------------------------------------------------------
+# These wrap the existing v8.1.0 ``migrate_dispatchers`` C++ machinery —
+# no plugin changes needed. They flip the default from "dry-run" to
+# "silently fix everything," and add a project-wide variant.
+
+
+@mcp.tool()
+def auto_migrate_dispatchers(blueprint: str) -> dict[str, Any]:
+    """Silent migration: fix ALL dispatcher damage modes in one call — v9.5.0.
+
+    Convenience alias for ``migrate_dispatchers(blueprint, recreate_ghosts=True)``.
+    Where the v8.1.0 default is "dry-run + report," this one actually
+    applies every fix:
+      - Mode 1 (graph w/o variable)        → back-fills the PC_MCDelegate variable
+      - Mode 2 (variable w/o graph)        → reported as orphan_variables (delete via delete_event_dispatcher)
+      - Mode 3 (ghost — both missing)      → recreates with empty signature
+
+    Idempotent — re-running on an already-healthy BP is a no-op
+    (``compiled=false``, ``saved=false``).
+
+    Args:
+        blueprint: BP asset path to fix.
+
+    Returns:
+        Same shape as ``migrate_dispatchers``. Most fields will be 0 /
+        empty arrays after the first successful run.
+    """
+    return migrate_dispatchers(blueprint=blueprint, recreate_ghosts=True)
+
+
+@mcp.tool()
+def auto_migrate_all_dispatchers(
+    folder: str = "/Game",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Project-wide silent dispatcher migration — v9.5.0.
+
+    Walks every Blueprint under ``folder`` (via ``list_blueprints``) and
+    runs ``auto_migrate_dispatchers`` on each. Returns a per-BP summary
+    plus aggregate totals. Designed for a one-shot "fix everything in
+    my project" command after upgrading the plugin.
+
+    Args:
+        folder: Root /Game-relative folder to scan. Default ``/Game``.
+        dry_run: If True, runs ``migrate_dispatchers`` in detect-only
+            mode (same as the v8.1.0 default) — useful to preview what
+            WOULD be changed. Default False (apply all fixes).
+
+    Returns:
+        ``{"ok": True,
+           "folder": "...",
+           "dry_run": bool,
+           "blueprint_count": N,
+           "total_migrated": N,         "total_ghosts_recreated": N,
+           "total_orphan_variables": N, "total_ghosts_detected": N,
+           "compiled_count": N,         "saved_count": N,
+           "results": [{"blueprint": "...", "migrated_count": N, ...}, ...],
+           "errors": [{"blueprint": "...", "error": "...", "detail": "..."}, ...]}``
+
+        ``results`` contains the full per-BP migrate_dispatchers response.
+        ``errors`` collects any per-BP failures so a single bad BP doesn't
+        abort the whole sweep.
+    """
+    blueprints_r = list_blueprints(folder=folder, max_results=10000)
+    if not blueprints_r.get("ok"):
+        return {
+            "ok": False,
+            "error": "list_blueprints_failed",
+            "detail": blueprints_r.get("error", "<unknown>"),
+        }
+
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    totals = {
+        "migrated": 0,
+        "ghosts_recreated": 0,
+        "orphan_variables": 0,
+        "ghosts_detected": 0,
+        "compiled": 0,
+        "saved": 0,
+    }
+
+    for asset in blueprints_r.get("assets", []):
+        # asset["path"] is the full /Game/.../Name.Name form; we want just
+        # the package path for migrate_dispatchers.
+        bp_path = asset["path"].split(".")[0]
+        r = (
+            migrate_dispatchers(blueprint=bp_path)
+            if dry_run
+            else auto_migrate_dispatchers(blueprint=bp_path)
+        )
+        if not r.get("ok"):
+            errors.append({
+                "blueprint": bp_path,
+                "error": r.get("error", "<unknown>"),
+                "detail": r.get("detail", ""),
+            })
+            continue
+        results.append(r)
+        totals["migrated"] += r.get("migrated_count", 0)
+        totals["ghosts_recreated"] += r.get("ghosts_recreated_count", 0)
+        totals["orphan_variables"] += r.get("orphan_variable_count", 0)
+        totals["ghosts_detected"] += r.get("ghosts_detected_count", 0)
+        if r.get("compiled"):
+            totals["compiled"] += 1
+        if r.get("saved"):
+            totals["saved"] += 1
+
+    return {
+        "ok": True,
+        "command": "auto_migrate_all_dispatchers",
+        "folder": folder,
+        "dry_run": dry_run,
+        "blueprint_count": len(blueprints_r.get("assets", [])),
+        "total_migrated": totals["migrated"],
+        "total_ghosts_recreated": totals["ghosts_recreated"],
+        "total_orphan_variables": totals["orphan_variables"],
+        "total_ghosts_detected": totals["ghosts_detected"],
+        "compiled_count": totals["compiled"],
+        "saved_count": totals["saved"],
+        "results": results,
+        "errors": errors,
+    }
+
+
 @mcp.tool()
 def delete_event_dispatcher(
     blueprint: str,
