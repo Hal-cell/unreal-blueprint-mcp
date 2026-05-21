@@ -1851,6 +1851,17 @@ namespace
         CastNode->PostPlacedNewNode();
         CastNode->AllocateDefaultPins();
 
+        // BUG-6 fix: UE generates the cast result pin name from the class display name
+        // (so "EnhancedInputLocalPlayerSubsystem" → "As Enhanced Input Local Player Subsystem"
+        // with spaces). add_cast already overrides this — apply the same normalization
+        // here so the wire_imc_subscribe-spawned cast is consistent.
+        if (UEdGraphPin* ResultPin = CastNode->GetCastResultPin())
+        {
+            const FString ConsistentName = FString::Printf(TEXT("As%s"), *EISubsystemClass->GetName());
+            ResultPin->PinName = FName(*ConsistentName);
+            ResultPin->PinFriendlyName = FText::FromString(ConsistentName);
+        }
+
         // --- Node 4: AddMappingContext ---
         UFunction* AddCtxFunc = EISubsystemClass->FindFunctionByName(FName("AddMappingContext"));
         if (!AddCtxFunc) return JsonError(TEXT("wire_imc_subscribe"), TEXT("addmappingcontext_missing"), TEXT(""));
@@ -1880,48 +1891,78 @@ namespace
 
         // --- Connect everything (v6.0.2 reroute: exec goes through Cast) ---
 
-        // v6.0.3 fix (P6): BeginPlay.then is single-output by K2 convention. If user has
-        // an existing BeginPlay chain (e.g. EnableInput), naive TryCreateConnection would
-        // sever it (CONNECT_RESPONSE_BREAK_OTHERS_A). Walk to the leaf of the existing
-        // .then chain and append our subscribe chain there instead of overwriting.
+        // v6.0.3 fix (P6) + BUG-5 fix (v7.1.1): BeginPlay.then is single-output by K2
+        // convention. If the user has an existing BeginPlay chain (e.g. EnableInput),
+        // naive TryCreateConnection would sever it (CONNECT_RESPONSE_BREAK_OTHERS_A).
+        //
+        // Walk strategy: try to find a leaf of the existing .then chain. If the walk
+        // fails to find one (e.g. a mid-chain node has no "then" pin), fall back to
+        // splice-mode: snapshot the original link, allow the overwrite, then rejoin
+        // the original next at the tail of our subscribe chain. Either way the user's
+        // chain is preserved.
+        UEdGraphPin* OriginalNext = (BeginPlayThen->LinkedTo.Num() > 0)
+            ? BeginPlayThen->LinkedTo[0] : nullptr;
         UEdGraphPin* InsertExecAfter = BeginPlayThen;
-        if (BeginPlayThen->LinkedTo.Num() > 0)
+        bool bWalkFoundLeaf = false;
+
+        if (OriginalNext != nullptr)
         {
-            // Walk the existing chain to find the tail
-            UEdGraphPin* CurrentLink = BeginPlayThen->LinkedTo[0];
+            UEdGraphPin* CurrentLink = OriginalNext;
             int32 SafetyCounter = 32;   // prevent infinite loop on circular graphs
             while (CurrentLink && SafetyCounter-- > 0)
             {
                 UEdGraphNode* CurrentNode = CurrentLink->GetOwningNode();
                 if (!CurrentNode) break;
-                UEdGraphPin* NextThen = CurrentNode->FindPin(FName("then"));
+                // Use canonical PN_Then constant (lowercase "then") instead of magic string
+                UEdGraphPin* NextThen = CurrentNode->FindPin(UEdGraphSchema_K2::PN_Then);
                 if (!NextThen)
                 {
-                    // Node has no .then (e.g. PrintString does have one — but some terminal nodes
-                    // don't). Fall back to attaching after this node by overwriting; better than
-                    // nothing.
+                    // Node has no .then pin — walk failed, splice-mode will recover below
                     break;
                 }
                 if (NextThen->LinkedTo.Num() == 0)
                 {
-                    // Found the leaf
+                    // Found the leaf — append-mode
                     InsertExecAfter = NextThen;
+                    bWalkFoundLeaf = true;
                     break;
                 }
                 CurrentLink = NextThen->LinkedTo[0];
             }
         }
 
-        // EXEC chain: <leaf-of-existing-chain>.then → Cast.execute → Cast.then → AddCtx.execute
+        // Decide insertion mode:
+        // - Append-mode (walk found leaf): InsertExecAfter is the tail of existing chain.
+        //   Just TryCreateConnection; the existing chain is upstream of us, untouched.
+        // - Splice-mode (no original chain OR walk failed): InsertExecAfter is BeginPlayThen.
+        //   TryCreateConnection will break BeginPlayThen → OriginalNext. We re-attach
+        //   OriginalNext at our tail (AddCtx.then) after the chain is built.
+        const bool bSpliceMode = !bWalkFoundLeaf && OriginalNext != nullptr;
+
+        // EXEC chain: <insert-point>.then → Cast.execute → Cast.then → AddCtx.execute
         if (UEdGraphPin* CastExec = CastNode->FindPin(FName("execute")))
         {
             Schema->TryCreateConnection(InsertExecAfter, CastExec);
         }
-        if (UEdGraphPin* CastThen = CastNode->FindPin(FName("then")))
+        if (UEdGraphPin* CastThen = CastNode->FindPin(UEdGraphSchema_K2::PN_Then))
         {
             if (UEdGraphPin* AddExec = AddCtxNode->FindPin(FName("execute")))
             {
                 Schema->TryCreateConnection(CastThen, AddExec);
+            }
+        }
+
+        // BUG-5 fix splice-mode recovery: walk failed to find a leaf, so the
+        // TryCreateConnection(BeginPlayThen, CastExec) above broke the original chain.
+        // Reattach OriginalNext at the end of our subscribe chain so user's chain is preserved.
+        if (bSpliceMode)
+        {
+            if (UEdGraphPin* AddCtxThen = AddCtxNode->FindPin(UEdGraphSchema_K2::PN_Then))
+            {
+                Schema->TryCreateConnection(AddCtxThen, OriginalNext);
+                UE_LOG(LogBlueprintMCP_TCP, Log,
+                    TEXT("wire_imc_subscribe: splice-mode — reconnected original chain (next pin owned by %s) at AddCtx.then"),
+                    OriginalNext->GetOwningNode() ? *OriginalNext->GetOwningNode()->GetName() : TEXT("?"));
             }
         }
 
@@ -2432,13 +2473,15 @@ namespace
         NewNode->PostPlacedNewNode();
         NewNode->AllocateDefaultPins();
 
-        // v6.0.2 P5 fix: UE generates the cast result pin name from class display name
-        // (with spaces) for classes carrying a DisplayName meta. Override to a stable
-        // identifier-safe form: "As<ClassName>" (no spaces), regardless of class.
+        // v6.0.2 P5 + v7.1.1 BUG-6 fix: UE generates the cast result pin name from the
+        // class display name (with spaces inserted between camelCase words). Override to
+        // a stable identifier-safe form: "As<ClassName>" (no spaces). Also override
+        // PinFriendlyName so ReconstructNode / re-display doesn't regenerate the spaced form.
         if (UEdGraphPin* ResultPin = NewNode->GetCastResultPin())
         {
             const FString ConsistentName = FString::Printf(TEXT("As%s"), *TargetClass->GetName());
             ResultPin->PinName = FName(*ConsistentName);
+            ResultPin->PinFriendlyName = FText::FromString(ConsistentName);
         }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
