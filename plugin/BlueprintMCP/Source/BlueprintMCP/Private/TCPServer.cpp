@@ -139,6 +139,9 @@
 // v9.6.0 — Headless CI commandlet shutdown flag
 #include "BlueprintMCPRunCommandlet.h"
 
+// v9.9.0 — FTSTicker for asynchronous key-hold / move-player scheduling
+#include "Containers/Ticker.h"
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -5387,9 +5390,9 @@ namespace
             bRequestQueued ? TEXT("true") : TEXT("false"));
     }
 
-    // ===== v8.3 — Input simulation =====
+    // ===== v8.3 — Input simulation (v9.9.0 extends with duration + player movement) =====
 
-    FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex)
+    FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex, float DurationSec)
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("pie_press_key");
@@ -5410,16 +5413,122 @@ namespace
             return JsonError(CmdName, TEXT("invalid_key"),
                 FString::Printf(TEXT("%s (try Space, P, LeftMouseButton, F1, ...)"), *KeyName));
 
-        // Press then release. FInputKeyParams takes (Key, EventType, Delta-as-FVector, bGamepad).
+        // v9.9.0 — if duration_sec <= 0, behave as before (press+release immediately).
+        // Otherwise press now, then schedule the release via FTSTicker after duration_sec.
+        // FTSTicker fires on the game thread, no blocking required.
         FInputKeyParams PressParams(Key, IE_Pressed, FVector::ZeroVector, /*bGamepad*/ false);
         PC->InputKey(PressParams);
-        FInputKeyParams ReleaseParams(Key, IE_Released, FVector::ZeroVector, /*bGamepad*/ false);
-        PC->InputKey(ReleaseParams);
+
+        const bool bHold = (DurationSec > 0.0f);
+        if (!bHold)
+        {
+            FInputKeyParams ReleaseParams(Key, IE_Released, FVector::ZeroVector, /*bGamepad*/ false);
+            PC->InputKey(ReleaseParams);
+        }
+        else
+        {
+            // Capture PC + Key by value. Use a weak ptr for PC so if PIE ends
+            // before the ticker fires we don't dereference a dangling pointer.
+            TWeakObjectPtr<APlayerController> WeakPC(PC);
+            const FKey CapturedKey = Key;
+            FTSTicker::GetCoreTicker().AddTicker(
+                FTickerDelegate::CreateLambda([WeakPC, CapturedKey](float /*Dt*/) -> bool
+                {
+                    if (APlayerController* PCAlive = WeakPC.Get())
+                    {
+                        FInputKeyParams RP(CapturedKey, IE_Released, FVector::ZeroVector, false);
+                        PCAlive->InputKey(RP);
+                    }
+                    return false;   // one-shot; do not re-fire
+                }),
+                DurationSec);
+        }
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"pie_press_key\",\"key\":%s,\"player_index\":%d}\n"),
+            TEXT("{\"ok\":true,\"command\":\"pie_press_key\",\"key\":%s,\"player_index\":%d,\"held\":%s,\"duration_sec\":%f}\n"),
             *EscapeJsonString(Key.ToString()),
-            PlayerIndex);
+            PlayerIndex,
+            bHold ? TEXT("true") : TEXT("false"),
+            DurationSec);
+    }
+
+    // v9.9.0 — pie_set_player_location: teleport the controlled pawn.
+    FString PieSetPlayerLocationOnGameThread(float X, float Y, float Z, int32 PlayerIndex)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("pie_set_player_location");
+        if (GEditor == nullptr || GEditor->PlayWorld == nullptr)
+            return JsonError(CmdName, TEXT("pie_not_running"));
+
+        APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIndex);
+        if (PC == nullptr)
+            return JsonError(CmdName, TEXT("no_player_controller"),
+                FString::Printf(TEXT("player_index=%d"), PlayerIndex));
+
+        APawn* Pawn = PC->GetPawn();
+        if (Pawn == nullptr)
+            return JsonError(CmdName, TEXT("no_pawn"), TEXT("PlayerController has no controlled Pawn"));
+
+        const FVector NewLoc(X, Y, Z);
+        const bool bOk = Pawn->SetActorLocation(NewLoc, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+
+        const FVector Cur = Pawn->GetActorLocation();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"pie_set_player_location\",\"player_index\":%d,\"requested\":[%f,%f,%f],\"actual\":[%f,%f,%f],\"moved\":%s}\n"),
+            PlayerIndex,
+            X, Y, Z,
+            Cur.X, Cur.Y, Cur.Z,
+            bOk ? TEXT("true") : TEXT("false"));
+    }
+
+    // v9.9.0 — pie_move_player: simulated continuous movement input over duration.
+    // Each game-thread tick we call Pawn->AddMovementInput(dir, scale). Uses
+    // an FTSTicker that re-arms each tick until duration_sec has elapsed.
+    FString PieMovePlayerOnGameThread(float DirX, float DirY, float DirZ, float DurationSec, float Scale, int32 PlayerIndex)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("pie_move_player");
+        if (GEditor == nullptr || GEditor->PlayWorld == nullptr)
+            return JsonError(CmdName, TEXT("pie_not_running"));
+        if (DurationSec <= 0.0f)
+            return JsonError(CmdName, TEXT("invalid_duration"), TEXT("duration_sec must be > 0"));
+
+        APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIndex);
+        if (PC == nullptr)
+            return JsonError(CmdName, TEXT("no_player_controller"),
+                FString::Printf(TEXT("player_index=%d"), PlayerIndex));
+        APawn* Pawn = PC->GetPawn();
+        if (Pawn == nullptr)
+            return JsonError(CmdName, TEXT("no_pawn"));
+
+        const FVector Direction(DirX, DirY, DirZ);
+        if (Direction.IsNearlyZero())
+            return JsonError(CmdName, TEXT("zero_direction"), TEXT("direction vector is (0,0,0)"));
+        const FVector NormDir = Direction.GetSafeNormal();
+
+        // Shared elapsed-time counter captured by the ticker.
+        TSharedRef<float, ESPMode::ThreadSafe> Elapsed = MakeShared<float, ESPMode::ThreadSafe>(0.0f);
+        TWeakObjectPtr<APawn> WeakPawn(Pawn);
+
+        FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateLambda([WeakPawn, NormDir, Scale, DurationSec, Elapsed](float Dt) -> bool
+            {
+                APawn* PawnAlive = WeakPawn.Get();
+                if (PawnAlive == nullptr) return false;  // pawn died → stop
+
+                PawnAlive->AddMovementInput(NormDir, Scale, /*bForce*/ false);
+
+                *Elapsed += Dt;
+                return (*Elapsed < DurationSec);   // true = keep ticking, false = stop
+            }),
+            0.0f);   // start ASAP
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"pie_move_player\",\"player_index\":%d,\"direction\":[%f,%f,%f],\"duration_sec\":%f,\"scale\":%f,\"queued\":true}\n"),
+            PlayerIndex,
+            NormDir.X, NormDir.Y, NormDir.Z,
+            DurationSec,
+            Scale);
     }
 
     // ===== v8.1 — log capture read/clear (no game-thread needed; capture is thread-safe) =====
@@ -5648,7 +5757,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.8.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.9.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -7309,7 +7418,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- v8.3 pie_press_key ---
+    // --- v8.3 pie_press_key (v9.9.0 extends with duration_sec) ---
     if (Command.Equals(TEXT("pie_press_key"), ESearchCase::IgnoreCase))
     {
         FString KeyName;
@@ -7317,16 +7426,75 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             return JsonError(TEXT("pie_press_key"), TEXT("missing_field"), TEXT("key"));
         int32 PlayerIndex = 0;
         JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+        double DurationSec = 0.0;
+        JsonObject->TryGetNumberField(TEXT("duration_sec"), DurationSec);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), KeyName, PlayerIndex]() mutable
+            [Promise = MoveTemp(Promise), KeyName, PlayerIndex, DurationSec]() mutable
             {
-                Promise.SetValue(PiePressKeyOnGameThread(KeyName, PlayerIndex));
+                Promise.SetValue(PiePressKeyOnGameThread(KeyName, PlayerIndex, static_cast<float>(DurationSec)));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("pie_press_key"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.9.0 pie_set_player_location ---
+    if (Command.Equals(TEXT("pie_set_player_location"), ESearchCase::IgnoreCase))
+    {
+        const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
+        if (!JsonObject->TryGetArrayField(TEXT("location"), LocArr) || LocArr->Num() < 3)
+            return JsonError(TEXT("pie_set_player_location"), TEXT("missing_field"),
+                TEXT("location must be [X,Y,Z]"));
+        const double X = (*LocArr)[0]->AsNumber();
+        const double Y = (*LocArr)[1]->AsNumber();
+        const double Z = (*LocArr)[2]->AsNumber();
+        int32 PlayerIndex = 0;
+        JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), X, Y, Z, PlayerIndex]() mutable
+            {
+                Promise.SetValue(PieSetPlayerLocationOnGameThread(
+                    static_cast<float>(X), static_cast<float>(Y), static_cast<float>(Z), PlayerIndex));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("pie_set_player_location"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.9.0 pie_move_player ---
+    if (Command.Equals(TEXT("pie_move_player"), ESearchCase::IgnoreCase))
+    {
+        const TArray<TSharedPtr<FJsonValue>>* DirArr = nullptr;
+        if (!JsonObject->TryGetArrayField(TEXT("direction"), DirArr) || DirArr->Num() < 3)
+            return JsonError(TEXT("pie_move_player"), TEXT("missing_field"),
+                TEXT("direction must be [X,Y,Z]"));
+        const double DX = (*DirArr)[0]->AsNumber();
+        const double DY = (*DirArr)[1]->AsNumber();
+        const double DZ = (*DirArr)[2]->AsNumber();
+        double DurationSec = 1.0;
+        JsonObject->TryGetNumberField(TEXT("duration_sec"), DurationSec);
+        double InputScale = 1.0;
+        JsonObject->TryGetNumberField(TEXT("scale"), InputScale);
+        int32 PlayerIndex = 0;
+        JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), DX, DY, DZ, DurationSec, InputScale, PlayerIndex]() mutable
+            {
+                Promise.SetValue(PieMovePlayerOnGameThread(
+                    static_cast<float>(DX), static_cast<float>(DY), static_cast<float>(DZ),
+                    static_cast<float>(DurationSec), static_cast<float>(InputScale), PlayerIndex));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("pie_move_player"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

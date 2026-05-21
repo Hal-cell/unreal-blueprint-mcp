@@ -3793,3 +3793,96 @@ def test_ping_returns_plugin_version_9_8_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.8.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.9.0 — PIE input enhancements
+# ---------------------------------------------------------------------------
+
+
+def test_pie_press_key_with_duration() -> None:
+    """v9.9.0 — duration_sec > 0 schedules a held release via FTSTicker."""
+    response = (
+        b'{"ok":true,"command":"pie_press_key","key":"W","player_index":0,'
+        b'"held":true,"duration_sec":2.0}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_press_key(key="W", duration_sec=2.0)
+    assert r["ok"] is True
+    assert r["held"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["duration_sec"] == 2.0
+
+
+def test_pie_press_key_duration_zero_omits_field() -> None:
+    """duration_sec=0.0 keeps the v8.3 behavior — field omitted from payload."""
+    response = b'{"ok":true,"command":"pie_press_key","key":"Space","player_index":0,"held":false,"duration_sec":0.0}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.pie_press_key(key="Space")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "duration_sec" not in sent_dict
+
+
+def test_pie_set_player_location_success() -> None:
+    response = (
+        b'{"ok":true,"command":"pie_set_player_location","player_index":0,'
+        b'"requested":[100,200,50],"actual":[100,200,50],"moved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_set_player_location(location=[100, 200, 50])
+    assert r["ok"] is True
+    assert r["moved"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "pie_set_player_location",
+        "location": [100, 200, 50],
+        "player_index": 0,
+    }
+
+
+def test_pie_set_player_location_local_validation() -> None:
+    assert server.pie_set_player_location(location=[])["error"] == "missing_argument"
+    assert server.pie_set_player_location(location=[1, 2])["error"] == "missing_argument"
+
+
+def test_pie_move_player_forward() -> None:
+    """Walk forward for 2 seconds."""
+    response = (
+        b'{"ok":true,"command":"pie_move_player","player_index":0,'
+        b'"direction":[1,0,0],"duration_sec":2.0,"scale":1.0,"queued":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_move_player(direction=[1, 0, 0], duration_sec=2.0)
+    assert r["ok"] is True
+    assert r["queued"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["direction"] == [1, 0, 0]
+    assert sent_dict["duration_sec"] == 2.0
+    assert sent_dict["scale"] == 1.0
+
+
+def test_pie_move_player_local_validation() -> None:
+    assert server.pie_move_player(direction=[])["error"] == "missing_argument"
+    assert server.pie_move_player(direction=[1, 2])["error"] == "missing_argument"
+
+
+def test_ping_returns_plugin_version_9_9_0() -> None:
+    """v9.9.0: ping surfaces 9.9.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.9.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.9.0"

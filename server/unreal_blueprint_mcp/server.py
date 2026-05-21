@@ -3028,8 +3028,12 @@ def is_pie_running() -> dict[str, Any]:
 
 
 @mcp.tool()
-def pie_press_key(key: str, player_index: int = 0) -> dict[str, Any]:
-    """Simulate a key press (press + release) on the PIE PlayerController — v8.3.
+def pie_press_key(
+    key: str,
+    player_index: int = 0,
+    duration_sec: float = 0.0,
+) -> dict[str, Any]:
+    """Simulate a key press on the PIE PlayerController — v8.3 + v9.9.0 hold.
 
     Routes through ``APlayerController::InputKey(FInputKeyParams)`` so it works
     for both legacy input and Enhanced Input (whichever is bound).
@@ -3039,18 +3043,118 @@ def pie_press_key(key: str, player_index: int = 0) -> dict[str, Any]:
             Aliases applied via the same ``ResolveFKeyWithAliases`` helper
             that ``add_input_key`` uses, so ``"Space"`` → ``"SpaceBar"`` etc.
         player_index: Which local player to target (default 0 — single-player).
+        duration_sec: **v9.9.0** — if > 0, press now and schedule release
+            after this many seconds (via FTSTicker, non-blocking). Returns
+            immediately with ``held=true``. Default 0 = press+release
+            immediately (original v8.3 behavior).
 
     Returns:
-        ``{"ok": True, "key": "<canonical key>", "player_index": N}``
+        ``{"ok": True, "key": "<canonical key>", "player_index": N,
+            "held": bool, "duration_sec": float}``
         Errors: ``pie_not_running``, ``no_player_controller``, ``invalid_key``.
 
     Note: PIE must already be running (``start_pie`` + wait for the tick).
+    For continuous movement (hold WASD to walk), use ``pie_move_player``
+    instead — uses native AddMovementInput which is more reliable than
+    raw key holds for character-controller pawns.
     """
     if not key:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "pie_press_key",
         "key": key,
+        "player_index": player_index,
+    }
+    if duration_sec > 0:
+        payload["duration_sec"] = duration_sec
+    return _send_command(payload)
+
+
+# ---------------------------------------------------------------------------
+# v9.9.0 — Player movement in PIE
+# ---------------------------------------------------------------------------
+# Closes feature-request gap #7 ("can't drive character into trigger box").
+# pie_press_key with WASD doesn't reliably trigger movement on character
+# pawns — they expect axis input via AddMovementInput. These tools target
+# the pawn directly.
+
+
+@mcp.tool()
+def pie_set_player_location(
+    location: list[float],
+    player_index: int = 0,
+) -> dict[str, Any]:
+    """Teleport the PIE pawn to a world-space location — v9.9.0.
+
+    Calls ``APlayerController::GetPawn()->SetActorLocation(loc,
+    bSweep=false, ..., ETeleportType::TeleportPhysics)``. Useful to
+    drop the player at a specific test position before driving into a
+    trigger volume, or to reset a stuck test.
+
+    Args:
+        location: ``[X, Y, Z]`` world coordinates.
+        player_index: Which local player (default 0).
+
+    Returns:
+        ``{"ok": True, "player_index": N, "requested": [X,Y,Z],
+            "actual": [X,Y,Z], "moved": True}``
+
+    Common errors:
+        pie_not_running, no_player_controller, no_pawn
+    """
+    if not location or len(location) < 3:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "pie_set_player_location",
+        "location": list(location)[:3],
+        "player_index": player_index,
+    })
+
+
+@mcp.tool()
+def pie_move_player(
+    direction: list[float],
+    duration_sec: float = 1.0,
+    scale: float = 1.0,
+    player_index: int = 0,
+) -> dict[str, Any]:
+    """Simulate continuous movement input on the PIE pawn — v9.9.0.
+
+    Equivalent to "holding WASD" for ``duration_sec``. Each game-thread
+    tick the pawn receives ``AddMovementInput(direction.Normal, scale)``.
+    Uses FTSTicker so it doesn't block — returns immediately with
+    ``queued=true``. The user is expected to sleep ``duration_sec`` (or
+    longer) before checking PIE state.
+
+    This is the right tool for "walk into the trigger box" tests on
+    character pawns. ``pie_press_key("W", duration_sec=N)`` works only
+    if the pawn has a Pressed-binding on W; character-class pawns
+    typically use axis bindings, which only respond to
+    ``AddMovementInput``.
+
+    Args:
+        direction: World-space direction vector ``[X, Y, Z]``.
+            Forward = ``[1, 0, 0]``, right = ``[0, 1, 0]``, up = ``[0, 0, 1]``.
+            Normalized server-side; magnitude is ignored.
+        duration_sec: How long to keep applying the input (default 1.0).
+        scale: Input scalar (default 1.0). Use < 1.0 for slower motion.
+        player_index: Which local player (default 0).
+
+    Returns:
+        ``{"ok": True, "player_index": N, "direction": [normalized X,Y,Z],
+            "duration_sec": N, "scale": N, "queued": True}``
+
+    Common errors:
+        pie_not_running, no_player_controller, no_pawn,
+        zero_direction, invalid_duration
+    """
+    if not direction or len(direction) < 3:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "pie_move_player",
+        "direction": list(direction)[:3],
+        "duration_sec": duration_sec,
+        "scale": scale,
         "player_index": player_index,
     })
 
