@@ -106,6 +106,11 @@
 // We call the BP function directly to avoid depending on the (non-exported) K2Node.
 #include "Subsystems/SubsystemBlueprintLibrary.h"
 
+// v8 — PIE control + input simulation
+#include "Editor/EditorEngine.h"        // FRequestPlaySessionParams
+#include "GameFramework/PlayerController.h"  // already in v3, but explicit
+#include "Engine/World.h"                // UWorld for PIE
+
 // v7.1 — set_component_property (FProperty reflection for component template defaults)
 #include "UObject/UnrealType.h"        // FObjectProperty / FStructProperty / FClassProperty
 
@@ -130,6 +135,62 @@
 #include "K2Node_RemoveDelegate.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintMCP_TCP, Log, All);
+
+// ============================================================
+// v8.1 — Log capture (FBlueprintMCPLogCapture impl + global)
+// Declared in TCPServer.h; installed in BlueprintMCPModule.cpp.
+// ============================================================
+
+FBlueprintMCPLogCapture* GBlueprintMCPLogCapture = nullptr;
+
+void FBlueprintMCPLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category)
+{
+    if (V == nullptr || *V == TEXT('\0')) return;
+    // Skip our own log spam (would loop on GLog->Add output during our own UE_LOG calls).
+    if (Category == TEXT("LogBlueprintMCP") || Category == TEXT("LogBlueprintMCP_TCP"))
+    {
+        // Still capture them — they're useful — just don't recurse via Serialize.
+        // FOutputDevice already protects against re-entry, but defensive.
+    }
+
+    // Compose: [LogCategory][Verbosity] message
+    const TCHAR* VerbStr = ::ToString(Verbosity);   // "Warning", "Error", "Log", "Verbose", ...
+    FString Formatted = FString::Printf(TEXT("[%s][%s] %s"),
+        *Category.ToString(),
+        (VerbStr != nullptr ? VerbStr : TEXT("Unknown")),
+        V);
+
+    FScopeLock Lock(&Mutex);
+    if (Lines.Num() >= kMaxBufferedLines)
+    {
+        // Drop oldest. RemoveAt(0) is O(N) but kMaxBufferedLines is small.
+        Lines.RemoveAt(0);
+    }
+    Lines.Add(MoveTemp(Formatted));
+}
+
+TArray<FString> FBlueprintMCPLogCapture::Snapshot(int32 MaxLines) const
+{
+    FScopeLock Lock(&Mutex);
+    if (MaxLines <= 0 || MaxLines >= Lines.Num())
+    {
+        return Lines;   // full copy
+    }
+    TArray<FString> Tail;
+    Tail.Reserve(MaxLines);
+    const int32 Start = Lines.Num() - MaxLines;
+    for (int32 i = Start; i < Lines.Num(); ++i)
+    {
+        Tail.Add(Lines[i]);
+    }
+    return Tail;
+}
+
+void FBlueprintMCPLogCapture::Clear()
+{
+    FScopeLock Lock(&Mutex);
+    Lines.Empty();
+}
 
 namespace
 {
@@ -3839,6 +3900,156 @@ namespace
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
     }
+
+    // ===== v8.2 — PIE control =====
+
+    /** True iff a PIE session is currently active (not just queued). */
+    bool IsPIERunningChecked()
+    {
+        return GEditor != nullptr && GEditor->PlayWorld != nullptr;
+    }
+
+    FString StartPIEOnGameThread()
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("start_pie");
+        if (GEditor == nullptr)
+            return JsonError(CmdName, TEXT("no_editor"), TEXT("GEditor null"));
+        if (IsPIERunningChecked())
+            return JsonError(CmdName, TEXT("pie_already_running"), TEXT(""));
+
+        FRequestPlaySessionParams Params;
+        Params.WorldType = EPlaySessionWorldType::PlayInEditor;
+        GEditor->RequestPlaySession(Params);
+        // Note: actual PIE start is queued and processed in next editor tick.
+        // is_pie_running will return false for a brief moment after this returns.
+
+        return FString(TEXT("{\"ok\":true,\"command\":\"start_pie\",\"queued\":true}\n"));
+    }
+
+    FString StopPIEOnGameThread()
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("stop_pie");
+        if (GEditor == nullptr)
+            return JsonError(CmdName, TEXT("no_editor"), TEXT("GEditor null"));
+        if (!IsPIERunningChecked())
+            return JsonError(CmdName, TEXT("pie_not_running"), TEXT(""));
+
+        GEditor->RequestEndPlayMap();
+        return FString(TEXT("{\"ok\":true,\"command\":\"stop_pie\",\"queued\":true}\n"));
+    }
+
+    FString IsPIERunningOnGameThread()
+    {
+        check(IsInGameThread());
+        const bool bRunning = IsPIERunningChecked();
+        const bool bRequestQueued = (GEditor != nullptr) && GEditor->IsPlaySessionRequestQueued();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"is_pie_running\",\"running\":%s,\"start_queued\":%s}\n"),
+            bRunning ? TEXT("true") : TEXT("false"),
+            bRequestQueued ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v8.3 — Input simulation =====
+
+    FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("pie_press_key");
+        if (GEditor == nullptr)
+            return JsonError(CmdName, TEXT("no_editor"), TEXT("GEditor null"));
+        UWorld* PlayWorld = GEditor->PlayWorld;
+        if (PlayWorld == nullptr)
+            return JsonError(CmdName, TEXT("pie_not_running"),
+                TEXT("Call start_pie first; wait a tick for it to actually start"));
+
+        APlayerController* PC = UGameplayStatics::GetPlayerController(PlayWorld, PlayerIndex);
+        if (PC == nullptr)
+            return JsonError(CmdName, TEXT("no_player_controller"),
+                FString::Printf(TEXT("player_index=%d"), PlayerIndex));
+
+        const FKey Key = ResolveFKeyWithAliases(KeyName);
+        if (!Key.IsValid())
+            return JsonError(CmdName, TEXT("invalid_key"),
+                FString::Printf(TEXT("%s (try Space, P, LeftMouseButton, F1, ...)"), *KeyName));
+
+        // Press then release. FInputKeyParams takes (Key, EventType, Delta-as-FVector, bGamepad).
+        FInputKeyParams PressParams(Key, IE_Pressed, FVector::ZeroVector, /*bGamepad*/ false);
+        PC->InputKey(PressParams);
+        FInputKeyParams ReleaseParams(Key, IE_Released, FVector::ZeroVector, /*bGamepad*/ false);
+        PC->InputKey(ReleaseParams);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"pie_press_key\",\"key\":%s,\"player_index\":%d}\n"),
+            *EscapeJsonString(Key.ToString()),
+            PlayerIndex);
+    }
+
+    // ===== v8.1 — log capture read/clear (no game-thread needed; capture is thread-safe) =====
+
+    FString ReadLogCaptureSync(int32 MaxLines, const FString& CategoryFilter, const FString& VerbosityFilter, const FString& Substring)
+    {
+        const TCHAR* CmdName = TEXT("read_log_capture");
+        if (GBlueprintMCPLogCapture == nullptr)
+            return JsonError(CmdName, TEXT("log_capture_not_installed"), TEXT(""));
+
+        // Snapshot copies under lock; safe to filter/serialize without holding mutex.
+        TArray<FString> All = GBlueprintMCPLogCapture->Snapshot(/*MaxLines=*/ 0);  // 0 = all
+
+        // Apply category/verbosity/substring filters (cheap string scans)
+        const bool bHasCat   = !CategoryFilter.IsEmpty();
+        const bool bHasVerb  = !VerbosityFilter.IsEmpty();
+        const bool bHasSub   = !Substring.IsEmpty();
+
+        TArray<FString> Filtered;
+        Filtered.Reserve(All.Num());
+        for (const FString& Line : All)
+        {
+            if (bHasCat && !Line.Contains(FString::Printf(TEXT("[%s]"), *CategoryFilter), ESearchCase::IgnoreCase))
+                continue;
+            if (bHasVerb && !Line.Contains(FString::Printf(TEXT("[%s]"), *VerbosityFilter), ESearchCase::IgnoreCase))
+                continue;
+            if (bHasSub && !Line.Contains(Substring, ESearchCase::IgnoreCase))
+                continue;
+            Filtered.Add(Line);
+        }
+
+        // Tail-trim to MaxLines (if > 0)
+        if (MaxLines > 0 && Filtered.Num() > MaxLines)
+        {
+            const int32 Drop = Filtered.Num() - MaxLines;
+            Filtered.RemoveAt(0, Drop, EAllowShrinking::No);
+        }
+
+        // Build JSON via TJsonWriter (auto-escapes strings — important; log lines have arbitrary content)
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), TEXT("read_log_capture"));
+        Writer->WriteValue(TEXT("total_captured"), All.Num());
+        Writer->WriteValue(TEXT("returned"), Filtered.Num());
+        Writer->WriteArrayStart(TEXT("lines"));
+        for (const FString& Line : Filtered)
+        {
+            Writer->WriteValue(Line);
+        }
+        Writer->WriteArrayEnd();
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
+    FString ClearLogCaptureSync()
+    {
+        const TCHAR* CmdName = TEXT("clear_log_capture");
+        if (GBlueprintMCPLogCapture == nullptr)
+            return JsonError(CmdName, TEXT("log_capture_not_installed"), TEXT(""));
+        GBlueprintMCPLogCapture->Clear();
+        return FString(TEXT("{\"ok\":true,\"command\":\"clear_log_capture\"}\n"));
+    }
 }
 
 FTCPServerRunnable::FTCPServerRunnable(int32 InPort)
@@ -4990,6 +5201,69 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
                 return JsonError(CmdName, TEXT("game_thread_timeout"));
             return Future.Get();
         }
+    }
+
+    // --- v8.1 read_log_capture / clear_log_capture (no game-thread marshaling — thread-safe) ---
+    if (Command.Equals(TEXT("read_log_capture"), ESearchCase::IgnoreCase))
+    {
+        int32 MaxLines = 100;
+        JsonObject->TryGetNumberField(TEXT("max_lines"), MaxLines);
+        FString CategoryFilter, VerbosityFilter, Substring;
+        JsonObject->TryGetStringField(TEXT("category"), CategoryFilter);
+        JsonObject->TryGetStringField(TEXT("verbosity"), VerbosityFilter);
+        JsonObject->TryGetStringField(TEXT("contains"), Substring);
+        return ReadLogCaptureSync(MaxLines, CategoryFilter, VerbosityFilter, Substring);
+    }
+    if (Command.Equals(TEXT("clear_log_capture"), ESearchCase::IgnoreCase))
+    {
+        return ClearLogCaptureSync();
+    }
+
+    // --- v8.2 PIE control ---
+    if (Command.Equals(TEXT("start_pie"), ESearchCase::IgnoreCase)
+        || Command.Equals(TEXT("stop_pie"), ESearchCase::IgnoreCase)
+        || Command.Equals(TEXT("is_pie_running"), ESearchCase::IgnoreCase))
+    {
+        const TCHAR* CmdName = Command.Equals(TEXT("start_pie"), ESearchCase::IgnoreCase) ? TEXT("start_pie")
+                             : Command.Equals(TEXT("stop_pie"),  ESearchCase::IgnoreCase) ? TEXT("stop_pie")
+                                                                                          : TEXT("is_pie_running");
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        const FString CmdCopy = Command;   // capture as FString (TCHAR* lifetime)
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), CmdCopy]() mutable
+            {
+                if (CmdCopy.Equals(TEXT("start_pie"), ESearchCase::IgnoreCase))
+                    Promise.SetValue(StartPIEOnGameThread());
+                else if (CmdCopy.Equals(TEXT("stop_pie"), ESearchCase::IgnoreCase))
+                    Promise.SetValue(StopPIEOnGameThread());
+                else
+                    Promise.SetValue(IsPIERunningOnGameThread());
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v8.3 pie_press_key ---
+    if (Command.Equals(TEXT("pie_press_key"), ESearchCase::IgnoreCase))
+    {
+        FString KeyName;
+        if (!JsonObject->TryGetStringField(TEXT("key"), KeyName) || KeyName.IsEmpty())
+            return JsonError(TEXT("pie_press_key"), TEXT("missing_field"), TEXT("key"));
+        int32 PlayerIndex = 0;
+        JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), KeyName, PlayerIndex]() mutable
+            {
+                Promise.SetValue(PiePressKeyOnGameThread(KeyName, PlayerIndex));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("pie_press_key"), TEXT("game_thread_timeout"));
+        return Future.Get();
     }
 
     return FString::Printf(

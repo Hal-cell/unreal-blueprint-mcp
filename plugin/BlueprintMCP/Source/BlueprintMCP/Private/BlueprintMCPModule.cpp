@@ -12,6 +12,15 @@ IMPLEMENT_MODULE(FBlueprintMCPModule, BlueprintMCP);
 void FBlueprintMCPModule::StartupModule()
 {
     UE_LOG(LogBlueprintMCP, Log, TEXT("BlueprintMCP starting"));
+
+    // v8.1: install log capture before TCP server so commands can read logs
+    GBlueprintMCPLogCapture = new FBlueprintMCPLogCapture();
+    if (GLog != nullptr)
+    {
+        GLog->AddOutputDevice(GBlueprintMCPLogCapture);
+        UE_LOG(LogBlueprintMCP, Log, TEXT("BlueprintMCP log capture installed"));
+    }
+
     StartTCPServer();
 }
 
@@ -19,6 +28,16 @@ void FBlueprintMCPModule::ShutdownModule()
 {
     UE_LOG(LogBlueprintMCP, Log, TEXT("BlueprintMCP stopping"));
     StopTCPServer();
+
+    if (GBlueprintMCPLogCapture != nullptr)
+    {
+        if (GLog != nullptr)
+        {
+            GLog->RemoveOutputDevice(GBlueprintMCPLogCapture);
+        }
+        delete GBlueprintMCPLogCapture;
+        GBlueprintMCPLogCapture = nullptr;
+    }
 }
 
 void FBlueprintMCPModule::StartTCPServer()

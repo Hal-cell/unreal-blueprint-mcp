@@ -2226,3 +2226,154 @@ def test_save_blueprint_against_real_plugin() -> None:
     r = server.save_blueprint(blueprint="/Game/Blueprints/BP_TestSpikeB1_v2")
     assert r["ok"] is True
     assert r["saved"] is True
+
+
+# ---------------------------------------------------------------------------
+# v8 — PIE control + simulated input + log capture (agentic closed loop)
+# ---------------------------------------------------------------------------
+
+
+def test_read_log_capture_success() -> None:
+    response = (
+        b'{"ok":true,"command":"read_log_capture","total_captured":3,"returned":2,'
+        b'"lines":["[LogBlueprintUserMessages][Log] hello","[LogTemp][Log] foo"]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.read_log_capture(max_lines=2, category="Blueprint")
+    assert r["ok"] is True
+    assert r["returned"] == 2
+    assert len(r["lines"]) == 2
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "read_log_capture"
+    assert sent_dict["max_lines"] == 2
+    assert sent_dict["category"] == "Blueprint"
+
+
+def test_read_log_capture_omits_empty_filters() -> None:
+    """Empty filter strings should not appear in the wire payload."""
+    response = b'{"ok":true,"command":"read_log_capture","total_captured":0,"returned":0,"lines":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.read_log_capture()
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "category" not in sent_dict
+    assert "verbosity" not in sent_dict
+    assert "contains" not in sent_dict
+    assert sent_dict["max_lines"] == 100  # default
+
+
+def test_clear_log_capture_success() -> None:
+    response = b'{"ok":true,"command":"clear_log_capture"}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.clear_log_capture()
+    assert r["ok"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "clear_log_capture"}
+
+
+def test_start_pie_success() -> None:
+    response = b'{"ok":true,"command":"start_pie","queued":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.start_pie()
+    assert r["ok"] is True
+    assert r["queued"] is True
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "start_pie"}
+
+
+def test_start_pie_handles_already_running() -> None:
+    response = b'{"ok":false,"command":"start_pie","error":"pie_already_running","detail":""}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.start_pie()
+    assert r["ok"] is False
+    assert r["error"] == "pie_already_running"
+
+
+def test_stop_pie_success() -> None:
+    response = b'{"ok":true,"command":"stop_pie","queued":true}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.stop_pie()
+    assert r["ok"] is True
+
+
+def test_is_pie_running_returns_status() -> None:
+    response = b'{"ok":true,"command":"is_pie_running","running":true,"start_queued":false}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.is_pie_running()
+    assert r["ok"] is True
+    assert r["running"] is True
+    assert r["start_queued"] is False
+
+
+def test_pie_press_key_success() -> None:
+    response = (
+        b'{"ok":true,"command":"pie_press_key","key":"SpaceBar","player_index":0}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_press_key(key="Space")  # alias → SpaceBar on UE side
+    assert r["ok"] is True
+    assert r["key"] == "SpaceBar"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "pie_press_key", "key": "Space", "player_index": 0}
+
+
+def test_pie_press_key_handles_pie_not_running() -> None:
+    response = (
+        b'{"ok":false,"command":"pie_press_key","error":"pie_not_running",'
+        b'"detail":"Call start_pie first; wait a tick for it to actually start"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.pie_press_key(key="P")
+    assert r["ok"] is False
+    assert r["error"] == "pie_not_running"
+
+
+def test_pie_press_key_local_validation_missing_key() -> None:
+    r = server.pie_press_key(key="")
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+@pytest.mark.skip(reason="Requires UE editor — agentic loop demo")
+def test_v8_agentic_loop_against_real_plugin() -> None:
+    """Manual integration: write hello-world BP → spawn → PIE → read log → stop."""
+    bp = "/Game/Blueprints/BP_V8_AgenticLoop"
+    server.create_blueprint(name="BP_V8_AgenticLoop")
+    # Wire BeginPlay → PrintString("hello v8")
+    server.add_node(blueprint=bp, node_type="PrintString",
+                    anchor_name="print_hello")
+    server.set_pin_default(blueprint=bp, pin_ref="print_hello.InString",
+                           value="hello v8")
+    server.connect_pins(blueprint=bp, from_pin="begin_play.then",
+                        to_pin="print_hello.execute")
+    assert server.compile_blueprint(name=bp)["ok"]
+    assert server.spawn_actor(blueprint=bp)["ok"]
+
+    # Clear log, start PIE, wait a tick (in real test would sleep)
+    server.clear_log_capture()
+    assert server.start_pie()["ok"]
+
+    # In real usage, wait ~1s for PIE to actually start + tick
+    # import time; time.sleep(1)
+
+    # Read log — should contain our PrintString
+    log_result = server.read_log_capture(category="BlueprintUserMessages",
+                                          contains="hello v8")
+    assert log_result["ok"] is True
+    assert log_result["returned"] >= 1
+
+    assert server.stop_pie()["ok"]

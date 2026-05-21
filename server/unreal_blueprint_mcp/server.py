@@ -1853,6 +1853,132 @@ def create_blueprint(
 
 
 # ---------------------------------------------------------------------------
+# v8 — agentic closed loop: PIE control, simulated input, log capture
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def read_log_capture(
+    max_lines: int = 100,
+    category: str = "",
+    verbosity: str = "",
+    contains: str = "",
+) -> dict[str, Any]:
+    """Read recent UE log lines captured by the plugin's FOutputDevice — v8.1.
+
+    The plugin installs a global log capture at module startup. Every
+    ``UE_LOG`` / ``PrintString`` line goes into a thread-safe circular buffer
+    (default cap: 1000 lines). This tool reads + filters the buffer.
+
+    Args:
+        max_lines: Limit on returned lines (default 100). 0 = no cap.
+        category: If non-empty, only return lines whose log category contains
+            this string (case-insensitive). E.g. ``"BlueprintUserMessages"``
+            for PrintString output.
+        verbosity: If non-empty, only return lines whose verbosity contains this
+            string. E.g. ``"Warning"``, ``"Error"``.
+        contains: If non-empty, only return lines containing this substring
+            (case-insensitive).
+
+    Returns:
+        ``{"ok": True, "total_captured": N, "returned": M, "lines": [...]}``
+        Each line is formatted ``[Category][Verbosity] message``.
+
+    Use this after triggering an action to see what UE logged.
+    """
+    payload: dict[str, Any] = {
+        "command": "read_log_capture",
+        "max_lines": max_lines,
+    }
+    if category:
+        payload["category"] = category
+    if verbosity:
+        payload["verbosity"] = verbosity
+    if contains:
+        payload["contains"] = contains
+    return _send_command(payload)
+
+
+@mcp.tool()
+def clear_log_capture() -> dict[str, Any]:
+    """Empty the log capture buffer — v8.1.
+
+    Use this before triggering an action to make sure subsequent
+    ``read_log_capture`` only shows new output.
+    """
+    return _send_command({"command": "clear_log_capture"})
+
+
+@mcp.tool()
+def start_pie() -> dict[str, Any]:
+    """Start a PIE (Play In Editor) session — v8.2.
+
+    Equivalent to clicking the "Play" toolbar button. The actual start is
+    queued and processed on the next editor tick — ``is_pie_running`` will
+    return ``running=false`` for one tick after this returns, even on success.
+
+    Returns:
+        ``{"ok": True, "queued": True}`` if request accepted.
+        ``{"ok": False, "error": "pie_already_running"}`` if a session is active.
+    """
+    return _send_command({"command": "start_pie"})
+
+
+@mcp.tool()
+def stop_pie() -> dict[str, Any]:
+    """End the active PIE session — v8.2.
+
+    Equivalent to pressing Esc in PIE or clicking "Stop" on the toolbar.
+
+    Returns:
+        ``{"ok": True, "queued": True}`` if request accepted.
+        ``{"ok": False, "error": "pie_not_running"}`` if no session.
+    """
+    return _send_command({"command": "stop_pie"})
+
+
+@mcp.tool()
+def is_pie_running() -> dict[str, Any]:
+    """Query whether a PIE session is currently active — v8.2.
+
+    Returns:
+        ``{"ok": True, "running": bool, "start_queued": bool}``
+        ``running=True`` iff GEditor->PlayWorld is non-null (session has actually
+        started). ``start_queued=True`` iff a start was requested but hasn't
+        ticked through yet.
+    """
+    return _send_command({"command": "is_pie_running"})
+
+
+@mcp.tool()
+def pie_press_key(key: str, player_index: int = 0) -> dict[str, Any]:
+    """Simulate a key press (press + release) on the PIE PlayerController — v8.3.
+
+    Routes through ``APlayerController::InputKey(FInputKeyParams)`` so it works
+    for both legacy input and Enhanced Input (whichever is bound).
+
+    Args:
+        key: Key name (`"Space"`, `"P"`, `"LeftMouseButton"`, `"F1"`, etc.).
+            Aliases applied via the same ``ResolveFKeyWithAliases`` helper
+            that ``add_input_key`` uses, so ``"Space"`` → ``"SpaceBar"`` etc.
+        player_index: Which local player to target (default 0 — single-player).
+
+    Returns:
+        ``{"ok": True, "key": "<canonical key>", "player_index": N}``
+        Errors: ``pie_not_running``, ``no_player_controller``, ``invalid_key``.
+
+    Note: PIE must already be running (``start_pie`` + wait for the tick).
+    """
+    if not key:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "pie_press_key",
+        "key": key,
+        "player_index": player_index,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
