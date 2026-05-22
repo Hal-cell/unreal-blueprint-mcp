@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.13.0](https://img.shields.io/badge/version-v9.13.0-brightgreen)](#status)
+[![v9.14.0](https://img.shields.io/badge/version-v9.14.0-brightgreen)](#status)
 [![78 tools](https://img.shields.io/badge/tools-78-blue)](#tools)
-[![233 tests](https://img.shields.io/badge/tests-233%20passing-success)](#requirements)
+[![236 tests](https://img.shields.io/badge/tests-236%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -76,7 +76,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.11.0** | ✅ `spawn_actor` persistence fix (level pkg now marked dirty) + `rotation=` kwarg + actor bounds in `get_actor_transform` + new `get_actor_bounds` (precise placement against existing geometry) |
 | **v9.12.0** | ✅ Sizing tools: `get_player_capsule` (radius / half_height / diameter / full_height) + `spawn_actor(scale=)` (full-pose one-call) + `pie_set_player_location(snap_to_ground=True)` (line trace + capsule offset). LLM no longer blind to size when laying out corridors/doors |
 | **v9.13.0** | ✅ `add_component_get` (by-name SCS component ref node — closes "GetComponentByClass-only-finds-first" gap) + WP-aware spawn persistence (`AActor::MarkPackageDirty` for external actor files) + `add_node` invalid_node_type format hint + `set_pin_default` docs fix (class pins always worked) |
-| **Unit tests** | **233 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.14.0** | ✅ `add_select` `num_options` actually grows past 2 (was silently capped — closes rev8 ISSUE-1). N-way data Select now usable in one node instead of Switch + N VariableSet workaround |
+| **Unit tests** | **236 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements

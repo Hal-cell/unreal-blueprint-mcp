@@ -6,7 +6,34 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.13.0.
+Everything shipped through v9.14.0.
+
+---
+
+## [v9.14.0] — 2026-05-23 — add_select num_options actually grows (closes rev8 ISSUE-1)
+
+### Fixed
+
+`add_select` silently capped `num_options` at 2 since v7.0.1 — the
+note "UK2Node_Select has no public AddOptionPinToNode() in UE 5.4"
+was incorrect. `UK2Node_Select::AddInputPin()` IS public (overrides
+`IK2Node_AddPinInterface`), and internally:
+
+  - Increments `NumOptionPins`
+  - Flips `IndexPin` from `bool` → `int` once we exceed 2
+  - Calls `ReconstructNode` to materialize the new Option pin
+
+Loop from 2 (default) up to `NumOptions`, respecting `CanAddPin`
+gating. Clamp range `[2, 64]`. `NumOptionPins` itself is private, so
+the actual count back from the call comes from `GetOptionPins`
+(BLUEPRINTGRAPH_API).
+
+rev8 use case: F-key cycling among 6 floor-animation modes. Previously
+required `Switch on Int` + 6 `K2Node_VariableSet` + an intermediate
+variable. Now a single `Select` node with `num_options=6`.
+
+### `ping.plugin_version`
+"9.13.0" → **"9.14.0"**.
 
 ---
 
