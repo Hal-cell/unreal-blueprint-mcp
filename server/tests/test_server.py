@@ -4230,3 +4230,99 @@ def test_ping_returns_plugin_version_9_12_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.12.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.13.0 — add_component_get + WP-aware spawn persistence + error hints
+# ---------------------------------------------------------------------------
+
+
+def test_add_component_get_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_component_get","anchor_name":"get_ism",'
+        b'"component_name":"BlocksISM",'
+        b'"component_class":"/Script/Engine.InstancedStaticMeshComponent",'
+        b'"node_guid":"AAAA-BBBB","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_component_get(
+            blueprint="/Game/BP_Floor",
+            component_name="BlocksISM",
+            anchor_name="get_ism",
+            position_x=100, position_y=200,
+        )
+    assert r["ok"] is True
+    assert r["component_class"].endswith("InstancedStaticMeshComponent")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_component_get",
+        "blueprint": "/Game/BP_Floor",
+        "component_name": "BlocksISM",
+        "anchor_name": "get_ism",
+        "position_x": 100,
+        "position_y": 200,
+    }
+
+
+def test_add_component_get_with_graph_name() -> None:
+    """Function-body graphs also work."""
+    response = b'{"ok":true,"command":"add_component_get","anchor_name":"g","component_name":"C","component_class":"","node_guid":"X","pins":[],"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_component_get(
+            blueprint="/Game/BP", component_name="C", anchor_name="g",
+            graph_name="MyFunc",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_add_component_get_component_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"add_component_get","error":"component_not_found",'
+        b'"detail":"\'Ghost\' not found on /Game/BP. Add via add_component first..."}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component_get(blueprint="/Game/BP", component_name="Ghost", anchor_name="g")
+    assert r["ok"] is False
+    assert r["error"] == "component_not_found"
+
+
+def test_add_component_get_local_validation() -> None:
+    assert server.add_component_get(blueprint="", component_name="C", anchor_name="g")["error"] == "missing_argument"
+    assert server.add_component_get(blueprint="/G/BP", component_name="", anchor_name="g")["error"] == "missing_argument"
+    assert server.add_component_get(blueprint="/G/BP", component_name="C", anchor_name="")["error"] == "missing_argument"
+
+
+def test_add_node_invalid_node_type_includes_hint() -> None:
+    """rev7 §二 — bare 'PrintString' should produce a format hint."""
+    response = (
+        b'{"ok":false,"command":"add_node","error":"invalid_node_type",'
+        b'"detail":"Got \'PrintString\' \xe2\x80\x94 node_type must use \'<K2NodeClass>:<param>\' format. '
+        b'Example: \'K2Node_CallFunction:PrintString\' or fully-qualified '
+        b'\'K2Node_CallFunction:KismetSystemLibrary.PrintString\'."}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_node(
+            blueprint="/Game/BP", node_type="PrintString", anchor_name="print_x",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "invalid_node_type"
+    # Hint mentions both the actual problem AND the correct format
+    assert "K2Node_CallFunction:" in r["detail"]
+
+
+def test_ping_returns_plugin_version_9_13_0() -> None:
+    """v9.13.0: ping surfaces 9.13.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.13.0","build_date":"May 22 2026 12:00:00",'
+        b'"timestamp":"2026-05-22T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.13.0"

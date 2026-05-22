@@ -1480,6 +1480,11 @@ def set_pin_default(
             - **Vector** (v4): "1.0,2.0,3.0" or "(X=1,Y=2,Z=3)"
             - **Rotator** (v4): "P,Y,R" e.g. "0,90,0" or "(P=0,Y=90,R=0)"
             - **Color / LinearColor** (v4): "R,G,B" (A=1) or "R,G,B,A" or "(R=...,G=...,B=...,A=...)"
+            - **Object ref** (v6.0.2+): asset path like "/Engine/BasicShapes/Cube.Cube"
+            - **Class ref** (v6.0.2+, **rev7-verified**): class path like
+              "/Script/Engine.InstancedStaticMeshComponent". Works for both
+              ``FClassProperty`` (TSubclassOf) and the Class pin on
+              ``GetComponentByClass`` etc.
 
     Returns:
         On success: {"ok": True, "anchor_name": ..., "pin_name": ...,
@@ -1487,11 +1492,15 @@ def set_pin_default(
                      "saved": True}
         On error:   {"ok": False, "error": "...", "detail": "..."}
 
-    v0 limitations:
-        - Only primitive types (string/name/text/int/int64/real/bool/byte). Pins of type
-          object/class/struct/delegate/wildcard return `unsupported_pin_type`.
-        - Output pins return `pin_not_input` (defaults apply only to inputs).
-        - Exec pins return `exec_pin_no_default`.
+    Supported pin categories (current — was over-restrictive in v0 docstring):
+        primitive types (string/name/text/int/int64/real/bool/byte) ✓
+        struct (Vector / Rotator / Color / LinearColor — others via raw UE
+        export string) ✓
+        object refs (asset path) ✓
+        class refs (class path) ✓
+        Output pins → `pin_not_input` (defaults apply only to inputs)
+        Exec pins → `exec_pin_no_default`
+        delegate / wildcard / unknown struct → `unsupported_pin_type`
 
     Common errors:
         blueprint_not_found, no_event_graph, invalid_pin_ref (missing "."),
@@ -2438,6 +2447,67 @@ def add_variable_set(
         "command": "add_variable_set",
         "blueprint": blueprint,
         "variable_name": variable_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
+def add_component_get(
+    blueprint: str,
+    component_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Add a Get node for one of the BP's own components — v9.13.0.
+
+    Closes rev7 ISSUE-1. Previously the only way to reference a BP's
+    component in its EventGraph was ``GetComponentByClass``, which
+    returns the FIRST component of that class — useless when the BP
+    has two components of the same class. ``add_component_get`` is
+    the by-name equivalent — it drops a ``K2Node_VariableGet``
+    referencing the named component on ``self``, exactly like
+    dragging the component from UE's Components panel into the graph.
+
+    The output pin's type is the component's class. Wire it into any
+    function's Target/Self pin that expects that class (e.g. the ISM's
+    ``Target`` pin on ``AddInstance``).
+
+    Args:
+        blueprint: Full BP asset path.
+        component_name: Component name as added via ``add_component`` (or
+            as it appears in UE's Components panel). Inherited / native
+            components are also accepted if they're UPROPERTY-declared
+            on the parent class.
+        anchor_name: User-given label (unique within the target graph).
+        position_x, position_y: Graph position. Defaults 0, 0.
+        graph_name: Function/macro graph name (default empty = EventGraph).
+
+    Returns:
+        On success: ``{"ok": True, "command": "add_component_get",
+                       "anchor_name": "...", "component_name": "...",
+                       "component_class": "/Script/Engine.X" (full path),
+                       "node_guid": "...", "pins": [...], "saved": True}``
+
+    Common errors:
+        blueprint_not_found
+        graph_not_found / no_event_graph
+        component_not_found  — not in SCS AND not an inherited UPROPERTY
+                                of a UActorComponent subclass
+        anchor_name_exists
+    """
+    if not blueprint or not component_name or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_component_get",
+        "blueprint": blueprint,
+        "component_name": component_name,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,

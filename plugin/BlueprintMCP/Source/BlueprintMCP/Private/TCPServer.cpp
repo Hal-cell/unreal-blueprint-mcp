@@ -597,7 +597,12 @@ namespace
         FString NodeClass, NodeParam;
         if (!NodeType.Split(TEXT(":"), &NodeClass, &NodeParam))
         {
-            return JsonError(TEXT("add_node"), TEXT("invalid_node_type"), NodeType);
+            // v9.13.0 — rev7 noted the bare-name confusion. Make the hint explicit.
+            return JsonError(TEXT("add_node"), TEXT("invalid_node_type"),
+                FString::Printf(TEXT("Got '%s' — node_type must use '<K2NodeClass>:<param>' format. "
+                                     "Example: 'K2Node_CallFunction:PrintString' or fully-qualified "
+                                     "'K2Node_CallFunction:KismetSystemLibrary.PrintString'."),
+                    *NodeType));
         }
 
         // 5. Branch on node class (v0 only K2Node_CallFunction)
@@ -1659,6 +1664,124 @@ namespace
             *EscapeJsonString(CmdStr),
             *EscapeJsonString(AnchorName),
             *EscapeJsonString(VariableName),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.13.0 — add_component_get (rev7 ISSUE-1) =====
+    //
+    // Drop a K2Node_VariableGet referencing one of the BP's own SCS
+    // components by name. The component must exist in the BP's
+    // SimpleConstructionScript — i.e., it must have been added via
+    // add_component (or via UE editor's Components panel).
+    //
+    // After compile, SCS components surface as UObject properties on
+    // the generated class with the same name, so VariableReference.
+    // SetSelfMember works the same way as for a regular member var.
+    //
+    // The output pin's type is the component's class — wire it into
+    // any function's Target/Self pin that expects that class.
+    //
+    // This closes the gap rev7 ISSUE-1: previously the only way to
+    // reference a component was GetComponentByClass, which can't
+    // distinguish two components of the same class.
+
+    FString AddComponentGetOnGameThread(
+        const FString& BlueprintPath,
+        const FString& ComponentName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        const FString& GraphName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_component_get");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* TargetGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (TargetGraph == nullptr)
+        {
+            return JsonError(CmdName,
+                GraphName.IsEmpty() ? TEXT("no_event_graph") : TEXT("graph_not_found"),
+                GraphName.IsEmpty() ? BlueprintPath : GraphName);
+        }
+
+        // Validate the component exists via SCS first (most reliable for
+        // BP-added components — including ones added via add_component).
+        USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+        const FName ComponentFName(*ComponentName);
+        bool bFoundInSCS = false;
+        UClass* ResolvedComponentClass = nullptr;
+        if (SCS != nullptr)
+        {
+            USCS_Node* SCSNode = SCS->FindSCSNode(ComponentFName);
+            if (SCSNode != nullptr)
+            {
+                bFoundInSCS = true;
+                if (SCSNode->ComponentTemplate != nullptr)
+                    ResolvedComponentClass = SCSNode->ComponentTemplate->GetClass();
+            }
+        }
+
+        // Fallback for inherited / native components: check the generated
+        // class for an FObjectProperty by that name.
+        if (!bFoundInSCS && Blueprint->GeneratedClass != nullptr)
+        {
+            FProperty* Prop = Blueprint->GeneratedClass->FindPropertyByName(ComponentFName);
+            if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+            {
+                if (ObjProp->PropertyClass != nullptr
+                    && ObjProp->PropertyClass->IsChildOf(UActorComponent::StaticClass()))
+                {
+                    bFoundInSCS = true;
+                    ResolvedComponentClass = ObjProp->PropertyClass;
+                }
+            }
+        }
+
+        if (!bFoundInSCS)
+        {
+            return JsonError(CmdName, TEXT("component_not_found"),
+                FString::Printf(TEXT("'%s' not found on '%s'. Add via add_component first, "
+                                     "or check for typo. (Inherited/native components also accepted "
+                                     "if they're declared as UPROPERTY on the parent class.)"),
+                    *ComponentName, *BlueprintPath));
+        }
+
+        // Anchor uniqueness within the chosen graph
+        if (FindNodeByAnchor(TargetGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(TargetGraph);
+        GetNode->VariableReference.SetSelfMember(ComponentFName);
+        GetNode->SetFlags(RF_Transactional);
+        GetNode->NodePosX = PosX;
+        GetNode->NodePosY = PosY;
+        GetNode->NodeComment = AnchorName;
+        GetNode->bCommentBubbleVisible = true;
+
+        TargetGraph->AddNode(GetNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        GetNode->CreateNewGuid();
+        GetNode->PostPlacedNewNode();
+        GetNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(GetNode);
+        const FString GuidStr = GetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const FString ClassStr = ResolvedComponentClass != nullptr
+            ? ResolvedComponentClass->GetPathName() : FString();
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_component_get\",\"anchor_name\":%s,")
+            TEXT("\"component_name\":%s,\"component_class\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(ComponentName),
+            *EscapeJsonString(ClassStr),
             *EscapeJsonString(GuidStr),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
@@ -3162,9 +3285,17 @@ namespace
             AppliedScale = NewScale;
         }
 
-        // v9.11.0 ISSUE-1 fix — mark the level package dirty so save_all
-        // actually persists the spawn. Without this, the actor exists in
-        // memory only and is lost on next editor restart.
+        // v9.11.0 ISSUE-1 fix + v9.13.0 World-Partition compat — mark the
+        // ACTOR's package dirty (which is the per-actor external file in
+        // WP mode, falls back to the level package in non-WP mode).
+        // The v9.11.0 fix only marked the level package, which doesn't
+        // cover WP external actor files — that's why rev7 saw spawns
+        // disappear again across sessions on the FirstPerson template
+        // (WP-enabled by default).
+        SpawnedActor->MarkPackageDirty();
+        // Also mark the level package — for non-WP levels this is
+        // redundant (same package), for WP levels this catches changes
+        // to the level's own actor list / cell layout.
         if (SpawnedActor->GetLevel() != nullptr && SpawnedActor->GetLevel()->GetOutermost() != nullptr)
         {
             SpawnedActor->GetLevel()->GetOutermost()->MarkPackageDirty();
@@ -6002,7 +6133,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.12.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.13.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6590,6 +6721,34 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.13.0 add_component_get ---
+    if (Command.Equals(TEXT("add_component_get"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, ComponentName, AnchorName, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_component_get"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("component_name"), ComponentName) || ComponentName.IsEmpty())
+            return JsonError(TEXT("add_component_get"), TEXT("missing_field"), TEXT("component_name"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_component_get"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, ComponentName, AnchorName, PosX, PosY, GraphName]() mutable
+            {
+                Promise.SetValue(AddComponentGetOnGameThread(Blueprint, ComponentName, AnchorName, PosX, PosY, GraphName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_component_get"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
