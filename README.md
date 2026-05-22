@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.12.0](https://img.shields.io/badge/version-v9.12.0-brightgreen)](#status)
-[![77 tools](https://img.shields.io/badge/tools-77-blue)](#tools)
-[![227 tests](https://img.shields.io/badge/tests-227%20passing-success)](#requirements)
+[![v9.13.0](https://img.shields.io/badge/version-v9.13.0-brightgreen)](#status)
+[![78 tools](https://img.shields.io/badge/tools-78-blue)](#tools)
+[![233 tests](https://img.shields.io/badge/tests-233%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -75,7 +75,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.10.0** | ✅ PIE player rotation: `pie_set_player_rotation` (SetControlRotation = FPS look) + `pie_move_player(face_movement=)` — character turns to face direction instead of strafing |
 | **v9.11.0** | ✅ `spawn_actor` persistence fix (level pkg now marked dirty) + `rotation=` kwarg + actor bounds in `get_actor_transform` + new `get_actor_bounds` (precise placement against existing geometry) |
 | **v9.12.0** | ✅ Sizing tools: `get_player_capsule` (radius / half_height / diameter / full_height) + `spawn_actor(scale=)` (full-pose one-call) + `pie_set_player_location(snap_to_ground=True)` (line trace + capsule offset). LLM no longer blind to size when laying out corridors/doors |
-| **Unit tests** | **227 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.13.0** | ✅ `add_component_get` (by-name SCS component ref node — closes "GetComponentByClass-only-finds-first" gap) + WP-aware spawn persistence (`AActor::MarkPackageDirty` for external actor files) + `add_node` invalid_node_type format hint + `set_pin_default` docs fix (class pins always worked) |
+| **Unit tests** | **233 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -187,6 +188,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`set_variable_flags`** (v9.8) | Flip flags on an existing var: `instance_editable` / `blueprint_read_only` / `expose_on_spawn` (tri-state — None = unchanged) |
 | **`delete_variable`** (v9.8) | Remove a member variable (recompile + save) |
 | `add_variable_get` / `add_variable_set` | Read/write nodes for BP variables |
+| **`add_component_get`** (v9.13) | By-name Get node for one of the BP's own SCS components (or inherited UPROPERTY component). Closes the "GetComponentByClass only finds the first instance" gap |
 
 ### Function & dispatcher authoring
 

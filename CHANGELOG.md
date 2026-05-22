@@ -6,7 +6,57 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.12.0.
+Everything shipped through v9.13.0.
+
+---
+
+## [v9.13.0] — 2026-05-22 — add_component_get + WP-aware spawn persistence + docs/hints (closes rev7 ISSUE-1/2)
+
+### Closes rev7 issues
+
+- **ISSUE-1** (medium) — no way to reference a BP's own components in
+  the graph by name. The only workaround was `GetComponentByClass`
+  which returns the FIRST component of that class (useless for "two
+  StaticMesh components on the same BP").
+- **ISSUE-2** (low/docs) — `set_pin_default` docstring said class pins
+  return `unsupported_pin_type`; class pins have actually worked since
+  v6.0.2. Docs were over-restrictive.
+
+Plus the rev6 ISSUE-1 (spawn persistence) re-confirmed in rev7:
+v9.11.0's `MarkPackageDirty` on the LEVEL package wasn't enough on
+World Partition maps (FirstPerson template default), because WP saves
+actors as per-actor external files. Fix is to mark the ACTOR's
+package — `AActor::MarkPackageDirty()` gets the right one in both
+WP and non-WP cases.
+
+### Added — 1 new tool + 3 fixes (77 → 78)
+
+- **`add_component_get(blueprint, component_name, anchor_name,
+   position_x=0, position_y=0, graph_name="")`** — drops a
+   `K2Node_VariableGet` referencing a named SCS component on `self`.
+   Identical to dragging the component from UE's Components panel.
+   Lookup: SCS first via `Blueprint->SimpleConstructionScript->
+   FindSCSNode`, falls back to `Blueprint->GeneratedClass->
+   FindPropertyByName` for inherited / native components. Output pin
+   is the component's class — wire into `AddInstance.Target` etc.
+- **WP-aware `spawn_actor` persistence** — additionally call
+  `AActor::MarkPackageDirty()` after spawn. This is the right entry
+  point for both WP (marks the per-actor external file) and non-WP
+  (marks the level package, same as before). v9.11.0's level-only
+  approach was a partial fix that wasn't catching the WP case.
+- **`add_node` error hint** — `invalid_node_type` detail now reads:
+  `"Got 'PrintString' — node_type must use '<K2NodeClass>:<param>'
+  format. Example: 'K2Node_CallFunction:PrintString' or
+  fully-qualified 'K2Node_CallFunction:KismetSystemLibrary.PrintString'."`
+  Saves a round-trip when the LLM forgets the prefix.
+- **`set_pin_default` docstring rewrite** — accurately lists what's
+  supported (primitives, common structs, object refs, class refs) and
+  what's not (delegate, wildcard, unknown structs). Previously claimed
+  `object/class/struct/delegate/wildcard` ALL return error — only the
+  last two are still true.
+
+### `ping.plugin_version`
+"9.12.0" → **"9.13.0"**.
 
 ---
 
