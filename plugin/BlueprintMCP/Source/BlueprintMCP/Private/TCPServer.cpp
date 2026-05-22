@@ -5484,7 +5484,9 @@ namespace
     // v9.9.0 — pie_move_player: simulated continuous movement input over duration.
     // Each game-thread tick we call Pawn->AddMovementInput(dir, scale). Uses
     // an FTSTicker that re-arms each tick until duration_sec has elapsed.
-    FString PieMovePlayerOnGameThread(float DirX, float DirY, float DirZ, float DurationSec, float Scale, int32 PlayerIndex)
+    // v9.10.0 — bFaceMovement rotates the controller to look down the movement
+    // direction first, so first-person characters don't strafe-walk.
+    FString PieMovePlayerOnGameThread(float DirX, float DirY, float DirZ, float DurationSec, float Scale, int32 PlayerIndex, bool bFaceMovement)
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("pie_move_player");
@@ -5506,6 +5508,20 @@ namespace
             return JsonError(CmdName, TEXT("zero_direction"), TEXT("direction vector is (0,0,0)"));
         const FVector NormDir = Direction.GetSafeNormal();
 
+        // v9.10.0 — face the movement direction before moving. Use Yaw only
+        // so we don't tilt the camera by mistake (Pitch=0). Roll always 0.
+        // For Character pawns with bUseControllerRotationYaw=true (the FP/TP
+        // template defaults), the mesh follows the controller's yaw on the
+        // next tick.
+        FRotator AppliedRotation = FRotator::ZeroRotator;
+        if (bFaceMovement)
+        {
+            AppliedRotation = NormDir.Rotation();
+            AppliedRotation.Pitch = 0.0f;
+            AppliedRotation.Roll  = 0.0f;
+            PC->SetControlRotation(AppliedRotation);
+        }
+
         // Shared elapsed-time counter captured by the ticker.
         TSharedRef<float, ESPMode::ThreadSafe> Elapsed = MakeShared<float, ESPMode::ThreadSafe>(0.0f);
         TWeakObjectPtr<APawn> WeakPawn(Pawn);
@@ -5524,11 +5540,42 @@ namespace
             0.0f);   // start ASAP
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"pie_move_player\",\"player_index\":%d,\"direction\":[%f,%f,%f],\"duration_sec\":%f,\"scale\":%f,\"queued\":true}\n"),
+            TEXT("{\"ok\":true,\"command\":\"pie_move_player\",\"player_index\":%d,\"direction\":[%f,%f,%f],")
+            TEXT("\"duration_sec\":%f,\"scale\":%f,\"faced_movement\":%s,\"applied_yaw\":%f,\"queued\":true}\n"),
             PlayerIndex,
             NormDir.X, NormDir.Y, NormDir.Z,
             DurationSec,
-            Scale);
+            Scale,
+            bFaceMovement ? TEXT("true") : TEXT("false"),
+            AppliedRotation.Yaw);
+    }
+
+    // v9.10.0 — pie_set_player_rotation: sets the PlayerController's
+    // ControlRotation, which is the source-of-truth for first-person view
+    // direction (mouse-look writes here). On Character pawns with
+    // bUseControllerRotationYaw=true, the pawn mesh follows yaw next tick.
+    FString PieSetPlayerRotationOnGameThread(float Pitch, float Yaw, float Roll, int32 PlayerIndex)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("pie_set_player_rotation");
+        if (GEditor == nullptr || GEditor->PlayWorld == nullptr)
+            return JsonError(CmdName, TEXT("pie_not_running"));
+
+        APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIndex);
+        if (PC == nullptr)
+            return JsonError(CmdName, TEXT("no_player_controller"),
+                FString::Printf(TEXT("player_index=%d"), PlayerIndex));
+
+        const FRotator NewRotation(Pitch, Yaw, Roll);
+        PC->SetControlRotation(NewRotation);
+
+        const FRotator Applied = PC->GetControlRotation();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"pie_set_player_rotation\",\"player_index\":%d,")
+            TEXT("\"requested\":[%f,%f,%f],\"applied\":[%f,%f,%f]}\n"),
+            PlayerIndex,
+            Pitch, Yaw, Roll,
+            Applied.Pitch, Applied.Yaw, Applied.Roll);
     }
 
     // ===== v8.1 — log capture read/clear (no game-thread needed; capture is thread-safe) =====
@@ -5757,7 +5804,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.9.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.10.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -7467,7 +7514,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- v9.9.0 pie_move_player ---
+    // --- v9.9.0 pie_move_player (v9.10.0 adds face_movement) ---
     if (Command.Equals(TEXT("pie_move_player"), ESearchCase::IgnoreCase))
     {
         const TArray<TSharedPtr<FJsonValue>>* DirArr = nullptr;
@@ -7483,18 +7530,46 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("scale"), InputScale);
         int32 PlayerIndex = 0;
         JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+        bool bFaceMovement = false;
+        JsonObject->TryGetBoolField(TEXT("face_movement"), bFaceMovement);   // v9.10.0
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), DX, DY, DZ, DurationSec, InputScale, PlayerIndex]() mutable
+            [Promise = MoveTemp(Promise), DX, DY, DZ, DurationSec, InputScale, PlayerIndex, bFaceMovement]() mutable
             {
                 Promise.SetValue(PieMovePlayerOnGameThread(
                     static_cast<float>(DX), static_cast<float>(DY), static_cast<float>(DZ),
-                    static_cast<float>(DurationSec), static_cast<float>(InputScale), PlayerIndex));
+                    static_cast<float>(DurationSec), static_cast<float>(InputScale), PlayerIndex, bFaceMovement));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("pie_move_player"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.10.0 pie_set_player_rotation ---
+    if (Command.Equals(TEXT("pie_set_player_rotation"), ESearchCase::IgnoreCase))
+    {
+        const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+        if (!JsonObject->TryGetArrayField(TEXT("rotation"), RotArr) || RotArr->Num() < 3)
+            return JsonError(TEXT("pie_set_player_rotation"), TEXT("missing_field"),
+                TEXT("rotation must be [Pitch, Yaw, Roll]"));
+        const double Pitch = (*RotArr)[0]->AsNumber();
+        const double Yaw   = (*RotArr)[1]->AsNumber();
+        const double Roll  = (*RotArr)[2]->AsNumber();
+        int32 PlayerIndex = 0;
+        JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Pitch, Yaw, Roll, PlayerIndex]() mutable
+            {
+                Promise.SetValue(PieSetPlayerRotationOnGameThread(
+                    static_cast<float>(Pitch), static_cast<float>(Yaw), static_cast<float>(Roll), PlayerIndex));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("pie_set_player_rotation"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

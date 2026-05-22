@@ -3886,3 +3886,87 @@ def test_ping_returns_plugin_version_9_9_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.9.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.10.0 — Player rotation control
+# ---------------------------------------------------------------------------
+
+
+def test_pie_set_player_rotation_success() -> None:
+    response = (
+        b'{"ok":true,"command":"pie_set_player_rotation","player_index":0,'
+        b'"requested":[0,90,0],"applied":[0,90,0]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_set_player_rotation(rotation=[0, 90, 0])
+    assert r["ok"] is True
+    assert r["applied"] == [0, 90, 0]
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "pie_set_player_rotation",
+        "rotation": [0, 90, 0],
+        "player_index": 0,
+    }
+
+
+def test_pie_set_player_rotation_pitch_clamped() -> None:
+    """FPS templates clamp pitch — requested vs applied may differ."""
+    response = (
+        b'{"ok":true,"command":"pie_set_player_rotation","player_index":0,'
+        b'"requested":[180,45,0],"applied":[89,45,0]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.pie_set_player_rotation(rotation=[180, 45, 0])
+    assert r["ok"] is True
+    # Pitch was clamped
+    assert r["applied"][0] == 89
+    assert r["requested"][0] == 180
+
+
+def test_pie_set_player_rotation_local_validation() -> None:
+    assert server.pie_set_player_rotation(rotation=[])["error"] == "missing_argument"
+    assert server.pie_set_player_rotation(rotation=[0, 90])["error"] == "missing_argument"
+
+
+def test_pie_move_player_face_movement_passes_flag() -> None:
+    """v9.10.0 — face_movement=True is forwarded to the plugin."""
+    response = (
+        b'{"ok":true,"command":"pie_move_player","player_index":0,'
+        b'"direction":[1,0,0],"duration_sec":2.0,"scale":1.0,'
+        b'"faced_movement":true,"applied_yaw":0.0,"queued":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_move_player(direction=[1, 0, 0], duration_sec=2.0, face_movement=True)
+    assert r["ok"] is True
+    assert r["faced_movement"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["face_movement"] is True
+
+
+def test_pie_move_player_face_movement_default_omitted() -> None:
+    """Default face_movement=False keeps payload backwards-compatible."""
+    response = b'{"ok":true,"command":"pie_move_player","player_index":0,"direction":[1,0,0],"duration_sec":1,"scale":1,"faced_movement":false,"applied_yaw":0,"queued":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.pie_move_player(direction=[1, 0, 0])
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "face_movement" not in sent_dict
+
+
+def test_ping_returns_plugin_version_9_10_0() -> None:
+    """v9.10.0: ping surfaces 9.10.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.10.0","build_date":"May 21 2026 12:00:00",'
+        b'"timestamp":"2026-05-21T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.10.0"

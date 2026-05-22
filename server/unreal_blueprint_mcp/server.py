@@ -3117,8 +3117,9 @@ def pie_move_player(
     duration_sec: float = 1.0,
     scale: float = 1.0,
     player_index: int = 0,
+    face_movement: bool = False,
 ) -> dict[str, Any]:
-    """Simulate continuous movement input on the PIE pawn — v9.9.0.
+    """Simulate continuous movement input on the PIE pawn — v9.9.0 + v9.10.0 face.
 
     Equivalent to "holding WASD" for ``duration_sec``. Each game-thread
     tick the pawn receives ``AddMovementInput(direction.Normal, scale)``.
@@ -3139,10 +3140,16 @@ def pie_move_player(
         duration_sec: How long to keep applying the input (default 1.0).
         scale: Input scalar (default 1.0). Use < 1.0 for slower motion.
         player_index: Which local player (default 0).
+        face_movement: **v9.10.0** — if True, set the controller's yaw to
+            face ``direction`` BEFORE starting movement. Fixes the
+            first-person "strafe sideways into the portal" weirdness:
+            character actually turns to face where they're walking.
+            Pitch and Roll always 0 (don't tilt the camera).
 
     Returns:
         ``{"ok": True, "player_index": N, "direction": [normalized X,Y,Z],
-            "duration_sec": N, "scale": N, "queued": True}``
+            "duration_sec": N, "scale": N, "faced_movement": bool,
+            "applied_yaw": deg, "queued": True}``
 
     Common errors:
         pie_not_running, no_player_controller, no_pawn,
@@ -3150,11 +3157,57 @@ def pie_move_player(
     """
     if not direction or len(direction) < 3:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "pie_move_player",
         "direction": list(direction)[:3],
         "duration_sec": duration_sec,
         "scale": scale,
+        "player_index": player_index,
+    }
+    if face_movement:
+        payload["face_movement"] = True
+    return _send_command(payload)
+
+
+@mcp.tool()
+def pie_set_player_rotation(
+    rotation: list[float],
+    player_index: int = 0,
+) -> dict[str, Any]:
+    """Set the PIE player's view rotation — v9.10.0.
+
+    Writes to ``APlayerController::SetControlRotation`` — the
+    source-of-truth for first-person camera direction (mouse-look writes
+    here). On Character pawns with ``bUseControllerRotationYaw=true``
+    (the default for both First-Person and Third-Person templates),
+    the pawn mesh follows yaw on the next tick.
+
+    Pair with ``pie_set_player_location`` to position + orient the player
+    in two calls, or use ``pie_move_player(..., face_movement=True)`` to
+    handle "turn-then-walk" in one call.
+
+    Args:
+        rotation: ``[Pitch, Yaw, Roll]`` in degrees.
+            - Pitch: look up (positive) / down (negative). FPS templates
+              typically clamp to ±89°.
+            - Yaw: rotate around vertical axis. 0 = +X, 90 = +Y, etc.
+            - Roll: tilt camera (usually 0).
+        player_index: Which local player (default 0).
+
+    Returns:
+        ``{"ok": True, "player_index": N, "requested": [P,Y,R],
+            "applied": [P,Y,R]}``
+        ``applied`` may differ from ``requested`` if the controller's
+        Pitch/Yaw clamps engage (e.g. FPS Pitch limits).
+
+    Common errors:
+        pie_not_running, no_player_controller
+    """
+    if not rotation or len(rotation) < 3:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "pie_set_player_rotation",
+        "rotation": list(rotation)[:3],
         "player_index": player_index,
     })
 
