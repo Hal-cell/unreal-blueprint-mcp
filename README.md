@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.9.0](https://img.shields.io/badge/version-v9.9.0-brightgreen)](#status)
-[![74 tools](https://img.shields.io/badge/tools-74-blue)](#tools)
-[![203 tests](https://img.shields.io/badge/tests-203%20passing-success)](#requirements)
+[![v9.10.0](https://img.shields.io/badge/version-v9.10.0-brightgreen)](#status)
+[![75 tools](https://img.shields.io/badge/tools-75-blue)](#tools)
+[![209 tests](https://img.shields.io/badge/tests-209%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -72,7 +72,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.7.0** | ✅ Level/instance ops: `list_level_actors` / `get_actor_transform` / `set_actor_transform` / `set_actor_property` / `delete_actor` — LLM no longer blind to the scene |
 | **v9.8.0** | ✅ BP/variable lifecycle: `delete_blueprint` / `delete_variable` / `set_variable_flags` + `add_variable(instance_editable=)` |
 | **v9.9.0** | ✅ PIE input enhancements: `pie_press_key(duration_sec=)` + `pie_set_player_location` + `pie_move_player` — LLM can now actually walk into a trigger box |
-| **Unit tests** | **203 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.10.0** | ✅ PIE player rotation: `pie_set_player_rotation` (SetControlRotation = FPS look) + `pie_move_player(face_movement=)` — character turns to face direction instead of strafing |
+| **Unit tests** | **209 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -246,7 +247,8 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | **`is_pie_running`** (v8) | Query PIE state — `running` (active) + `start_queued` (requested but not yet ticked) |
 | **`pie_press_key`** (v8, **v9.9-extended**) | Simulate key on `APlayerController`. **v9.9 adds `duration_sec=` for held keys** (non-blocking — release scheduled via FTSTicker) |
 | **`pie_set_player_location`** (v9.9) | Teleport the controlled pawn to a world-space location (`SetActorLocation` w/ TeleportPhysics) |
-| **`pie_move_player`** (v9.9) | Simulate continuous movement input — equivalent to holding WASD. Per-tick `AddMovementInput(dir, scale)` via FTSTicker. **The right tool for character pawns** (axis-based) |
+| **`pie_set_player_rotation`** (v9.10) | Set the FPS view direction via `APlayerController::SetControlRotation`. On Character pawns with `bUseControllerRotationYaw=true`, the mesh follows yaw next tick |
+| **`pie_move_player`** (v9.9, **v9.10-extended**) | Simulate continuous movement input — equivalent to holding WASD. Per-tick `AddMovementInput(dir, scale)` via FTSTicker. **v9.10 adds `face_movement=` to turn the controller to face direction first** (fixes FPS strafe-walk weirdness) |
 | **`read_log_capture`** (v8) | Read recent UE log lines from a thread-safe FOutputDevice buffer. Filter by `category` (substring) / `verbosity` / `contains` / `max_lines`. **Sees MCP commands at category `BlueprintMCP_TCP` (v8.0.1+)** |
 | **`clear_log_capture`** (v8) | Drop the log buffer before triggering an action |
 

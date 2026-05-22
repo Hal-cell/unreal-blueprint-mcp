@@ -6,6 +6,41 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
+Everything shipped through v9.10.0.
+
+---
+
+## [v9.10.0] — 2026-05-22 — PIE player rotation control
+
+### Closes the "FPS character strafes sideways into the portal" UX gap
+
+v9.9.0's `pie_move_player` only `AddMovementInput` — no rotation. So
+calling `pie_move_player(direction=[0,1,0])` on a first-person character
+facing +X made the character strafe sideways into the +Y direction
+instead of turning to walk forward. Looks weird.
+
+### Added — 1 new tool + 1 extension (74 → 75)
+
+- **`pie_set_player_rotation(rotation, player_index=0)`** — calls
+  `APlayerController::SetControlRotation(FRotator(Pitch,Yaw,Roll))`,
+  the source-of-truth for first-person view direction (where mouse-look
+  writes). On Character pawns with `bUseControllerRotationYaw=true`
+  (the default for FP/TP templates), the mesh follows yaw on the next
+  tick. Returns `{requested, applied}` so callers can see when FPS
+  Pitch clamps engage.
+- **`pie_move_player(..., face_movement=False)`** — extended kwarg.
+  `face_movement=True` sets the controller's yaw to face the movement
+  direction BEFORE starting the AddMovementInput ticker. Pitch/Roll
+  forced to 0 (don't tilt the camera). Single-call "turn-then-walk."
+
+### `ping.plugin_version`
+"9.9.0" → **"9.10.0"**.
+
+---
+
+(Originally noted in v9.9 wrap-up as "all 7 feature-request gaps shipped" —
+v9.10 is a UX patch on top of #7, not a new gap.)
+
 All four rev4 roadmap items + all 7 feature-request gaps from 2026-05-21
 review shipped:
 - (Done in v9.0.0–v9.3.0) AnimGraph / UMG / Niagara door-openers — every editor
