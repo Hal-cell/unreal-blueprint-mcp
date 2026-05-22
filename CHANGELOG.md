@@ -6,7 +6,57 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.11.0.
+Everything shipped through v9.12.0.
+
+---
+
+## [v9.12.0] — 2026-05-22 — Sizing tools (closes rev6 ISSUE-1/2/3)
+
+### Three rev6 issues — same root cause
+
+The LLM was BLIND TO SIZE when programmatically building levels:
+- **ISSUE-1** — no way to read character capsule → corridor width was
+  a guess. User built a 55-unit gap, character is 68 wide, stuck.
+- **ISSUE-2** — `spawn_actor` couldn't set scale → 2-call pattern
+  (spawn + `set_actor_transform`) with a `(1,1,1)` intermediate state
+  that could leak through `save_all` / re-compile.
+- **ISSUE-3** — no ground snap → Z was a guess too (corridor floor
+  height + capsule half-height = ?).
+
+### Added — 1 new tool + 2 extensions (76 → 77)
+
+- **`spawn_actor(..., scale=None)`** — optional `[X, Y, Z]` scale
+  kwarg. Applied immediately after spawn, BEFORE the level package is
+  marked dirty — no `(1,1,1)` intermediate state. Server also accepts
+  `scale_x/y/z` individually for JSON RPC ergonomics. Response now
+  includes `scale`.
+- **`get_player_capsule(player_index=0)`** — reads
+  `UCapsuleComponent::GetScaledCapsuleRadius/HalfHeight` for Character
+  pawns, `GetSimpleCollisionCylinder` fallback for non-Character.
+  Returns `radius` / `half_height` plus pre-computed `diameter` and
+  `full_height` (no math required by caller). PIE-only — the
+  character pawn doesn't exist in the editor world.
+- **`pie_set_player_location(..., snap_to_ground=False)`** — with
+  `snap_to_ground=True`, line-traces down from
+  `(X, Y, Z + trace_up_height)` by `trace_down_dist` (defaults
+  200 / 10000) on `ECC_Visibility` (ignoring the pawn itself). On
+  hit: place pawn at `ground_z + capsule_half_height`. Response
+  includes `snapped_to_ground` / `ground_z` / `capsule_half_height` /
+  `ground_hit` (the actor name we hit, for verification). No-snap
+  path unchanged.
+
+### Verification (live smoke test)
+
+- `spawn_actor(scale=[11,3,2], rotation=[0,45,0])` → `bounds_extent =
+  [494.97, 494.97, 100]` — exact AABB math for rotated 1100×300 box.
+- `get_player_capsule` on FP template → `radius=55, half_height=96,
+  diameter=110, full_height=192` — this is what rev6 needed to set
+  corridor width correctly the first time.
+- `snap_to_ground` from `Z=5000` → snapped to `ground_z=400.5 +
+  half_height=96 = 496.5`; `ground_hit: StaticMeshActor_2`.
+
+### `ping.plugin_version`
+"9.11.0" → **"9.12.0"**.
 
 ---
 
