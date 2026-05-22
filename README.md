@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.10.0](https://img.shields.io/badge/version-v9.10.0-brightgreen)](#status)
-[![75 tools](https://img.shields.io/badge/tools-75-blue)](#tools)
-[![209 tests](https://img.shields.io/badge/tests-209%20passing-success)](#requirements)
+[![v9.11.0](https://img.shields.io/badge/version-v9.11.0-brightgreen)](#status)
+[![76 tools](https://img.shields.io/badge/tools-76-blue)](#tools)
+[![218 tests](https://img.shields.io/badge/tests-218%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -73,7 +73,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.8.0** | ✅ BP/variable lifecycle: `delete_blueprint` / `delete_variable` / `set_variable_flags` + `add_variable(instance_editable=)` |
 | **v9.9.0** | ✅ PIE input enhancements: `pie_press_key(duration_sec=)` + `pie_set_player_location` + `pie_move_player` — LLM can now actually walk into a trigger box |
 | **v9.10.0** | ✅ PIE player rotation: `pie_set_player_rotation` (SetControlRotation = FPS look) + `pie_move_player(face_movement=)` — character turns to face direction instead of strafing |
-| **Unit tests** | **209 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.11.0** | ✅ `spawn_actor` persistence fix (level pkg now marked dirty) + `rotation=` kwarg + actor bounds in `get_actor_transform` + new `get_actor_bounds` (precise placement against existing geometry) |
+| **Unit tests** | **218 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -163,7 +164,7 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | `echo` | MCP stdio plumbing sanity test |
 | `create_blueprint` | New BP asset in `/Game/...`, parent class from whitelist |
 | `compile_blueprint` | `FKismetEditorUtilities::CompileBlueprint` |
-| `spawn_actor` | Place a compiled BP instance into the current level |
+| `spawn_actor` | Place a compiled BP instance into the current level. **v9.11** adds optional `rotation=[P,Y,R]` kwarg + marks level dirty so `save_all` persists the spawn |
 | **`save_blueprint`** (v7) | Explicit `UEditorAssetLibrary::SaveAsset` |
 | **`save_all`** (v9.4) | Silently save every dirty package — call before any UE kill/restart |
 | **`shutdown_editor`** (v9.6) | Clean editor exit — works in BOTH GUI and headless commandlet modes |
@@ -257,7 +258,8 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | Tool | What it does |
 |------|--------------|
 | **`list_level_actors`** (v9.7) | `UEditorActorSubsystem::GetAllLevelActors` + class + name filter. Returns `[{name, label, class, location}, ...]`. The LLM is no longer blind to the scene |
-| **`get_actor_transform`** (v9.7) | World-space location / rotation / scale of an actor |
+| **`get_actor_transform`** (v9.7, **v9.11-extended**) | World-space location / rotation / scale + **`bounds_origin` / `bounds_extent`** (v9.11 — world OBB half-extent) of an actor |
+| **`get_actor_bounds`** (v9.11) | Standalone bounds query: `world_origin/extent`, pre-computed `world_min/max`, `mesh_local_extent` (pre-scale asset bounds), `mesh_asset` path. For precise placement against existing geometry |
 | **`set_actor_transform`** (v9.7) | Move / rotate / scale a single instance (no re-spawn). Any of location/rotation/scale may be omitted |
 | **`set_actor_property`** (v9.7) | Per-instance FProperty setter (different from `set_component_property` — that writes to the BP CDO). For AActor-typed properties, value can be **another actor's name** (resolved against the level) — canonical "double portal" wiring |
 | **`delete_actor`** (v9.7) | Remove an actor from the level (`DestroyActor`) |

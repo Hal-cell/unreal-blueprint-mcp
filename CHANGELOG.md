@@ -6,7 +6,56 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.10.0.
+Everything shipped through v9.11.0.
+
+---
+
+## [v9.11.0] — 2026-05-22 — spawn_actor persistence + rotation + actor bounds
+
+### Closes rev5 ISSUE-1 + ISSUE-2
+
+- **ISSUE-1** (medium): `spawn_actor` instances were lost on next editor
+  restart because the level package wasn't dirty-marked. The actor was
+  in memory but never persisted by `save_all`.
+- **ISSUE-2** (low/enhancement): no way to query an actor's world-space
+  bounding box → "stick BP_Portal flat against this Cube wall" math
+  required guessing the base mesh size.
+
+Plus drive-by from rev5 §二: `spawn_actor` didn't accept a rotation
+parameter.
+
+### Added — 1 new tool + 3 extensions (75 → 76)
+
+- **`spawn_actor(..., rotation=None)`** — optional `[Pitch, Yaw, Roll]`
+  kwarg (also accepts `rotation_pitch/yaw/roll` individually for JSON
+  RPC ergonomics). Response now also includes `actor_label`
+  (Outliner display) + applied rotation.
+- **`spawn_actor` persistence fix** — after a successful spawn, the
+  level's outermost package is marked dirty so `save_all` actually
+  persists the spawn to disk.
+- **`get_actor_transform`** — response now includes `bounds_origin` and
+  `bounds_extent` (world-space OBB, half-extent) from
+  `AActor::GetActorBounds`. Existing fields unchanged.
+- **`get_actor_bounds(actor)`** — new standalone bounds tool. Returns
+  `world_origin/extent`, pre-computed `world_min/max`,
+  `mesh_local_extent` (pre-scale asset bounds, when root is a
+  StaticMeshComponent), and `mesh_asset` path. Distinguishes
+  "100³ cube scaled 3×" from "300³ cube scaled 1×".
+- **`list_level_actors(..., include_bounds=False)`** — opt-in flag adds
+  per-actor bounds to scan results. Off by default — bounds query has
+  per-actor cost.
+
+### Documentation update
+
+`spawn_actor` docstring now warns: `compile_blueprint` triggers
+reinstancing of all BP-spawned actors → the underlying UObject is
+replaced and `actor_name` changes. After recompile, re-fetch the
+current name via `list_level_actors` before using
+`set_actor_transform` / `set_actor_property` / `delete_actor`. Don't
+cache the post-spawn name across recompiles.
+
+### `ping.plugin_version`
+"9.10.0" → **"9.11.0"**.
 
 ---
 
