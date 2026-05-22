@@ -1069,25 +1069,42 @@ def spawn_actor(
     location_x: float = 0.0,
     location_y: float = 0.0,
     location_z: float = 0.0,
+    rotation: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Spawn a Blueprint instance into the current level (the final step before PIE).
+    """Spawn a Blueprint instance into the current level — v0 + v9.11.0.
 
     Use this after `compile_blueprint` to place the Blueprint into the world so
     its BeginPlay etc. will fire when the user presses Play.
+
+    **v9.11.0 persistence fix**: the level package is now marked dirty after
+    spawn so ``save_all()`` persists the spawn. Previously the actor lived
+    in memory only and was lost on next editor restart.
 
     Args:
         blueprint: Full Blueprint asset path. MUST have been compiled (BS_UpToDate);
             spawning an unbuilt or error-state BP returns `no_generated_class`.
         location_x/y/z: World-space spawn location (default 0,0,0).
             Doesn't matter for non-spatial BPs like PrintString demos.
+        rotation: **v9.11.0** — optional ``[Pitch, Yaw, Roll]`` in degrees.
+            Default ``None`` = identity rotation. Previously you had to spawn
+            then call ``set_actor_transform(rotation=...)`` separately.
 
     Returns:
-        On success: {"ok": True, "blueprint_path": ..., "actor_name": "<UE-assigned>",
-                     "location": [x, y, z]}
-        On error:   {"ok": False, "error": "...", "detail": "..."}
+        On success: ``{"ok": True, "blueprint_path": ..., "actor_name": "<UE-assigned>",
+                       "actor_label": "<Outliner label>",
+                       "location": [x, y, z], "rotation": [P, Y, R]}``
+        On error:   ``{"ok": False, "error": "...", "detail": "..."}``
 
     After spawning, the user must press the **Play** button (top toolbar) to
     enter PIE (Play In Editor) mode. The BP's BeginPlay (if any) fires there.
+
+    **Gotchas to know**:
+    - ``compile_blueprint`` triggers REINSTANCE of all spawned actors of that
+      BP — the underlying UObject gets replaced and ``actor_name`` changes.
+      After recompile, re-fetch the current name via ``list_level_actors``
+      before using ``set_actor_transform`` / ``set_actor_property`` /
+      ``delete_actor``. Don't cache the post-spawn name across recompiles.
+    - The level must be writable (no checkout/source-control block).
 
     Common errors:
         blueprint_not_found  - path doesn't exist
@@ -1097,13 +1114,16 @@ def spawn_actor(
         spawn_failed         - UE refused to spawn (rare; e.g., level not writable)
         game_thread_timeout  - 10s deadline exceeded
     """
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "spawn_actor",
         "blueprint": blueprint,
         "location_x": location_x,
         "location_y": location_y,
         "location_z": location_z,
-    })
+    }
+    if rotation is not None and len(rotation) >= 3:
+        payload["rotation"] = list(rotation)[:3]
+    return _send_command(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,8 +1141,9 @@ def list_level_actors(
     class_filter: str = "",
     name_contains: str = "",
     max_results: int = 500,
+    include_bounds: bool = False,
 ) -> dict[str, Any]:
-    """List actors in the current editor level — v9.7.0.
+    """List actors in the current editor level — v9.7.0 + v9.11.0 bounds.
 
     Lets the LLM see the level layout instead of being blind to the scene.
     Each actor is reported with its `name` (canonical UE name, what
@@ -1136,9 +1157,15 @@ def list_level_actors(
         name_contains: Case-insensitive substring match against both
             `name` and `label`.
         max_results: Cap on number of actors returned (default 500).
+        include_bounds: **v9.11.0** — if True, each actor includes
+            ``bounds_origin`` and ``bounds_extent`` (world-space OBB,
+            same shape as ``AActor::GetActorBounds``). Useful for
+            scanning a level for "what can I place stuff against."
+            Off by default — bounds query has a per-actor cost.
 
     Returns:
-        ``{"ok": True, "actors": [{"name", "label", "class", "location"}, ...],
+        ``{"ok": True, "actors": [{"name", "label", "class", "location",
+                                    + "bounds_origin", "bounds_extent" if include_bounds}, ...],
             "count": N, "class_filter": "..."}``
 
     Common errors:
@@ -1153,12 +1180,15 @@ def list_level_actors(
         payload["class_filter"] = class_filter
     if name_contains:
         payload["name_contains"] = name_contains
+    if include_bounds:
+        payload["include_bounds"] = True
     return _send_command(payload)
 
 
 @mcp.tool()
 def get_actor_transform(actor: str) -> dict[str, Any]:
-    """Get the world-space transform of a level actor — v9.7.0.
+    """Get the world-space transform + bounds of a level actor —
+    v9.7.0 + v9.11.0 bounds.
 
     Args:
         actor: Actor name (`GetName()`) or label (`GetActorLabel()`).
@@ -1166,7 +1196,13 @@ def get_actor_transform(actor: str) -> dict[str, Any]:
     Returns:
         ``{"ok": True, "actor": "...", "label": "...", "class": "...",
             "location": [X, Y, Z], "rotation": [Pitch, Yaw, Roll],
-            "scale": [X, Y, Z]}``
+            "scale": [X, Y, Z],
+            "bounds_origin": [X, Y, Z], "bounds_extent": [X, Y, Z]}``
+
+        ``bounds_origin/extent`` are the world-space OBB (same shape as
+        ``AActor::GetActorBounds``) — origin is the bounds center,
+        extent is the HALF-size on each axis. World min = origin - extent,
+        world max = origin + extent. Useful for vertex/edge/face math.
 
     Common errors:
         actor_not_found — no actor with that name or label
@@ -1174,6 +1210,35 @@ def get_actor_transform(actor: str) -> dict[str, Any]:
     if not actor:
         return {"ok": False, "error": "missing_argument"}
     return _send_command({"command": "get_actor_transform", "actor": actor})
+
+
+@mcp.tool()
+def get_actor_bounds(actor: str) -> dict[str, Any]:
+    """Get an actor's bounds without the transform overhead — v9.11.0.
+
+    Same world-space OBB as ``get_actor_transform`` but isolated. Also
+    returns ``world_min`` / ``world_max`` pre-computed (origin ± extent)
+    so callers don't have to do the arithmetic, plus ``mesh_local_extent``
+    when the root is a StaticMeshComponent — the asset's intrinsic
+    pre-scale size, useful for "what does scale=(2,2,2) mean in cm?"
+    reasoning.
+
+    Args:
+        actor: Actor name or label.
+
+    Returns:
+        ``{"ok": True, "actor": "...",
+            "world_origin": [X, Y, Z], "world_extent": [X, Y, Z],
+            "world_min": [X, Y, Z],    "world_max": [X, Y, Z],
+            "mesh_local_extent": [X, Y, Z] (zero if root isn't a StaticMesh),
+            "mesh_asset": "/Game/..." or ""}``
+
+    Common errors:
+        actor_not_found
+    """
+    if not actor:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "get_actor_bounds", "actor": actor})
 
 
 @mcp.tool()

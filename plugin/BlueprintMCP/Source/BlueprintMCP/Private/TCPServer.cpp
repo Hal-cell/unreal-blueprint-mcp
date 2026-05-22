@@ -59,6 +59,7 @@
 #include "Components/SphereComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"   // v9.11.0 — for GetBounds() on get_actor_bounds
 #include "Camera/CameraComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SpotLightComponent.h"
@@ -3102,7 +3103,8 @@ namespace
      */
     FString SpawnActorOnGameThread(
         const FString& BlueprintPath,
-        float LocX, float LocY, float LocZ)
+        float LocX, float LocY, float LocZ,
+        float RotPitch, float RotYaw, float RotRoll)    // v9.11.0 — rotation kwarg
     {
         check(IsInGameThread());
 
@@ -3139,7 +3141,7 @@ namespace
         }
 
         const FVector Location(LocX, LocY, LocZ);
-        const FRotator Rotation = FRotator::ZeroRotator;
+        const FRotator Rotation(RotPitch, RotYaw, RotRoll);
 
         AActor* SpawnedActor = ActorSubsystem->SpawnActorFromClass(BPClass, Location, Rotation);
         if (SpawnedActor == nullptr)
@@ -3147,11 +3149,22 @@ namespace
             return JsonError(TEXT("spawn_actor"), TEXT("spawn_failed"), BlueprintPath);
         }
 
+        // v9.11.0 ISSUE-1 fix — mark the level package dirty so save_all
+        // actually persists the spawn. Without this, the actor exists in
+        // memory only and is lost on next editor restart.
+        if (SpawnedActor->GetLevel() != nullptr && SpawnedActor->GetLevel()->GetOutermost() != nullptr)
+        {
+            SpawnedActor->GetLevel()->GetOutermost()->MarkPackageDirty();
+        }
+
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"spawn_actor\",\"blueprint_path\":%s,\"actor_name\":%s,\"location\":[%f,%f,%f]}\n"),
+            TEXT("{\"ok\":true,\"command\":\"spawn_actor\",\"blueprint_path\":%s,\"actor_name\":%s,")
+            TEXT("\"actor_label\":%s,\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f]}\n"),
             *EscapeJsonString(BlueprintPath),
             *EscapeJsonString(SpawnedActor->GetName()),
-            LocX, LocY, LocZ);
+            *EscapeJsonString(SpawnedActor->GetActorLabel()),
+            LocX, LocY, LocZ,
+            RotPitch, RotYaw, RotRoll);
     }
 
     // ===== v9.7.0 — Level / instance manipulation =====
@@ -3186,7 +3199,8 @@ namespace
     FString ListLevelActorsOnGameThread(
         const FString& ClassFilter,
         const FString& NameContains,
-        int32 MaxResults)
+        int32 MaxResults,
+        bool bIncludeBounds)   // v9.11.0 ISSUE-2 — opt-in per-actor world bounds
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("list_level_actors");
@@ -3251,6 +3265,17 @@ namespace
             Writer->WriteValue(Loc.Y);
             Writer->WriteValue(Loc.Z);
             Writer->WriteArrayEnd();
+            if (bIncludeBounds)
+            {
+                FVector BO = FVector::ZeroVector, BE = FVector::ZeroVector;
+                A->GetActorBounds(false, BO, BE, true);
+                Writer->WriteArrayStart(TEXT("bounds_origin"));
+                Writer->WriteValue(BO.X); Writer->WriteValue(BO.Y); Writer->WriteValue(BO.Z);
+                Writer->WriteArrayEnd();
+                Writer->WriteArrayStart(TEXT("bounds_extent"));
+                Writer->WriteValue(BE.X); Writer->WriteValue(BE.Y); Writer->WriteValue(BE.Z);
+                Writer->WriteArrayEnd();
+            }
             Writer->WriteObjectEnd();
 
             ++Count;
@@ -3275,15 +3300,74 @@ namespace
         const FVector Loc = T.GetLocation();
         const FRotator Rot = T.Rotator();
         const FVector Scale = T.GetScale3D();
+
+        // v9.11.0 ISSUE-2 — include world-space bounds so the LLM can compute
+        // "stick this against that wall" placements without guessing.
+        // GetActorBounds returns the OBB origin + half-extent.
+        FVector BoundsOrigin = FVector::ZeroVector;
+        FVector BoundsExtent = FVector::ZeroVector;
+        A->GetActorBounds(/*bOnlyCollidingComponents*/ false, BoundsOrigin, BoundsExtent, /*bIncludeFromChildActors*/ true);
+
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"get_actor_transform\",\"actor\":%s,\"label\":%s,\"class\":%s,")
-            TEXT("\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f],\"scale\":[%f,%f,%f]}\n"),
+            TEXT("\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f],\"scale\":[%f,%f,%f],")
+            TEXT("\"bounds_origin\":[%f,%f,%f],\"bounds_extent\":[%f,%f,%f]}\n"),
             *EscapeJsonString(A->GetName()),
             *EscapeJsonString(A->GetActorLabel()),
             *EscapeJsonString(A->GetClass()->GetName()),
             Loc.X, Loc.Y, Loc.Z,
             Rot.Pitch, Rot.Yaw, Rot.Roll,
-            Scale.X, Scale.Y, Scale.Z);
+            Scale.X, Scale.Y, Scale.Z,
+            BoundsOrigin.X, BoundsOrigin.Y, BoundsOrigin.Z,
+            BoundsExtent.X, BoundsExtent.Y, BoundsExtent.Z);
+    }
+
+    // v9.11.0 — standalone bounds query. Same as the bounds fields in
+    // get_actor_transform but isolated for when callers only need bounds.
+    // Includes both the world OBB AND the local-space mesh bounds (when
+    // a single primary StaticMeshComponent exists) so callers can reason
+    // about the "raw mesh extent before scale" too.
+    FString GetActorBoundsOnGameThread(const FString& ActorName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("get_actor_bounds");
+        AActor* A = FindActorByNameOrLabel(ActorName);
+        if (A == nullptr)
+            return JsonError(CmdName, TEXT("actor_not_found"), ActorName);
+
+        FVector BoundsOrigin = FVector::ZeroVector;
+        FVector BoundsExtent = FVector::ZeroVector;
+        A->GetActorBounds(false, BoundsOrigin, BoundsExtent, true);
+
+        // Local-space (pre-scale) mesh bounds — useful for "what is the asset's
+        // intrinsic size?" Look at the actor's root if it's a StaticMeshComponent.
+        FVector MeshLocalExtent = FVector::ZeroVector;
+        FString MeshAssetPath;
+        if (USceneComponent* Root = A->GetRootComponent())
+        {
+            if (UStaticMeshComponent* SMC = Cast<UStaticMeshComponent>(Root))
+            {
+                if (UStaticMesh* SM = SMC->GetStaticMesh())
+                {
+                    const FBoxSphereBounds LocalBounds = SM->GetBounds();
+                    MeshLocalExtent = LocalBounds.BoxExtent;
+                    MeshAssetPath = SM->GetPathName();
+                }
+            }
+        }
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"get_actor_bounds\",\"actor\":%s,")
+            TEXT("\"world_origin\":[%f,%f,%f],\"world_extent\":[%f,%f,%f],")
+            TEXT("\"world_min\":[%f,%f,%f],\"world_max\":[%f,%f,%f],")
+            TEXT("\"mesh_local_extent\":[%f,%f,%f],\"mesh_asset\":%s}\n"),
+            *EscapeJsonString(A->GetName()),
+            BoundsOrigin.X, BoundsOrigin.Y, BoundsOrigin.Z,
+            BoundsExtent.X, BoundsExtent.Y, BoundsExtent.Z,
+            BoundsOrigin.X - BoundsExtent.X, BoundsOrigin.Y - BoundsExtent.Y, BoundsOrigin.Z - BoundsExtent.Z,
+            BoundsOrigin.X + BoundsExtent.X, BoundsOrigin.Y + BoundsExtent.Y, BoundsOrigin.Z + BoundsExtent.Z,
+            MeshLocalExtent.X, MeshLocalExtent.Y, MeshLocalExtent.Z,
+            *EscapeJsonString(MeshAssetPath));
     }
 
     FString SetActorTransformOnGameThread(
@@ -5804,7 +5888,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.10.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.11.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6737,7 +6821,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- spawn_actor (Spike B6) ---
+    // --- spawn_actor (Spike B6 + v9.11.0 rotation kwarg + persistence fix) ---
     if (Command.Equals(TEXT("spawn_actor"), ESearchCase::IgnoreCase))
     {
         FString Blueprint;
@@ -6749,15 +6833,29 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetNumberField(TEXT("location_x"), LocX);
         JsonObject->TryGetNumberField(TEXT("location_y"), LocY);
         JsonObject->TryGetNumberField(TEXT("location_z"), LocZ);
+        // v9.11.0 — optional rotation. Accept either rotation_pitch/yaw/roll
+        // or a "rotation": [P, Y, R] array.
+        double RotPitch = 0.0, RotYaw = 0.0, RotRoll = 0.0;
+        JsonObject->TryGetNumberField(TEXT("rotation_pitch"), RotPitch);
+        JsonObject->TryGetNumberField(TEXT("rotation_yaw"),   RotYaw);
+        JsonObject->TryGetNumberField(TEXT("rotation_roll"),  RotRoll);
+        const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("rotation"), RotArr) && RotArr->Num() >= 3)
+        {
+            RotPitch = (*RotArr)[0]->AsNumber();
+            RotYaw   = (*RotArr)[1]->AsNumber();
+            RotRoll  = (*RotArr)[2]->AsNumber();
+        }
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
 
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, LocX, LocY, LocZ]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, LocX, LocY, LocZ, RotPitch, RotYaw, RotRoll]() mutable
             {
                 FString Result = SpawnActorOnGameThread(Blueprint,
-                    static_cast<float>(LocX), static_cast<float>(LocY), static_cast<float>(LocZ));
+                    static_cast<float>(LocX), static_cast<float>(LocY), static_cast<float>(LocZ),
+                    static_cast<float>(RotPitch), static_cast<float>(RotYaw), static_cast<float>(RotRoll));
                 Promise.SetValue(MoveTemp(Result));
             });
 
@@ -6770,7 +6868,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- v9.7.0 list_level_actors ---
+    // --- v9.7.0 list_level_actors (v9.11.0 include_bounds) ---
     if (Command.Equals(TEXT("list_level_actors"), ESearchCase::IgnoreCase))
     {
         FString ClassFilter, NameContains;
@@ -6778,20 +6876,22 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetStringField(TEXT("name_contains"), NameContains);
         int32 MaxResults = 500;
         JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
+        bool bIncludeBounds = false;
+        JsonObject->TryGetBoolField(TEXT("include_bounds"), bIncludeBounds);   // v9.11.0
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), ClassFilter, NameContains, MaxResults]() mutable
+            [Promise = MoveTemp(Promise), ClassFilter, NameContains, MaxResults, bIncludeBounds]() mutable
             {
-                Promise.SetValue(ListLevelActorsOnGameThread(ClassFilter, NameContains, MaxResults));
+                Promise.SetValue(ListLevelActorsOnGameThread(ClassFilter, NameContains, MaxResults, bIncludeBounds));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("list_level_actors"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
-    // --- v9.7.0 get_actor_transform ---
+    // --- v9.7.0 get_actor_transform (v9.11.0 now also returns bounds) ---
     if (Command.Equals(TEXT("get_actor_transform"), ESearchCase::IgnoreCase))
     {
         FString ActorName;
@@ -6807,6 +6907,25 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("get_actor_transform"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.11.0 get_actor_bounds ---
+    if (Command.Equals(TEXT("get_actor_bounds"), ESearchCase::IgnoreCase))
+    {
+        FString ActorName;
+        if (!JsonObject->TryGetStringField(TEXT("actor"), ActorName) || ActorName.IsEmpty())
+            return JsonError(TEXT("get_actor_bounds"), TEXT("missing_field"), TEXT("actor"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), ActorName]() mutable
+            {
+                Promise.SetValue(GetActorBoundsOnGameThread(ActorName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_actor_bounds"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

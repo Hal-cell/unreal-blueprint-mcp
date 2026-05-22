@@ -3970,3 +3970,122 @@ def test_ping_returns_plugin_version_9_10_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.10.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.11.0 — spawn_actor rotation + persistence + bounds
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_actor_with_rotation() -> None:
+    """v9.11.0 — rotation kwarg is forwarded."""
+    response = (
+        b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/BP_Portal",'
+        b'"actor_name":"BP_Portal_C_1","actor_label":"BP_Portal_C_1",'
+        b'"location":[0,0,0],"rotation":[0,90,0]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.spawn_actor(blueprint="/Game/BP_Portal", rotation=[0, 90, 0])
+    assert r["ok"] is True
+    assert r["actor_label"] == "BP_Portal_C_1"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["rotation"] == [0, 90, 0]
+
+
+def test_spawn_actor_no_rotation_omitted() -> None:
+    """Default rotation=None keeps the payload backwards-compatible."""
+    response = b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/BP","actor_name":"A","actor_label":"A","location":[0,0,0],"rotation":[0,0,0]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.spawn_actor(blueprint="/Game/BP")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "rotation" not in sent_dict
+
+
+def test_get_actor_transform_now_returns_bounds() -> None:
+    """v9.11.0 — get_actor_transform response includes bounds_origin/extent."""
+    response = (
+        b'{"ok":true,"command":"get_actor_transform","actor":"Cube_1","label":"Cube",'
+        b'"class":"StaticMeshActor","location":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1],'
+        b'"bounds_origin":[0,0,0],"bounds_extent":[50,50,50]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_actor_transform(actor="Cube_1")
+    assert r["ok"] is True
+    assert r["bounds_origin"] == [0, 0, 0]
+    assert r["bounds_extent"] == [50, 50, 50]
+
+
+def test_get_actor_bounds_success() -> None:
+    response = (
+        b'{"ok":true,"command":"get_actor_bounds","actor":"Cube_1",'
+        b'"world_origin":[100,0,50],"world_extent":[50,50,50],'
+        b'"world_min":[50,-50,0],"world_max":[150,50,100],'
+        b'"mesh_local_extent":[50,50,50],"mesh_asset":"/Engine/BasicShapes/Cube.Cube"}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.get_actor_bounds(actor="Cube_1")
+    assert r["ok"] is True
+    assert r["world_min"] == [50, -50, 0]
+    assert r["world_max"] == [150, 50, 100]
+    assert r["mesh_local_extent"] == [50, 50, 50]
+    assert r["mesh_asset"].endswith("Cube.Cube")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "get_actor_bounds", "actor": "Cube_1"}
+
+
+def test_get_actor_bounds_not_found() -> None:
+    response = b'{"ok":false,"command":"get_actor_bounds","error":"actor_not_found","detail":"Ghost"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_actor_bounds(actor="Ghost")
+    assert r["ok"] is False
+    assert r["error"] == "actor_not_found"
+
+
+def test_get_actor_bounds_local_validation() -> None:
+    assert server.get_actor_bounds(actor="")["error"] == "missing_argument"
+
+
+def test_list_level_actors_include_bounds() -> None:
+    response = (
+        b'{"ok":true,"command":"list_level_actors","class_filter":"StaticMeshActor",'
+        b'"actors":[{"name":"Cube_1","label":"Cube","class":"StaticMeshActor",'
+        b'"location":[0,0,0],"bounds_origin":[0,0,0],"bounds_extent":[50,50,50]}],"count":1}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_level_actors(class_filter="StaticMeshActor", include_bounds=True)
+    assert r["ok"] is True
+    assert r["actors"][0]["bounds_extent"] == [50, 50, 50]
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["include_bounds"] is True
+
+
+def test_list_level_actors_include_bounds_default_off() -> None:
+    response = b'{"ok":true,"command":"list_level_actors","actors":[],"count":0}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.list_level_actors()
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "include_bounds" not in sent_dict
+
+
+def test_ping_returns_plugin_version_9_11_0() -> None:
+    """v9.11.0: ping surfaces 9.11.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.11.0","build_date":"May 22 2026 12:00:00",'
+        b'"timestamp":"2026-05-22T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.11.0"
