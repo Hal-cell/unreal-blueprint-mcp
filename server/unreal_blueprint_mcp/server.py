@@ -460,20 +460,29 @@ def add_select(
     num_options: int = 2,
     graph_name: str = "",
 ) -> dict[str, Any]:
-    """Add a Select node (``K2Node_Select``) — v7.2.
+    """Add a Select node (``K2Node_Select``) — v7.2 + v9.14.0 num_options fix.
 
-    Three-way+ chooser: ``Index`` picks one of N option inputs and outputs its
+    N-way chooser: ``Index`` picks one of N option inputs and outputs its
     value. Value type is wildcard until you connect the first option.
+
+    **v9.14.0**: ``num_options`` now actually grows past 2. Previous
+    behavior silently capped at 2 (rev8 ISSUE-1). Uses
+    ``UK2Node_Select::AddInputPin()`` in a loop, which automatically
+    flips the index pin from bool → int once you exceed 2.
 
     Args:
         blueprint: BP asset path.
         anchor_name: Unique label.
-        num_options: Number of option input pins (``Option 0``, ``Option 1``, …).
-            Default 2.
+        num_options: Number of option input pins (``Option 0``, ``Option 1``,
+            …, ``Option N-1``). Default 2. Clamped to [2, 64].
         position_x, position_y: Graph coordinates.
 
     Returns:
-        Standard node-creation JSON.
+        ``{"ok": True, "anchor_name": "...", "num_options": N,
+            "node_guid": "...", "pins": [...], "saved": True}``
+        ``num_options`` in the response is the ACTUAL count after
+        ``CanAddPin`` gating (will equal the request unless UE refused
+        a particular add).
     """
     if not blueprint or not anchor_name:
         return {"ok": False, "error": "missing_argument"}

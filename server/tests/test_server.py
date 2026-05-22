@@ -4326,3 +4326,64 @@ def test_ping_returns_plugin_version_9_13_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.13.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.14.0 — add_select num_options actually grows past 2 (closes rev8 ISSUE-1)
+# ---------------------------------------------------------------------------
+
+
+def test_add_select_num_options_6() -> None:
+    """rev8 ISSUE-1 — num_options=6 must produce 6 Option pins, not 2."""
+    response = (
+        b'{"ok":true,"command":"add_select","anchor_name":"mode_select",'
+        b'"num_options":6,"node_guid":"AAAA",'
+        b'"pins":['
+        b'{"name":"Option 0","direction":"input","type":"wildcard"},'
+        b'{"name":"Option 1","direction":"input","type":"wildcard"},'
+        b'{"name":"Option 2","direction":"input","type":"wildcard"},'
+        b'{"name":"Option 3","direction":"input","type":"wildcard"},'
+        b'{"name":"Option 4","direction":"input","type":"wildcard"},'
+        b'{"name":"Option 5","direction":"input","type":"wildcard"},'
+        b'{"name":"Index","direction":"input","type":"int"},'
+        b'{"name":"ReturnValue","direction":"output","type":"wildcard"}'
+        b'],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_select(
+            blueprint="/Game/BP", anchor_name="mode_select", num_options=6,
+        )
+    assert r["ok"] is True
+    assert r["num_options"] == 6
+    option_pins = [p for p in r["pins"] if p["name"].startswith("Option ")]
+    assert len(option_pins) == 6, f"expected 6 Option pins, got: {[p['name'] for p in option_pins]}"
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["num_options"] == 6
+
+
+def test_add_select_default_2_options() -> None:
+    """Default num_options=2 still works (backwards-compatible)."""
+    response = b'{"ok":true,"command":"add_select","anchor_name":"s","num_options":2,"node_guid":"X","pins":[],"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_select(blueprint="/Game/BP", anchor_name="s")
+    assert r["num_options"] == 2
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["num_options"] == 2
+
+
+def test_ping_returns_plugin_version_9_14_0() -> None:
+    """v9.14.0: ping surfaces 9.14.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.14.0","build_date":"May 23 2026 12:00:00",'
+        b'"timestamp":"2026-05-23T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.14.0"

@@ -5541,17 +5541,28 @@ namespace
         UK2Node_Select* NewNode = SpawnK2NodeBare<UK2Node_Select>(EventGraph, AnchorName, PosX, PosY);
         FinalizeK2Node(EventGraph, NewNode);
 
-        // Note: UE 5.4 UK2Node_Select has no public AddOptionPinToNode() — only
-        // RemoveOptionPinToNode(). Default node has 2 option pins; adding more requires
-        // the BP editor's "Add Option" context-menu action. Param NumOptions is ignored
-        // when > 2 (logged so the user knows). v7.2.x candidate: implement via
-        // ReconstructNode + direct NumOptionPins mutation.
-        const int32 ActualNumOptions = 2;
-        if (NumOptions > ActualNumOptions)
+        // v9.14.0 — rev8 ISSUE-1 fix. UK2Node_Select::AddInputPin() IS public
+        // (overrides IK2Node_AddPinInterface). The earlier "defaults to 2" was
+        // wrong — we now actually grow to NumOptions. AddInputPin internally:
+        //   - Increments NumOptionPins
+        //   - Flips IndexPin from bool → int once we exceed 2
+        //   - Calls ReconstructNode to materialize new Option pins
+        // Loop from 2 (default) up to NumOptions; respect CanAddPin gating.
+        const int32 RequestedOptions = FMath::Clamp(NumOptions, 2, 64);
+        for (int32 i = 2; i < RequestedOptions; ++i)
+        {
+            if (!NewNode->CanAddPin()) break;
+            NewNode->AddInputPin();
+        }
+        // NumOptionPins is private — count via GetOptionPins (BLUEPRINTGRAPH_API).
+        TArray<UEdGraphPin*> OptionPins;
+        NewNode->GetOptionPins(OptionPins);
+        const int32 ActualNumOptions = OptionPins.Num();
+        if (ActualNumOptions != RequestedOptions)
         {
             UE_LOG(LogBlueprintMCP_TCP, Warning,
-                TEXT("add_select: requested num_options=%d but UE 5.4 K2Node_Select has no public AddOption — defaulting to 2"),
-                NumOptions);
+                TEXT("add_select: requested num_options=%d, ended at %d (CanAddPin gating engaged)"),
+                NumOptions, ActualNumOptions);
         }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
@@ -6133,7 +6144,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.13.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.14.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
