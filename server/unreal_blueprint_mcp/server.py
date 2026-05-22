@@ -1070,15 +1070,19 @@ def spawn_actor(
     location_y: float = 0.0,
     location_z: float = 0.0,
     rotation: list[float] | None = None,
+    scale: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Spawn a Blueprint instance into the current level — v0 + v9.11.0.
+    """Spawn a Blueprint instance into the current level — v0 + v9.11.0 + v9.12.0.
 
     Use this after `compile_blueprint` to place the Blueprint into the world so
     its BeginPlay etc. will fire when the user presses Play.
 
     **v9.11.0 persistence fix**: the level package is now marked dirty after
-    spawn so ``save_all()`` persists the spawn. Previously the actor lived
-    in memory only and was lost on next editor restart.
+    spawn so ``save_all()`` persists the spawn.
+
+    **v9.12.0 full-transform spawn**: now accepts both ``rotation`` AND
+    ``scale``. One call places the actor at full pose — no intermediate
+    ``(1,1,1)`` scale state for ``save_all`` / PIE / re-compile to capture.
 
     Args:
         blueprint: Full Blueprint asset path. MUST have been compiled (BS_UpToDate);
@@ -1086,13 +1090,18 @@ def spawn_actor(
         location_x/y/z: World-space spawn location (default 0,0,0).
             Doesn't matter for non-spatial BPs like PrintString demos.
         rotation: **v9.11.0** — optional ``[Pitch, Yaw, Roll]`` in degrees.
-            Default ``None`` = identity rotation. Previously you had to spawn
-            then call ``set_actor_transform(rotation=...)`` separately.
+            Default ``None`` = identity rotation.
+        scale: **v9.12.0** — optional ``[X, Y, Z]`` scale. Default ``None``
+            = whatever the BP CDO's RootComponent.RelativeScale3D is
+            (usually ``(1, 1, 1)``). For "an 11×3×2 wall" the right move
+            is now one ``spawn_actor(..., scale=[11, 3, 2])`` instead
+            of spawn + ``set_actor_transform``.
 
     Returns:
         On success: ``{"ok": True, "blueprint_path": ..., "actor_name": "<UE-assigned>",
                        "actor_label": "<Outliner label>",
-                       "location": [x, y, z], "rotation": [P, Y, R]}``
+                       "location": [x, y, z], "rotation": [P, Y, R],
+                       "scale": [X, Y, Z]}``
         On error:   ``{"ok": False, "error": "...", "detail": "..."}``
 
     After spawning, the user must press the **Play** button (top toolbar) to
@@ -1123,6 +1132,8 @@ def spawn_actor(
     }
     if rotation is not None and len(rotation) >= 3:
         payload["rotation"] = list(rotation)[:3]
+    if scale is not None and len(scale) >= 3:
+        payload["scale"] = list(scale)[:3]
     return _send_command(payload)
 
 
@@ -3148,30 +3159,97 @@ def pie_press_key(
 def pie_set_player_location(
     location: list[float],
     player_index: int = 0,
+    snap_to_ground: bool = False,
+    trace_up_height: float = 200.0,
+    trace_down_dist: float = 10000.0,
 ) -> dict[str, Any]:
-    """Teleport the PIE pawn to a world-space location — v9.9.0.
+    """Teleport the PIE pawn to a world-space location — v9.9.0 + v9.12.0 snap.
 
     Calls ``APlayerController::GetPawn()->SetActorLocation(loc,
     bSweep=false, ..., ETeleportType::TeleportPhysics)``. Useful to
     drop the player at a specific test position before driving into a
     trigger volume, or to reset a stuck test.
 
+    **v9.12.0 snap-to-ground**: with ``snap_to_ground=True`` the
+    location's Z becomes a STARTING POINT — the server does a downward
+    line trace from ``(X, Y, Z + trace_up_height)`` to
+    ``(X, Y, Z - trace_down_dist)`` and lands the pawn at
+    ``ground_z + capsule_half_height``. No more guessing Z. Closes
+    rev6 ISSUE-3.
+
     Args:
-        location: ``[X, Y, Z]`` world coordinates.
+        location: ``[X, Y, Z]`` world coordinates. With
+            ``snap_to_ground=True`` only X/Y matter — Z is the trace
+            anchor, the final Z is computed from the ground hit.
         player_index: Which local player (default 0).
+        snap_to_ground: **v9.12.0** — line-trace down for ground +
+            offset by capsule half-height. Default False
+            (backwards-compatible).
+        trace_up_height: How far above the supplied Z to START the
+            trace (in case Z is inside a wall). Default 200.
+        trace_down_dist: How far below to trace. Default 10000.
 
     Returns:
         ``{"ok": True, "player_index": N, "requested": [X,Y,Z],
-            "actual": [X,Y,Z], "moved": True}``
+            "actual": [X,Y,Z], "moved": True,
+            "snapped_to_ground": bool, "ground_z": Z,
+            "capsule_half_height": H, "ground_hit": "<actor name>"}``
+        ``snapped_to_ground=false`` if no ground was found in the trace
+        range — pawn is placed at the requested Z instead.
 
     Common errors:
         pie_not_running, no_player_controller, no_pawn
     """
     if not location or len(location) < 3:
         return {"ok": False, "error": "missing_argument"}
-    return _send_command({
+    payload: dict[str, Any] = {
         "command": "pie_set_player_location",
         "location": list(location)[:3],
+        "player_index": player_index,
+    }
+    if snap_to_ground:
+        payload["snap_to_ground"] = True
+        payload["trace_up_height"] = trace_up_height
+        payload["trace_down_dist"] = trace_down_dist
+    return _send_command(payload)
+
+
+@mcp.tool()
+def get_player_capsule(player_index: int = 0) -> dict[str, Any]:
+    """Read the PIE player's collision capsule dimensions — v9.12.0.
+
+    Closes rev6 ISSUE-1 — the LLM is no longer blind to player size
+    when programmatically laying out corridors / doors / cover.
+
+    The character only exists in the PIE world (a Character pawn at
+    PlayerStart, spawned by ``start_pie``), NOT in the editor world.
+    So ``start_pie`` must already be running.
+
+    For ``ACharacter``-derived pawns (the FP/TP template defaults),
+    reads ``UCapsuleComponent::GetScaledCapsuleRadius()`` and
+    ``GetScaledCapsuleHalfHeight()`` directly. For non-Character
+    pawns, falls back to ``GetSimpleCollisionCylinder`` (approximate
+    cylinder).
+
+    Args:
+        player_index: Which local player (default 0).
+
+    Returns:
+        ``{"ok": True, "player_index": N,
+            "pawn_name": "...", "pawn_class": "...",
+            "is_character": bool, "has_capsule": bool,
+            "radius": R, "half_height": H,
+            "diameter": 2R, "full_height": 2H,
+            "location": [X,Y,Z], "rotation": [P,Y,R]}``
+
+        Use ``diameter`` for "how wide a corridor needs to be" math
+        (plus a margin), ``full_height`` for "how tall a doorway."
+
+    Common errors:
+        pie_not_running, no_player_controller, no_pawn
+    """
+    return _send_command({
+        "command": "get_player_capsule",
         "player_index": player_index,
     })
 

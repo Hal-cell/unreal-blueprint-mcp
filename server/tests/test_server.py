@@ -4089,3 +4089,144 @@ def test_ping_returns_plugin_version_9_11_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.11.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.12.0 — get_player_capsule + spawn_actor scale + snap_to_ground
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_actor_with_scale() -> None:
+    """v9.12.0 — scale kwarg is forwarded."""
+    response = (
+        b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/BP",'
+        b'"actor_name":"BP_C_1","actor_label":"BP","location":[0,0,0],'
+        b'"rotation":[0,0,0],"scale":[11,3,2]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.spawn_actor(blueprint="/Game/BP", scale=[11, 3, 2])
+    assert r["ok"] is True
+    assert r["scale"] == [11, 3, 2]
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["scale"] == [11, 3, 2]
+
+
+def test_spawn_actor_rotation_and_scale_together() -> None:
+    """Full-pose spawn — both rotation and scale on one call."""
+    response = b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/BP","actor_name":"A","actor_label":"A","location":[0,0,0],"rotation":[0,90,0],"scale":[2,2,2]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.spawn_actor(blueprint="/Game/BP", rotation=[0, 90, 0], scale=[2, 2, 2])
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["rotation"] == [0, 90, 0]
+    assert sent_dict["scale"] == [2, 2, 2]
+
+
+def test_spawn_actor_no_scale_omitted() -> None:
+    """Default scale=None keeps the payload backwards-compatible."""
+    response = b'{"ok":true,"command":"spawn_actor","blueprint_path":"/Game/BP","actor_name":"A","actor_label":"A","location":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.spawn_actor(blueprint="/Game/BP")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "scale" not in sent_dict
+
+
+def test_get_player_capsule_character() -> None:
+    """ACharacter pawn → has_capsule=True, scaled dims surface."""
+    response = (
+        b'{"ok":true,"command":"get_player_capsule","player_index":0,'
+        b'"pawn_name":"FirstPersonCharacter_C_0","pawn_class":"FirstPersonCharacter_C",'
+        b'"is_character":true,"has_capsule":true,"radius":34.0,"half_height":88.0,'
+        b'"diameter":68.0,"full_height":176.0,'
+        b'"location":[0,0,180],"rotation":[0,0,0]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.get_player_capsule()
+    assert r["ok"] is True
+    assert r["is_character"] is True
+    assert r["radius"] == 34.0
+    assert r["half_height"] == 88.0
+    # Convenience-derived doubles
+    assert r["diameter"] == 68.0
+    assert r["full_height"] == 176.0
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "get_player_capsule", "player_index": 0}
+
+
+def test_get_player_capsule_no_pie() -> None:
+    response = b'{"ok":false,"command":"get_player_capsule","error":"pie_not_running","detail":"Start PIE first"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_player_capsule()
+    assert r["ok"] is False
+    assert r["error"] == "pie_not_running"
+
+
+def test_pie_set_player_location_snap_to_ground() -> None:
+    """snap_to_ground=True forwards the flag + trace params."""
+    response = (
+        b'{"ok":true,"command":"pie_set_player_location","player_index":0,'
+        b'"requested":[200,0,500],"actual":[200,0,188.0],"moved":true,'
+        b'"snapped_to_ground":true,"ground_z":100.0,"capsule_half_height":88.0,'
+        b'"ground_hit":"Floor_1"}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.pie_set_player_location(location=[200, 0, 500], snap_to_ground=True)
+    assert r["ok"] is True
+    assert r["snapped_to_ground"] is True
+    assert r["ground_z"] == 100.0
+    assert r["actual"][2] == 188.0   # 100 + 88
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["snap_to_ground"] is True
+    assert sent_dict["trace_up_height"] == 200.0
+    assert sent_dict["trace_down_dist"] == 10000.0
+
+
+def test_pie_set_player_location_no_snap_default() -> None:
+    """Default snap=False keeps the payload backwards-compatible."""
+    response = b'{"ok":true,"command":"pie_set_player_location","player_index":0,"requested":[0,0,0],"actual":[0,0,0],"moved":true,"snapped_to_ground":false,"ground_z":0,"capsule_half_height":0,"ground_hit":""}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.pie_set_player_location(location=[0, 0, 0])
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "snap_to_ground" not in sent_dict
+
+
+def test_pie_set_player_location_snap_custom_trace() -> None:
+    """Override trace_up_height / trace_down_dist."""
+    response = b'{"ok":true,"command":"pie_set_player_location","player_index":0,"requested":[0,0,0],"actual":[0,0,0],"moved":true,"snapped_to_ground":false,"ground_z":0,"capsule_half_height":0,"ground_hit":""}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.pie_set_player_location(
+            location=[0, 0, 0],
+            snap_to_ground=True,
+            trace_up_height=50,
+            trace_down_dist=5000,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["trace_up_height"] == 50
+    assert sent_dict["trace_down_dist"] == 5000
+
+
+def test_ping_returns_plugin_version_9_12_0() -> None:
+    """v9.12.0: ping surfaces 9.12.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.12.0","build_date":"May 22 2026 12:00:00",'
+        b'"timestamp":"2026-05-22T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.12.0"

@@ -3104,7 +3104,9 @@ namespace
     FString SpawnActorOnGameThread(
         const FString& BlueprintPath,
         float LocX, float LocY, float LocZ,
-        float RotPitch, float RotYaw, float RotRoll)    // v9.11.0 — rotation kwarg
+        float RotPitch, float RotYaw, float RotRoll,    // v9.11.0
+        float ScaleX, float ScaleY, float ScaleZ,       // v9.12.0
+        bool bHasScale)
     {
         check(IsInGameThread());
 
@@ -3149,6 +3151,17 @@ namespace
             return JsonError(TEXT("spawn_actor"), TEXT("spawn_failed"), BlueprintPath);
         }
 
+        // v9.12.0 — apply scale immediately after spawn, BEFORE we report
+        // success or mark dirty. Closes rev6 ISSUE-2 附带: no (1,1,1)
+        // intermediate state for save_all / PIE to capture.
+        FVector AppliedScale = SpawnedActor->GetActorScale3D();
+        if (bHasScale)
+        {
+            const FVector NewScale(ScaleX, ScaleY, ScaleZ);
+            SpawnedActor->SetActorScale3D(NewScale);
+            AppliedScale = NewScale;
+        }
+
         // v9.11.0 ISSUE-1 fix — mark the level package dirty so save_all
         // actually persists the spawn. Without this, the actor exists in
         // memory only and is lost on next editor restart.
@@ -3159,12 +3172,13 @@ namespace
 
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"spawn_actor\",\"blueprint_path\":%s,\"actor_name\":%s,")
-            TEXT("\"actor_label\":%s,\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f]}\n"),
+            TEXT("\"actor_label\":%s,\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f],\"scale\":[%f,%f,%f]}\n"),
             *EscapeJsonString(BlueprintPath),
             *EscapeJsonString(SpawnedActor->GetName()),
             *EscapeJsonString(SpawnedActor->GetActorLabel()),
             LocX, LocY, LocZ,
-            RotPitch, RotYaw, RotRoll);
+            RotPitch, RotYaw, RotRoll,
+            AppliedScale.X, AppliedScale.Y, AppliedScale.Z);
     }
 
     // ===== v9.7.0 — Level / instance manipulation =====
@@ -5536,33 +5550,133 @@ namespace
             DurationSec);
     }
 
-    // v9.9.0 — pie_set_player_location: teleport the controlled pawn.
-    FString PieSetPlayerLocationOnGameThread(float X, float Y, float Z, int32 PlayerIndex)
+    // v9.12.0 — small helper: extract a Character pawn's capsule dims,
+    // falling back to GetSimpleCollisionCylinder for non-Character pawns.
+    void GetPawnCapsuleDims(APawn* Pawn, float& OutRadius, float& OutHalfHeight, bool& bOutIsCharacter, bool& bOutHasCapsule)
+    {
+        OutRadius = 0.0f;
+        OutHalfHeight = 0.0f;
+        bOutIsCharacter = false;
+        bOutHasCapsule = false;
+        if (Pawn == nullptr) return;
+
+        if (ACharacter* Char = Cast<ACharacter>(Pawn))
+        {
+            bOutIsCharacter = true;
+            if (UCapsuleComponent* Cap = Char->GetCapsuleComponent())
+            {
+                OutRadius = Cap->GetScaledCapsuleRadius();
+                OutHalfHeight = Cap->GetScaledCapsuleHalfHeight();
+                bOutHasCapsule = true;
+                return;
+            }
+        }
+        // Fallback for non-Character pawns: rough cylinder query
+        Pawn->GetSimpleCollisionCylinder(OutRadius, OutHalfHeight);
+    }
+
+    // v9.12.0 — get_player_capsule: rev6 ISSUE-1. Reads the PIE pawn's
+    // capsule radius + half-height so the LLM knows how wide a corridor
+    // needs to be and how high above the floor to teleport.
+    FString GetPlayerCapsuleOnGameThread(int32 PlayerIndex)
     {
         check(IsInGameThread());
-        const TCHAR* CmdName = TEXT("pie_set_player_location");
+        const TCHAR* CmdName = TEXT("get_player_capsule");
         if (GEditor == nullptr || GEditor->PlayWorld == nullptr)
-            return JsonError(CmdName, TEXT("pie_not_running"));
+            return JsonError(CmdName, TEXT("pie_not_running"),
+                TEXT("Start PIE first — player Character only exists in PIE world"));
 
         APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIndex);
         if (PC == nullptr)
             return JsonError(CmdName, TEXT("no_player_controller"),
                 FString::Printf(TEXT("player_index=%d"), PlayerIndex));
+        APawn* Pawn = PC->GetPawn();
+        if (Pawn == nullptr)
+            return JsonError(CmdName, TEXT("no_pawn"));
 
+        float Radius = 0, HalfHeight = 0;
+        bool bIsCharacter = false, bHasCapsule = false;
+        GetPawnCapsuleDims(Pawn, Radius, HalfHeight, bIsCharacter, bHasCapsule);
+
+        const FVector Loc = Pawn->GetActorLocation();
+        const FRotator Rot = Pawn->GetActorRotation();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"get_player_capsule\",\"player_index\":%d,")
+            TEXT("\"pawn_name\":%s,\"pawn_class\":%s,\"is_character\":%s,\"has_capsule\":%s,")
+            TEXT("\"radius\":%f,\"half_height\":%f,\"diameter\":%f,\"full_height\":%f,")
+            TEXT("\"location\":[%f,%f,%f],\"rotation\":[%f,%f,%f]}\n"),
+            PlayerIndex,
+            *EscapeJsonString(Pawn->GetName()),
+            *EscapeJsonString(Pawn->GetClass()->GetName()),
+            bIsCharacter ? TEXT("true") : TEXT("false"),
+            bHasCapsule ? TEXT("true") : TEXT("false"),
+            Radius, HalfHeight,
+            Radius * 2.0f, HalfHeight * 2.0f,
+            Loc.X, Loc.Y, Loc.Z,
+            Rot.Pitch, Rot.Yaw, Rot.Roll);
+    }
+
+    // v9.9.0 + v9.12.0 — pie_set_player_location: teleport the controlled
+    // pawn. v9.12.0 adds bSnapToGround which traces downward for ground +
+    // offsets by the capsule half-height — closes rev6 ISSUE-3.
+    FString PieSetPlayerLocationOnGameThread(
+        float X, float Y, float Z, int32 PlayerIndex,
+        bool bSnapToGround, float TraceUpHeight, float TraceDownDist)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("pie_set_player_location");
+        UWorld* World = (GEditor != nullptr) ? GEditor->PlayWorld : nullptr;
+        if (World == nullptr)
+            return JsonError(CmdName, TEXT("pie_not_running"));
+
+        APlayerController* PC = UGameplayStatics::GetPlayerController(World, PlayerIndex);
+        if (PC == nullptr)
+            return JsonError(CmdName, TEXT("no_player_controller"),
+                FString::Printf(TEXT("player_index=%d"), PlayerIndex));
         APawn* Pawn = PC->GetPawn();
         if (Pawn == nullptr)
             return JsonError(CmdName, TEXT("no_pawn"), TEXT("PlayerController has no controlled Pawn"));
 
-        const FVector NewLoc(X, Y, Z);
-        const bool bOk = Pawn->SetActorLocation(NewLoc, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+        FVector NewLoc(X, Y, Z);
+        bool bSnapped = false;
+        float GroundZ = 0.0f;
+        float UsedHalfHeight = 0.0f;
+        FString GroundHitName;
 
+        if (bSnapToGround)
+        {
+            float Radius = 0, HalfHeight = 0;
+            bool bIsCharacter = false, bHasCapsule = false;
+            GetPawnCapsuleDims(Pawn, Radius, HalfHeight, bIsCharacter, bHasCapsule);
+            UsedHalfHeight = HalfHeight;
+
+            const FVector Start(X, Y, Z + TraceUpHeight);
+            const FVector End  (X, Y, Z - TraceDownDist);
+            FHitResult Hit;
+            FCollisionQueryParams Params(FName(TEXT("BlueprintMCP_SnapToGround")), /*bTraceComplex*/ false, Pawn);
+            // Use Visibility channel — same one Blueprint LineTraceByChannel defaults to.
+            if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+            {
+                GroundZ = Hit.ImpactPoint.Z;
+                NewLoc.Z = GroundZ + HalfHeight;
+                bSnapped = true;
+                if (Hit.GetActor() != nullptr) GroundHitName = Hit.GetActor()->GetName();
+            }
+        }
+
+        const bool bOk = Pawn->SetActorLocation(NewLoc, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
         const FVector Cur = Pawn->GetActorLocation();
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"pie_set_player_location\",\"player_index\":%d,\"requested\":[%f,%f,%f],\"actual\":[%f,%f,%f],\"moved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"pie_set_player_location\",\"player_index\":%d,")
+            TEXT("\"requested\":[%f,%f,%f],\"actual\":[%f,%f,%f],\"moved\":%s,")
+            TEXT("\"snapped_to_ground\":%s,\"ground_z\":%f,\"capsule_half_height\":%f,\"ground_hit\":%s}\n"),
             PlayerIndex,
             X, Y, Z,
             Cur.X, Cur.Y, Cur.Z,
-            bOk ? TEXT("true") : TEXT("false"));
+            bOk ? TEXT("true") : TEXT("false"),
+            bSnapped ? TEXT("true") : TEXT("false"),
+            GroundZ, UsedHalfHeight,
+            *EscapeJsonString(GroundHitName));
     }
 
     // v9.9.0 — pie_move_player: simulated continuous movement input over duration.
@@ -5888,7 +6002,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.11.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.12.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6846,16 +6960,32 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             RotYaw   = (*RotArr)[1]->AsNumber();
             RotRoll  = (*RotArr)[2]->AsNumber();
         }
+        // v9.12.0 — optional scale. Same dual-form: scale_x/y/z OR scale: [X,Y,Z]
+        double ScaleX = 1.0, ScaleY = 1.0, ScaleZ = 1.0;
+        bool bHasScale = false;
+        if (JsonObject->TryGetNumberField(TEXT("scale_x"), ScaleX)) bHasScale = true;
+        if (JsonObject->TryGetNumberField(TEXT("scale_y"), ScaleY)) bHasScale = true;
+        if (JsonObject->TryGetNumberField(TEXT("scale_z"), ScaleZ)) bHasScale = true;
+        const TArray<TSharedPtr<FJsonValue>>* ScaleArr = nullptr;
+        if (JsonObject->TryGetArrayField(TEXT("scale"), ScaleArr) && ScaleArr->Num() >= 3)
+        {
+            ScaleX = (*ScaleArr)[0]->AsNumber();
+            ScaleY = (*ScaleArr)[1]->AsNumber();
+            ScaleZ = (*ScaleArr)[2]->AsNumber();
+            bHasScale = true;
+        }
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
 
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, LocX, LocY, LocZ, RotPitch, RotYaw, RotRoll]() mutable
+            [Promise = MoveTemp(Promise), Blueprint, LocX, LocY, LocZ, RotPitch, RotYaw, RotRoll, ScaleX, ScaleY, ScaleZ, bHasScale]() mutable
             {
                 FString Result = SpawnActorOnGameThread(Blueprint,
                     static_cast<float>(LocX), static_cast<float>(LocY), static_cast<float>(LocZ),
-                    static_cast<float>(RotPitch), static_cast<float>(RotYaw), static_cast<float>(RotRoll));
+                    static_cast<float>(RotPitch), static_cast<float>(RotYaw), static_cast<float>(RotRoll),
+                    static_cast<float>(ScaleX), static_cast<float>(ScaleY), static_cast<float>(ScaleZ),
+                    bHasScale);
                 Promise.SetValue(MoveTemp(Result));
             });
 
@@ -7607,7 +7737,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- v9.9.0 pie_set_player_location ---
+    // --- v9.9.0 + v9.12.0 pie_set_player_location ---
     if (Command.Equals(TEXT("pie_set_player_location"), ESearchCase::IgnoreCase))
     {
         const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
@@ -7619,17 +7749,43 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const double Z = (*LocArr)[2]->AsNumber();
         int32 PlayerIndex = 0;
         JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+        bool bSnapToGround = false;
+        JsonObject->TryGetBoolField(TEXT("snap_to_ground"), bSnapToGround);   // v9.12.0
+        double TraceUpHeight = 200.0;
+        double TraceDownDist = 10000.0;
+        JsonObject->TryGetNumberField(TEXT("trace_up_height"), TraceUpHeight);
+        JsonObject->TryGetNumberField(TEXT("trace_down_dist"), TraceDownDist);
 
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), X, Y, Z, PlayerIndex]() mutable
+            [Promise = MoveTemp(Promise), X, Y, Z, PlayerIndex, bSnapToGround, TraceUpHeight, TraceDownDist]() mutable
             {
                 Promise.SetValue(PieSetPlayerLocationOnGameThread(
-                    static_cast<float>(X), static_cast<float>(Y), static_cast<float>(Z), PlayerIndex));
+                    static_cast<float>(X), static_cast<float>(Y), static_cast<float>(Z),
+                    PlayerIndex, bSnapToGround,
+                    static_cast<float>(TraceUpHeight), static_cast<float>(TraceDownDist)));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("pie_set_player_location"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.12.0 get_player_capsule ---
+    if (Command.Equals(TEXT("get_player_capsule"), ESearchCase::IgnoreCase))
+    {
+        int32 PlayerIndex = 0;
+        JsonObject->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), PlayerIndex]() mutable
+            {
+                Promise.SetValue(GetPlayerCapsuleOnGameThread(PlayerIndex));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_player_capsule"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
