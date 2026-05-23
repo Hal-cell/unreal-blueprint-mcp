@@ -6,7 +6,60 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.15.0.
+Everything shipped through v9.16.0.
+
+---
+
+## [v9.16.0] — 2026-05-23 — Material subsystem completion (closes rev9 ISSUE-1/2/3)
+
+### Closes rev9 issues
+
+- **ISSUE-1** (medium): v9.15.0 batch ops only `MarkPackageDirty` (deliberate
+  — `PostEditChange` per-op hit the 12s TCP timeout). User had to manually
+  click "Apply" in material editor.
+- **ISSUE-2** (medium): `OverrideMaterials[N]` static assignment didn't make
+  ISM render the new material (blocks stayed default-blue). Workaround
+  was runtime `CreateDynamicMaterialInstance`. Root-cause hypothesis:
+  `bUsedWithInstancedStaticMeshes` must be `true` — a material-level
+  UPROPERTY, not addressable by v9.15.0's tools.
+- **ISSUE-3** (low): material tools were additive-only — no delete, no
+  disconnect, no material-level property setter.
+
+### Added — 4 new tools + 1 helper extension (83 → 87)
+
+- **`compile_material(material)`** — the "Apply" button.
+  `PreEditChange/PostEditChange/ForceRecompileForRendering/SaveAsset`.
+  Server-side budget 60s, Python passes 75s socket timeout for the
+  shader compile. After the batch flow (add expressions / set props /
+  connect), call this once to make the material actually render.
+- **`set_material_property(material, property, value)`** —
+  material-level UPROPERTY via `WalkPropertyPath` on `UMaterial`. The
+  ISM gotcha cure: `bUsedWithInstancedStaticMeshes=true`. Also
+  `TwoSided` (UE 5.4 dropped the `b` prefix, easy to fat-finger),
+  `BlendMode`, `ShadingModel`, `MaterialDomain`, etc.
+- **`delete_material_expression(material, anchor_name)`** — removes the
+  expression from `ExpressionCollection`. Crucially, also walks all
+  material outputs AND all other expressions, clears any
+  `FExpressionInput` pointing to the target. No dangling pointers.
+- **`disconnect_material_pins(material, to_pin)`** — two forms:
+  - `to_pin="anchor.InputName"` clears the named input on an expression
+  - `to_pin="output:BaseColor"` clears a material-level output
+  The `output:` prefix disambiguates from an expression literally named
+  "output".
+- **`_send_command(payload, timeout_sec=None)`** — Python-side
+  per-call socket timeout override. `compile_material` uses 75s instead
+  of the default 12s. Backwards-compatible: default `None` = old
+  behavior.
+
+### Live verification
+
+Built height-color material → `set_material_property` ×2
+(`bUsedWithInstancedStaticMeshes`, `TwoSided`) → `delete_material_expression`
+→ `disconnect_material_pins` ×2 (input + output forms) →
+`compile_material` returned `recompiled=true, saved=true` in ~30s.
+
+### `ping.plugin_version`
+"9.15.0" → **"9.16.0"**.
 
 ---
 

@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.15.0](https://img.shields.io/badge/version-v9.15.0-brightgreen)](#status)
-[![83 tools](https://img.shields.io/badge/tools-83-blue)](#tools)
-[![252 tests](https://img.shields.io/badge/tests-252%20passing-success)](#requirements)
+[![v9.16.0](https://img.shields.io/badge/version-v9.16.0-brightgreen)](#status)
+[![87 tools](https://img.shields.io/badge/tools-87-blue)](#tools)
+[![265 tests](https://img.shields.io/badge/tests-265%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -78,7 +78,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.13.0** | ✅ `add_component_get` (by-name SCS component ref node — closes "GetComponentByClass-only-finds-first" gap) + WP-aware spawn persistence (`AActor::MarkPackageDirty` for external actor files) + `add_node` invalid_node_type format hint + `set_pin_default` docs fix (class pins always worked) |
 | **v9.14.0** | ✅ `add_select` `num_options` actually grows past 2 (was silently capped — closes rev8 ISSUE-1). N-way data Select now usable in one node instead of Switch + N VariableSet workaround |
 | **v9.15.0** | ✅ Material subsystem door-opener: `create_material` + `add_material_expression` + `set_material_expression_property` + `connect_material_pins` + `connect_material_output`. Plus `set_component_property` array-index syntax (`OverrideMaterials[0]`). LLM can now build height-color / param materials end-to-end |
-| **Unit tests** | **252 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.16.0** | ✅ Material subsystem completion: `compile_material` (= "Apply" button, 75s timeout) + `set_material_property` (material-level UPROPERTYs incl. `bUsedWithInstancedStaticMeshes` for ISM) + `delete_material_expression` (with auto-cleanup of dangling refs) + `disconnect_material_pins` (input form + `output:Name` form). Closes rev9 ISSUE-1/2/3 |
+| **Unit tests** | **265 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -315,6 +316,10 @@ batch to trigger one shader recompile + save (avoids the per-op 12s timeout).
 | **`set_material_expression_property`** (v9.15) | Set a UPROPERTY on an expression — FProperty reflection. `ComponentMask.R/G/B/A`, `Constant3Vector.Constant`, `ScalarParameter.DefaultValue`, etc. |
 | **`connect_material_pins`** (v9.15) | Wire `from_pin` ("anchor" / "anchor.0") into `to_pin` ("anchor.InputName"). Uses `FExpressionInput::Connect` |
 | **`connect_material_output`** (v9.15) | Wire into one of UMaterial's outputs: `BaseColor` / `EmissiveColor` / `Metallic` / `Roughness` / `Normal` / `Opacity` / `WorldPositionOffset` / etc. |
+| **`compile_material`** (v9.16) | The "Apply" button. `PostEditChange` + `ForceRecompileForRendering` + save. Server budget 60s (shader compile is slow); Python wrapper uses 75s socket timeout |
+| **`set_material_property`** (v9.16) | Material-level UPROPERTY (NOT inside the graph). Critical for ISM: `bUsedWithInstancedStaticMeshes=true`. Also `TwoSided` / `BlendMode` / `ShadingModel` / `MaterialDomain` |
+| **`delete_material_expression`** (v9.16) | Remove an expression. Auto-cleans dangling refs — walks all other expressions + material outputs, clears FExpressionInput pointing to the target |
+| **`disconnect_material_pins`** (v9.16) | Break a connection. `to_pin="anchor.InputName"` for an expression input, `to_pin="output:BaseColor"` for a material output |
 
 ## v1 Collision-Timer demo
 
