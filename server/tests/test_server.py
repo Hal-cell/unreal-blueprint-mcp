@@ -4565,3 +4565,129 @@ def test_ping_returns_plugin_version_9_15_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.15.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.16.0 — Material subsystem completion (closes rev9 ISSUE-1/2/3)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_material_success() -> None:
+    response = b'{"ok":true,"command":"compile_material","material_path":"/Game/M_X","saved":true,"recompiled":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.compile_material(material="/Game/M_X")
+    assert r["ok"] is True
+    assert r["recompiled"] is True
+    assert r["saved"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "compile_material", "material": "/Game/M_X"}
+
+
+def test_compile_material_not_found() -> None:
+    response = b'{"ok":false,"command":"compile_material","error":"material_not_found","detail":"/Game/Ghost"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.compile_material(material="/Game/Ghost")
+    assert r["error"] == "material_not_found"
+
+
+def test_compile_material_local_validation() -> None:
+    assert server.compile_material(material="")["error"] == "missing_argument"
+
+
+def test_set_material_property_ism_flag() -> None:
+    """The rev9 hypothesis: bUsedWithInstancedStaticMeshes."""
+    response = b'{"ok":true,"command":"set_material_property","material_path":"/Game/M_X","property":"bUsedWithInstancedStaticMeshes","resolved_value":"true","saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_material_property(material="/Game/M_X", property="bUsedWithInstancedStaticMeshes", value="true")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_material_property",
+        "material": "/Game/M_X",
+        "property": "bUsedWithInstancedStaticMeshes",
+        "value": "true",
+    }
+
+
+def test_set_material_property_blend_mode() -> None:
+    response = b'{"ok":true,"command":"set_material_property","material_path":"/Game/M_X","property":"BlendMode","resolved_value":"BLEND_Translucent","saved":false}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_material_property(material="/Game/M_X", property="BlendMode", value="BLEND_Translucent")
+    assert r["resolved_value"] == "BLEND_Translucent"
+
+
+def test_set_material_property_local_validation() -> None:
+    assert server.set_material_property(material="", property="X")["error"] == "missing_argument"
+    assert server.set_material_property(material="/G/M", property="")["error"] == "missing_argument"
+
+
+def test_delete_material_expression_success() -> None:
+    response = b'{"ok":true,"command":"delete_material_expression","anchor_name":"old_mask","saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_material_expression(material="/Game/M_X", anchor_name="old_mask")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "delete_material_expression",
+        "material": "/Game/M_X",
+        "anchor_name": "old_mask",
+    }
+
+
+def test_delete_material_expression_not_found() -> None:
+    response = b'{"ok":false,"command":"delete_material_expression","error":"expression_not_found","detail":"ghost"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_material_expression(material="/Game/M_X", anchor_name="ghost")
+    assert r["error"] == "expression_not_found"
+
+
+def test_delete_material_expression_local_validation() -> None:
+    assert server.delete_material_expression(material="", anchor_name="x")["error"] == "missing_argument"
+    assert server.delete_material_expression(material="/G/M", anchor_name="")["error"] == "missing_argument"
+
+
+def test_disconnect_material_pins_expression_input() -> None:
+    response = b'{"ok":true,"command":"disconnect_material_pins","to":"lerp.A","saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.disconnect_material_pins(material="/Game/M_X", to_pin="lerp.A")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["to_pin"] == "lerp.A"
+
+
+def test_disconnect_material_pins_material_output() -> None:
+    """The 'output:' prefix disambiguates a material output."""
+    response = b'{"ok":true,"command":"disconnect_material_pins","to":"output:BaseColor","saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.disconnect_material_pins(material="/Game/M_X", to_pin="output:BaseColor")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["to_pin"] == "output:BaseColor"
+
+
+def test_disconnect_material_pins_local_validation() -> None:
+    assert server.disconnect_material_pins(material="", to_pin="x.A")["error"] == "missing_argument"
+    assert server.disconnect_material_pins(material="/G/M", to_pin="")["error"] == "missing_argument"
+
+
+def test_ping_returns_plugin_version_9_16_0() -> None:
+    """v9.16.0: ping surfaces 9.16.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.16.0","build_date":"May 23 2026 12:00:00",'
+        b'"timestamp":"2026-05-23T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.16.0"

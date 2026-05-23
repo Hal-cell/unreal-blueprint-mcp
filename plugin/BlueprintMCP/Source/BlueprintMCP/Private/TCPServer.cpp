@@ -2232,6 +2232,230 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.16.0 — Material subsystem completion (closes rev9 ISSUE-1/2/3) =====
+    //
+    // Helper: clear every FExpressionInput that points to `Target` on a given
+    // owning container (UMaterialExpression or UMaterialEditorOnlyData).
+    // Used by delete_material_expression to avoid leaving dangling pointers.
+    void DisconnectInputsPointingTo(UObject* Container, UMaterialExpression* Target)
+    {
+        if (Container == nullptr || Target == nullptr) return;
+        for (TFieldIterator<FStructProperty> It(Container->GetClass()); It; ++It)
+        {
+            FStructProperty* StructProp = *It;
+            if (StructProp == nullptr || StructProp->Struct == nullptr) continue;
+            // Same heuristic as FindExpressionInputByName — name contains "Input"
+            if (!StructProp->Struct->GetName().Contains(TEXT("Input"))) continue;
+            FExpressionInput* Input = StructProp->ContainerPtrToValuePtr<FExpressionInput>(Container);
+            if (Input != nullptr && Input->Expression == Target)
+            {
+                Input->Expression = nullptr;
+                Input->OutputIndex = 0;
+            }
+        }
+    }
+
+    // ----- 6. compile_material -----
+    // Trigger PostEditChange + ForceRecompileForRendering + SaveAsset. This is
+    // the "Apply" button in the material editor. Per rev9 ISSUE-1: the v9.15.0
+    // batch ops only MarkPackageDirty, so the material's compiled shader is
+    // stale until something forces a recompile. This tool does it explicitly.
+    // Slow (shader compile) — Python wrapper passes a 60s timeout.
+    FString CompileMaterialOnGameThread(const FString& MaterialPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("compile_material");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        Mat->PreEditChange(nullptr);
+        Mat->PostEditChange();
+        Mat->ForceRecompileForRendering();
+        Mat->MarkPackageDirty();
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(MaterialPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"compile_material\",\"material_path\":%s,\"saved\":%s,\"recompiled\":true}\n"),
+            *EscapeJsonString(MaterialPath),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ----- 7. set_material_property -----
+    // Material-level UPROPERTY setter (Usage flags, BlendMode, ShadingModel,
+    // TwoSided, MaterialDomain, etc.). Reuses WalkPropertyPath. rev9 ISSUE-2
+    // root cause hypothesis: bUsedWithInstancedStaticMeshes must be true for
+    // an ISM to render with the material correctly — and that's a material-
+    // level flag, not an expression flag.
+    FString SetMaterialPropertyOnGameThread(
+        const FString& MaterialPath, const FString& PropertyPath, const FString& Value)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_material_property");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        void* ValuePtr = nullptr;
+        FProperty* LeafProp = WalkPropertyPath(Mat->GetClass(), Mat, PropertyPath, ValuePtr);
+        if (LeafProp == nullptr || ValuePtr == nullptr)
+        {
+            return JsonError(CmdName, TEXT("property_not_found"),
+                FString::Printf(TEXT("UMaterial has no property '%s'. Common usage flags: "
+                                     "bUsedWithInstancedStaticMeshes, bUsedWithStaticLighting, "
+                                     "bUsedWithSkeletalMesh, TwoSided (no 'b' prefix in UE 5.4). "
+                                     "Other: BlendMode, ShadingModel, MaterialDomain, "
+                                     "OpacityMaskClipValue. Use full reflected names — many UE 5 "
+                                     "bool UPROPERTYs dropped the 'b' prefix."),
+                    *PropertyPath));
+        }
+
+        Mat->PreEditChange(LeafProp);
+        FString ResolvedValueStr;
+        FString ErrorDetail;
+        bool bSuccess = false;
+
+        if (FObjectProperty* ObjProp = CastField<FObjectProperty>(LeafProp))
+        {
+            UObject* Asset = Value.IsEmpty() ? nullptr : LoadObject<UObject>(nullptr, *Value);
+            if (!Value.IsEmpty() && Asset == nullptr)
+                ErrorDetail = FString::Printf(TEXT("Asset not found: %s"), *Value);
+            else
+            {
+                ObjProp->SetObjectPropertyValue(ValuePtr, Asset);
+                ResolvedValueStr = Asset != nullptr ? Asset->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        else
+        {
+            FString NormalizedValue = Value;
+            if (FStructProperty* StructProp = CastField<FStructProperty>(LeafProp))
+            {
+                if (IsSupportedStructForDefault(StructProp->Struct))
+                    NormalizedValue = FormatStructDefault(StructProp->Struct, Value);
+            }
+            const TCHAR* Buffer = *NormalizedValue;
+            const TCHAR* Result = LeafProp->ImportText_Direct(Buffer, ValuePtr, /*OwnerObject*/ Mat, PPF_None);
+            if (Result == nullptr)
+                ErrorDetail = FString::Printf(TEXT("Failed to parse '%s' for property '%s' (type %s)"),
+                    *NormalizedValue, *PropertyPath, *LeafProp->GetClass()->GetName());
+            else
+            {
+                ResolvedValueStr = NormalizedValue;
+                bSuccess = true;
+            }
+        }
+
+        if (!bSuccess)
+            return JsonError(CmdName, TEXT("set_failed"), ErrorDetail);
+
+        FPropertyChangedEvent Change(LeafProp, EPropertyChangeType::ValueSet);
+        Mat->PostEditChangeProperty(Change);
+        Mat->MarkPackageDirty();
+        // Note: per batch-flow design, no SaveAsset / no PostEditChange-full.
+        // Caller runs compile_material + save_all when done.
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_material_property\",\"material_path\":%s,")
+            TEXT("\"property\":%s,\"resolved_value\":%s,\"saved\":false}\n"),
+            *EscapeJsonString(MaterialPath),
+            *EscapeJsonString(PropertyPath),
+            *EscapeJsonString(ResolvedValueStr));
+    }
+
+    // ----- 8. delete_material_expression -----
+    FString DeleteMaterialExpressionOnGameThread(const FString& MaterialPath, const FString& AnchorName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_material_expression");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        UMaterialExpression* Target = FindMaterialExpressionByDesc(Mat, AnchorName);
+        if (Target == nullptr)
+            return JsonError(CmdName, TEXT("expression_not_found"), AnchorName);
+
+        UMaterialEditorOnlyData* EditorData = Mat->GetEditorOnlyData();
+        if (EditorData == nullptr)
+            return JsonError(CmdName, TEXT("no_editor_data"));
+
+        // 1. Clear any material-output inputs pointing to this expression
+        DisconnectInputsPointingTo(EditorData, Target);
+
+        // 2. Clear any other expression's inputs pointing to this expression
+        for (UMaterialExpression* Other : EditorData->ExpressionCollection.Expressions)
+        {
+            if (Other != nullptr && Other != Target)
+                DisconnectInputsPointingTo(Other, Target);
+        }
+
+        // 3. Remove from collection
+        EditorData->ExpressionCollection.RemoveExpression(Target);
+
+        Mat->MarkPackageDirty();
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"delete_material_expression\",\"anchor_name\":%s,\"saved\":false}\n"),
+            *EscapeJsonString(AnchorName));
+    }
+
+    // ----- 9. disconnect_material_pins -----
+    // to_pin: "anchor.<InputName>" (clear that input), OR
+    //         "output:<OutputName>"  (clear that material output)
+    FString DisconnectMaterialPinsOnGameThread(const FString& MaterialPath, const FString& ToPin)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("disconnect_material_pins");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        // Material-output form: "output:BaseColor"
+        if (ToPin.StartsWith(TEXT("output:"), ESearchCase::IgnoreCase))
+        {
+            const FString OutputName = ToPin.RightChop(7);   // strip "output:"
+            UMaterialEditorOnlyData* EditorData = Mat->GetEditorOnlyData();
+            if (EditorData == nullptr)
+                return JsonError(CmdName, TEXT("no_editor_data"));
+            FProperty* Prop = FindFProperty<FProperty>(EditorData->GetClass(), *OutputName);
+            FStructProperty* StructProp = CastField<FStructProperty>(Prop);
+            if (StructProp == nullptr)
+                return JsonError(CmdName, TEXT("unknown_output"), OutputName);
+            FExpressionInput* Input = StructProp->ContainerPtrToValuePtr<FExpressionInput>(EditorData);
+            Input->Expression = nullptr;
+            Input->OutputIndex = 0;
+            Mat->MarkPackageDirty();
+            return FString::Printf(
+                TEXT("{\"ok\":true,\"command\":\"disconnect_material_pins\",\"to\":%s,\"saved\":false}\n"),
+                *EscapeJsonString(ToPin));
+        }
+
+        // Expression-input form: "anchor.InputName"
+        FString ToAnchor, ToInputName;
+        ParseMaterialPinRef(ToPin, ToAnchor, ToInputName);
+        if (ToInputName.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_to_input_name"),
+                TEXT("to_pin must be 'anchor.<InputName>' or 'output:<OutputName>'"));
+        UMaterialExpression* Expr = FindMaterialExpressionByDesc(Mat, ToAnchor);
+        if (Expr == nullptr)
+            return JsonError(CmdName, TEXT("to_expression_not_found"), ToAnchor);
+        FExpressionInput* Input = FindExpressionInputByName(Expr, ToInputName);
+        if (Input == nullptr)
+            return JsonError(CmdName, TEXT("input_not_found"), ToInputName);
+        Input->Expression = nullptr;
+        Input->OutputIndex = 0;
+        Mat->MarkPackageDirty();
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"disconnect_material_pins\",\"to\":%s,\"saved\":false}\n"),
+            *EscapeJsonString(ToPin));
+    }
+
     // ===== v4 helpers =====
 
     /** Whitelist of macros from /Engine/EditorBlueprintResources/StandardMacros. */
@@ -6589,7 +6813,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.15.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.16.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6994,6 +7218,91 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("connect_material_output"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.16.0 compile_material (rev9 ISSUE-1) ---
+    // Shader compile is slow — use a 60s game-thread budget instead of 10s.
+    if (Command.Equals(TEXT("compile_material"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("compile_material"), TEXT("missing_field"), TEXT("material"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath]() mutable
+            {
+                Promise.SetValue(CompileMaterialOnGameThread(MaterialPath));
+            });
+        // Material compile can take 30+s on first build — use 60s budget.
+        if (!Future.WaitFor(FTimespan::FromSeconds(60)))
+            return JsonError(TEXT("compile_material"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.16.0 set_material_property (rev9 ISSUE-2 hypothesis: bUsedWithInstancedStaticMeshes) ---
+    if (Command.Equals(TEXT("set_material_property"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, PropertyPath, Value;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("set_material_property"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("property"), PropertyPath) || PropertyPath.IsEmpty())
+            return JsonError(TEXT("set_material_property"), TEXT("missing_field"), TEXT("property"));
+        JsonObject->TryGetStringField(TEXT("value"), Value);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, PropertyPath, Value]() mutable
+            {
+                Promise.SetValue(SetMaterialPropertyOnGameThread(MaterialPath, PropertyPath, Value));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_material_property"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.16.0 delete_material_expression (rev9 ISSUE-3) ---
+    if (Command.Equals(TEXT("delete_material_expression"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("delete_material_expression"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("delete_material_expression"), TEXT("missing_field"), TEXT("anchor_name"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, AnchorName]() mutable
+            {
+                Promise.SetValue(DeleteMaterialExpressionOnGameThread(MaterialPath, AnchorName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_material_expression"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.16.0 disconnect_material_pins (rev9 ISSUE-3) ---
+    if (Command.Equals(TEXT("disconnect_material_pins"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, ToPin;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("disconnect_material_pins"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("to_pin"), ToPin) || ToPin.IsEmpty())
+            return JsonError(TEXT("disconnect_material_pins"), TEXT("missing_field"), TEXT("to_pin"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, ToPin]() mutable
+            {
+                Promise.SetValue(DisconnectMaterialPinsOnGameThread(MaterialPath, ToPin));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("disconnect_material_pins"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

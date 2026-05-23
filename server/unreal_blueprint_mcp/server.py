@@ -48,11 +48,20 @@ mcp = FastMCP("unreal-blueprint-mcp")
 # ---------------------------------------------------------------------------
 
 
-def _send_command(command_payload: dict[str, Any]) -> dict[str, Any]:
+def _send_command(
+    command_payload: dict[str, Any],
+    timeout_sec: float | None = None,
+) -> dict[str, Any]:
     """Send a JSON command to the UE plugin via TCP, return the parsed response.
 
     Lower-level helper. Tools should call this rather than open sockets directly,
     so the error-handling shape stays consistent.
+
+    Args:
+        command_payload: The JSON command dict (must include a "command" field).
+        timeout_sec: **v9.16.0** — optional per-call timeout override (in seconds).
+            Default ``UE_PLUGIN_TIMEOUT_SEC=12``. Use a larger value (e.g. 75) for
+            slow ops like ``compile_material`` (shader compile can be 30+s).
 
     Returns:
         On UE plugin success: the parsed JSON dict (e.g., {"ok": true, ...}).
@@ -61,9 +70,10 @@ def _send_command(command_payload: dict[str, Any]) -> dict[str, Any]:
     payload_bytes = (json.dumps(command_payload) + "\n").encode("utf-8")
     log.info("→ UE plugin: %s", command_payload.get("command", "<no-command>"))
 
+    effective_timeout = timeout_sec if timeout_sec is not None else UE_PLUGIN_TIMEOUT_SEC
     try:
         with socket.create_connection(
-            (UE_PLUGIN_HOST, UE_PLUGIN_PORT), timeout=UE_PLUGIN_TIMEOUT_SEC
+            (UE_PLUGIN_HOST, UE_PLUGIN_PORT), timeout=effective_timeout
         ) as sock:
             sock.sendall(payload_bytes)
             # v6.0.2 P1 fix: loop recv until UE closes the connection (no 8KB cap).
@@ -3228,6 +3238,155 @@ def connect_material_output(
         "material": material,
         "from_pin": from_pin,
         "output": output,
+    })
+
+
+@mcp.tool()
+def compile_material(material: str) -> dict[str, Any]:
+    """Apply + recompile a material's shader — v9.16.0.
+
+    The "Apply" button in the material editor. Closes rev9 ISSUE-1 —
+    v9.15.0's batch material ops (`add_material_expression` /
+    `connect_material_pins` / etc.) only mark the package dirty; they
+    do NOT call `PostEditChange` because per-op shader recompile was
+    hitting the 12s TCP timeout.
+
+    This tool does the recompile explicitly with a 75s timeout. Call
+    it after your batch material editing is complete to make the
+    material actually render correctly.
+
+    Internally calls ``Mat->PreEditChange(nullptr)`` →
+    ``PostEditChange()`` → ``ForceRecompileForRendering()`` →
+    ``SaveAsset``.
+
+    Args:
+        material: Material asset path.
+
+    Returns:
+        ``{"ok": True, "material_path": ..., "saved": True, "recompiled": True}``
+
+    Common errors:
+        material_not_found, game_thread_timeout (shader compile > 60s server-side)
+    """
+    if not material:
+        return {"ok": False, "error": "missing_argument"}
+    # Custom 75s Python timeout — compile_material's server-side budget is 60s,
+    # plus margin for TCP round-trip.
+    return _send_command({"command": "compile_material", "material": material}, timeout_sec=75.0)
+
+
+@mcp.tool()
+def set_material_property(
+    material: str,
+    property: str,
+    value: str = "",
+) -> dict[str, Any]:
+    """Set a material-level UPROPERTY — v9.16.0.
+
+    For material-level flags / settings (NOT inside the graph — those
+    go through ``set_material_expression_property``). The classic ISM
+    gotcha: ``bUsedWithInstancedStaticMeshes`` must be ``true`` for an
+    ISM to render with the material correctly.
+
+    Args:
+        material: Material asset path.
+        property: Property name or dot-path. Common picks:
+            - ``"bUsedWithInstancedStaticMeshes"`` (bool) — required for ISM
+            - ``"bUsedWithStaticLighting"``
+            - ``"bUsedWithSkeletalMesh"``
+            - ``"TwoSided"`` — two-sided rendering (UE 5.4 dropped the ``b`` prefix)
+            - ``"BlendMode"`` — ``"BLEND_Translucent"`` / ``"BLEND_Masked"`` / etc.
+            - ``"ShadingModel"`` — ``"MSM_Unlit"`` / ``"MSM_DefaultLit"`` / etc.
+            - ``"MaterialDomain"`` — ``"MD_Surface"`` / ``"MD_DeferredDecal"`` / etc.
+            - ``"OpacityMaskClipValue"`` — float for masked materials
+            - ``"DitheredLODTransition"``
+        value: New value. ``"true"``/``"false"`` for bools, ``"BLEND_X"`` /
+            ``"MSM_X"`` / ``"MD_X"`` enum literals for enum properties.
+
+    Returns:
+        ``{"ok": True, "material_path": ..., "property": ...,
+            "resolved_value": ..., "saved": False}``
+        ``saved=false`` — call ``compile_material`` + ``save_all`` to persist.
+
+    Common errors:
+        material_not_found, property_not_found, set_failed
+    """
+    if not material or not property:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_material_property",
+        "material": material,
+        "property": property,
+        "value": value,
+    })
+
+
+@mcp.tool()
+def delete_material_expression(
+    material: str,
+    anchor_name: str,
+) -> dict[str, Any]:
+    """Remove a material expression — v9.16.0.
+
+    Also cleans up dangling references — walks all other expressions
+    and material outputs, clears any FExpressionInput that pointed to
+    the removed expression. So you don't end up with broken wires.
+
+    Closes rev9 ISSUE-3 partial 1/2: material tools were "additive
+    only" before this.
+
+    Args:
+        material: Material asset path.
+        anchor_name: The expression's anchor (its ``Desc``).
+
+    Returns:
+        ``{"ok": True, "anchor_name": ..., "saved": False}``
+
+    Common errors:
+        material_not_found, expression_not_found
+    """
+    if not material or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "delete_material_expression",
+        "material": material,
+        "anchor_name": anchor_name,
+    })
+
+
+@mcp.tool()
+def disconnect_material_pins(
+    material: str,
+    to_pin: str,
+) -> dict[str, Any]:
+    """Break a single material connection — v9.16.0.
+
+    Two forms supported (closes rev9 ISSUE-3 partial 2/2):
+
+    - Expression input: ``to_pin="lerp.A"`` — clears Lerp's A input.
+    - Material output: ``to_pin="output:BaseColor"`` — clears the
+      material's BaseColor output (or EmissiveColor, Normal, etc.).
+
+    The ``output:`` prefix disambiguates from a regular anchor named
+    "output".
+
+    Args:
+        material: Material asset path.
+        to_pin: ``"<anchor>.<InputName>"`` or ``"output:<OutputName>"``.
+
+    Returns:
+        ``{"ok": True, "to": ..., "saved": False}``
+
+    Common errors:
+        material_not_found, to_expression_not_found,
+        input_not_found, unknown_output, missing_to_input_name
+    """
+    if not material or not to_pin:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "disconnect_material_pins",
+        "material": material,
+        "to_pin": to_pin,
     })
 
 
