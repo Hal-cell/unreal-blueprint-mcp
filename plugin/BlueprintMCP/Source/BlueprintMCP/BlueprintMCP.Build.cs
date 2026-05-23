@@ -46,6 +46,9 @@ public class BlueprintMCP : ModuleRules
             // v9.4.0: UMG — UWidgetBlueprint + UWidgetBlueprintFactory + UUserWidget
             "UMG",
             "UMGEditor",
+            // v9.15.0: Material subsystem — MaterialEditingLibrary, expression
+            // helpers, UMaterialFactoryNew (UMaterial itself is Engine-core).
+            "MaterialEditor",
         });
     }
 }

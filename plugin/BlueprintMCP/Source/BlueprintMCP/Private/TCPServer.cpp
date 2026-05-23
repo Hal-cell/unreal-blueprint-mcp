@@ -143,6 +143,13 @@
 // v9.9.0 — FTSTicker for asynchronous key-hold / move-player scheduling
 #include "Containers/Ticker.h"
 
+// v9.15.0 — Material subsystem
+#include "Materials/Material.h"
+#include "Materials/MaterialExpression.h"
+#include "MaterialEditingLibrary.h"   // for material compile triggers
+#include "Factories/MaterialFactoryNew.h"
+#include "MaterialExpressionIO.h"     // FExpressionInput::Connect
+
 // v9.1.0 — asset / class discovery
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -1129,8 +1136,52 @@ namespace
 
         for (int32 i = 0; i < Tokens.Num(); ++i)
         {
-            FProperty* Prop = FindFProperty<FProperty>(CurrentStruct, *Tokens[i]);
+            // v9.15.0 — split "Name[N]" form into (Name, ArrayIndex). Each token
+            // can optionally end in [N] which means "the Nth element of this
+            // array property". Closes the OverrideMaterials[0] case from the
+            // 2026-05-23 feature request #4.
+            FString TokenName = Tokens[i];
+            int32 ArrayIndex = INDEX_NONE;
+            const int32 LBracket = TokenName.Find(TEXT("["));
+            const int32 RBracket = TokenName.Find(TEXT("]"));
+            if (LBracket != INDEX_NONE && RBracket != INDEX_NONE && RBracket > LBracket + 1)
+            {
+                const FString IdxStr = TokenName.Mid(LBracket + 1, RBracket - LBracket - 1);
+                if (IdxStr.IsNumeric())
+                {
+                    ArrayIndex = FCString::Atoi(*IdxStr);
+                    TokenName = TokenName.Left(LBracket);
+                }
+            }
+
+            FProperty* Prop = FindFProperty<FProperty>(CurrentStruct, *TokenName);
             if (Prop == nullptr) return nullptr;
+
+            // If this token has [N], step into the FArrayProperty element.
+            if (ArrayIndex != INDEX_NONE)
+            {
+                FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop);
+                if (ArrayProp == nullptr) return nullptr;
+                FScriptArrayHelper ArrayHelper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(CurrentContainer));
+                // Grow the array if the index is past the current size — common case
+                // for OverrideMaterials[0] on a fresh component (default is empty).
+                if (ArrayIndex >= ArrayHelper.Num())
+                    ArrayHelper.AddValues(ArrayIndex + 1 - ArrayHelper.Num());
+
+                void* ElemPtr = ArrayHelper.GetRawPtr(ArrayIndex);
+                if (i == Tokens.Num() - 1)
+                {
+                    // Leaf is the array element itself (typed as the array's inner property)
+                    OutValuePtr = ElemPtr;
+                    return ArrayProp->Inner;
+                }
+                // Intermediate: only valid if the inner is a struct → descend
+                FStructProperty* InnerStruct = CastField<FStructProperty>(ArrayProp->Inner);
+                if (InnerStruct == nullptr) return nullptr;
+                CurrentContainer = ElemPtr;
+                CurrentStruct = InnerStruct->Struct;
+                continue;
+            }
 
             if (i == Tokens.Num() - 1)
             {
@@ -1784,6 +1835,400 @@ namespace
             *EscapeJsonString(ClassStr),
             *EscapeJsonString(GuidStr),
             *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.15.0 — Material subsystem (closes 2026-05-23 feature request #1/#2/#4) =====
+    //
+    // 5 tools that open the Material editing surface end-to-end:
+    //   create_material                 — UMaterialFactoryNew → UMaterial asset
+    //   add_material_expression         — NewObject<UMaterialExpressionX> + collection-add
+    //   set_material_expression_property — set UPROPERTYs on an expression (R/G/B on Constant3Vector, R/G/B/A bools on ComponentMask, ParameterName/DefaultValue on params, etc.)
+    //   connect_material_pins           — FExpressionInput::Connect on a named input
+    //   connect_material_output         — wire to one of UMaterial's outputs (BaseColor, Metallic, EmissiveColor, ...)
+    //
+    // Anchoring: each expression's `Desc` UPROPERTY is treated like a K2Node's
+    // NodeComment — the user-given label.  Re-lookup uses Desc.
+    //
+    // Pin reference format (mirrors v0's "<anchor>.<pin>" but for material):
+    //   "myExpr"            — first output of the expression named "myExpr"
+    //   "myExpr.0"          — output index 0 (same as above)
+    //   "myExpr.A"          — the input named "A" on the expression "myExpr"
+
+    /** Look up an expression in a material by its Desc (anchor). */
+    UMaterialExpression* FindMaterialExpressionByDesc(UMaterial* Mat, const FString& Desc)
+    {
+        if (Mat == nullptr) return nullptr;
+        UMaterialEditorOnlyData* EditorData = Mat->GetEditorOnlyData();
+        if (EditorData == nullptr) return nullptr;
+        for (UMaterialExpression* Expr : EditorData->ExpressionCollection.Expressions)
+        {
+            if (Expr != nullptr && Expr->Desc.Equals(Desc, ESearchCase::CaseSensitive))
+                return Expr;
+        }
+        return nullptr;
+    }
+
+    /**
+     * Resolve a class name like "Lerp" / "ComponentMask" / "WorldPosition"
+     * to a UMaterialExpression subclass via /Script/Engine.MaterialExpressionX
+     * lookup. Returns nullptr if not found / not a valid subclass.
+     */
+    UClass* ResolveMaterialExpressionClass(const FString& TypeName)
+    {
+        // Common alias map — UE editor menu names → actual class names.
+        static const TMap<FString, FString> kAlias = {
+            {TEXT("Lerp"),       TEXT("LinearInterpolate")},
+            {TEXT("WorldPos"),   TEXT("WorldPosition")},
+            {TEXT("Mask"),       TEXT("ComponentMask")},
+            {TEXT("Mul"),        TEXT("Multiply")},
+            {TEXT("Sub"),        TEXT("Subtract")},
+            {TEXT("Div"),        TEXT("Divide")},
+            {TEXT("Const"),      TEXT("Constant")},
+            {TEXT("Vec3"),       TEXT("Constant3Vector")},
+            {TEXT("Vec4"),       TEXT("Constant4Vector")},
+            {TEXT("ScalarParam"),TEXT("ScalarParameter")},
+            {TEXT("VectorParam"),TEXT("VectorParameter")},
+        };
+        FString CanonicalName = TypeName;
+        if (const FString* Aliased = kAlias.Find(TypeName))
+            CanonicalName = *Aliased;
+
+        // Try full path as-is first (user might pass /Script/Engine.MaterialExpressionAdd)
+        if (CanonicalName.StartsWith(TEXT("/Script/")))
+        {
+            if (UClass* Cls = LoadObject<UClass>(nullptr, *CanonicalName))
+            {
+                if (Cls->IsChildOf(UMaterialExpression::StaticClass()))
+                    return Cls;
+            }
+            return nullptr;
+        }
+
+        // Auto-prefix MaterialExpression if not already
+        FString ClassName = CanonicalName;
+        if (!ClassName.StartsWith(TEXT("MaterialExpression")))
+            ClassName = FString(TEXT("MaterialExpression")) + ClassName;
+
+        const FString FullPath = FString::Printf(TEXT("/Script/Engine.%s"), *ClassName);
+        UClass* Cls = LoadObject<UClass>(nullptr, *FullPath);
+        if (Cls != nullptr && Cls->IsChildOf(UMaterialExpression::StaticClass()))
+            return Cls;
+        return nullptr;
+    }
+
+    /**
+     * Parse a pin_ref of the form "anchor" / "anchor.0" / "anchor.A" into
+     * (anchor, suffix). Suffix may be empty.
+     */
+    void ParseMaterialPinRef(const FString& PinRef, FString& OutAnchor, FString& OutSuffix)
+    {
+        if (!PinRef.Split(TEXT("."), &OutAnchor, &OutSuffix))
+        {
+            OutAnchor = PinRef;
+            OutSuffix = FString();
+        }
+    }
+
+    /**
+     * For a "from" pin "myExpr.N" or "myExpr", returns OutOutputIndex.
+     * Default 0 if suffix omitted or non-numeric (the most common case —
+     * most expressions have one output).
+     */
+    int32 ResolveOutputIndex(const FString& Suffix)
+    {
+        if (Suffix.IsEmpty()) return 0;
+        if (Suffix.IsNumeric()) return FCString::Atoi(*Suffix);
+        return 0;   // named outputs (rare for most expressions) → fall through to 0
+    }
+
+    // ----- 1. create_material -----
+    FString CreateMaterialOnGameThread(const FString& Name, const FString& Path)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("create_material");
+
+        const FString FullAssetPath = Path / Name;
+        if (UEditorAssetLibrary::DoesAssetExist(FullAssetPath))
+            return JsonError(CmdName, TEXT("asset_exists"), FullAssetPath);
+
+        UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
+        FAssetToolsModule& AssetToolsModule =
+            FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+        UObject* NewAsset = AssetToolsModule.Get().CreateAsset(
+            Name, Path, UMaterial::StaticClass(), Factory);
+        if (NewAsset == nullptr)
+            return JsonError(CmdName, TEXT("creation_failed"), FullAssetPath);
+        UMaterial* NewMat = Cast<UMaterial>(NewAsset);
+        if (NewMat == nullptr)
+            return JsonError(CmdName, TEXT("wrong_asset_type"),
+                FString::Printf(TEXT("Created asset is %s, not UMaterial"),
+                    *NewAsset->GetClass()->GetName()));
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(FullAssetPath, /*bOnlyIfIsDirty*/ false);
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_material\",\"material_path\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(FullAssetPath),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ----- 2. add_material_expression -----
+    FString AddMaterialExpressionOnGameThread(
+        const FString& MaterialPath, const FString& ExpressionType,
+        const FString& AnchorName, int32 PosX, int32 PosY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_material_expression");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        if (FindMaterialExpressionByDesc(Mat, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UClass* ExprClass = ResolveMaterialExpressionClass(ExpressionType);
+        if (ExprClass == nullptr)
+            return JsonError(CmdName, TEXT("unknown_expression_type"),
+                FString::Printf(TEXT("'%s' didn't resolve to a UMaterialExpression subclass. "
+                                     "Try short names like 'Lerp' / 'Add' / 'ComponentMask' / "
+                                     "'WorldPosition' / 'Constant3Vector' / 'ScalarParameter' / "
+                                     "'VectorParameter', or full path '/Script/Engine.MaterialExpressionX'."),
+                    *ExpressionType));
+
+        UMaterial* OuterMat = Mat;
+        UMaterialExpression* NewExpr = NewObject<UMaterialExpression>(OuterMat, ExprClass, NAME_None, RF_Transactional);
+        NewExpr->Material = OuterMat;
+        NewExpr->MaterialExpressionEditorX = PosX;
+        NewExpr->MaterialExpressionEditorY = PosY;
+        NewExpr->Desc = AnchorName;
+        NewExpr->bCommentBubbleVisible = true;
+        NewExpr->MaterialExpressionGuid = FGuid::NewGuid();
+
+        Mat->GetEditorOnlyData()->ExpressionCollection.AddExpression(NewExpr);
+        // v9.15.0 — DO NOT call Mat->PostEditChange() per-op: it triggers a
+        // synchronous material shader recompile that easily exceeds the 12s
+        // Python TCP timeout once the graph wires reach an output. Material
+        // editing is a batch flow — caller does many add/connect ops, then
+        // calls save_all() at the end. MarkPackageDirty is enough for the
+        // save_all path to pick it up; recompile happens at next editor load
+        // or when the user explicitly opens the material.
+        Mat->MarkPackageDirty();
+        const bool bSaved = false;
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_material_expression\",\"anchor_name\":%s,")
+            TEXT("\"expression_class\":%s,\"node_guid\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(ExprClass->GetPathName()),
+            *EscapeJsonString(NewExpr->MaterialExpressionGuid.ToString(EGuidFormats::DigitsWithHyphens)),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ----- 3. set_material_expression_property -----
+    // Reuses WalkPropertyPath. For each value type, dispatch the same way as
+    // SetComponentPropertyOnGameThread (FObjectProperty / FClassProperty /
+    // ImportText_Direct fallback).
+    FString SetMaterialExpressionPropertyOnGameThread(
+        const FString& MaterialPath, const FString& AnchorName,
+        const FString& PropertyPath, const FString& Value)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_material_expression_property");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        UMaterialExpression* Expr = FindMaterialExpressionByDesc(Mat, AnchorName);
+        if (Expr == nullptr)
+            return JsonError(CmdName, TEXT("expression_not_found"), AnchorName);
+
+        void* ValuePtr = nullptr;
+        FProperty* LeafProp = WalkPropertyPath(Expr->GetClass(), Expr, PropertyPath, ValuePtr);
+        if (LeafProp == nullptr || ValuePtr == nullptr)
+            return JsonError(CmdName, TEXT("property_not_found"),
+                FString::Printf(TEXT("Expression '%s' (class %s) has no property '%s'"),
+                    *AnchorName, *Expr->GetClass()->GetName(), *PropertyPath));
+
+        Expr->PreEditChange(LeafProp);
+        FString ResolvedValueStr;
+        FString ErrorDetail;
+        bool bSuccess = false;
+
+        if (FObjectProperty* ObjProp = CastField<FObjectProperty>(LeafProp))
+        {
+            UObject* Asset = Value.IsEmpty() ? nullptr : LoadObject<UObject>(nullptr, *Value);
+            if (!Value.IsEmpty() && Asset == nullptr)
+                ErrorDetail = FString::Printf(TEXT("Asset not found: %s"), *Value);
+            else if (Asset != nullptr && !Asset->IsA(ObjProp->PropertyClass))
+                ErrorDetail = FString::Printf(TEXT("'%s' is %s, expected %s"),
+                    *Value, *Asset->GetClass()->GetName(), *ObjProp->PropertyClass->GetName());
+            else
+            {
+                ObjProp->SetObjectPropertyValue(ValuePtr, Asset);
+                ResolvedValueStr = Asset != nullptr ? Asset->GetPathName() : TEXT("None");
+                bSuccess = true;
+            }
+        }
+        else
+        {
+            FString NormalizedValue = Value;
+            if (FStructProperty* StructProp = CastField<FStructProperty>(LeafProp))
+            {
+                if (IsSupportedStructForDefault(StructProp->Struct))
+                    NormalizedValue = FormatStructDefault(StructProp->Struct, Value);
+            }
+            const TCHAR* Buffer = *NormalizedValue;
+            const TCHAR* Result = LeafProp->ImportText_Direct(Buffer, ValuePtr, /*OwnerObject*/ Expr, PPF_None);
+            if (Result == nullptr)
+                ErrorDetail = FString::Printf(TEXT("Failed to parse '%s' for property '%s' (type %s)"),
+                    *NormalizedValue, *PropertyPath, *LeafProp->GetClass()->GetName());
+            else
+            {
+                ResolvedValueStr = NormalizedValue;
+                bSuccess = true;
+            }
+        }
+
+        if (!bSuccess)
+            return JsonError(CmdName, TEXT("set_failed"), ErrorDetail);
+
+        FPropertyChangedEvent Change(LeafProp, EPropertyChangeType::ValueSet);
+        Expr->PostEditChangeProperty(Change);
+        // v9.15.0 — DO NOT call Mat->PostEditChange() per-op: it triggers a
+        // synchronous material shader recompile that easily exceeds the 12s
+        // Python TCP timeout once the graph wires reach an output. Material
+        // editing is a batch flow — caller does many add/connect ops, then
+        // calls save_all() at the end. MarkPackageDirty is enough for the
+        // save_all path to pick it up; recompile happens at next editor load
+        // or when the user explicitly opens the material.
+        Mat->MarkPackageDirty();
+        const bool bSaved = false;
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_material_expression_property\",\"anchor_name\":%s,")
+            TEXT("\"property\":%s,\"resolved_value\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(PropertyPath),
+            *EscapeJsonString(ResolvedValueStr),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // Helper: resolve an FExpressionInput pointer on an expression by name
+    // (FProperty reflection on UMaterialExpression subclasses).
+    FExpressionInput* FindExpressionInputByName(UMaterialExpression* Expr, const FString& InputName)
+    {
+        if (Expr == nullptr || InputName.IsEmpty()) return nullptr;
+        FProperty* Prop = FindFProperty<FProperty>(Expr->GetClass(), *InputName);
+        if (Prop == nullptr) return nullptr;
+        FStructProperty* StructProp = CastField<FStructProperty>(Prop);
+        if (StructProp == nullptr) return nullptr;
+        // FExpressionInput is NOT TBaseStructure-registered, and FMaterialInput<T>
+        // isn't either. Both have names containing "Input" (ExpressionInput,
+        // ColorMaterialInput, ScalarMaterialInput, VectorMaterialInput, …).
+        // Use that as the heuristic — any FExpressionInput-derived struct will
+        // start its layout with Expression+OutputIndex+InputName, so a memcpy
+        // through that field set is safe.
+        const FString StructName = StructProp->Struct->GetName();
+        if (!StructName.Contains(TEXT("Input"))) return nullptr;
+        return StructProp->ContainerPtrToValuePtr<FExpressionInput>(Expr);
+    }
+
+    // ----- 4. connect_material_pins -----
+    // from_pin: "anchor" or "anchor.<outputIdx>"
+    // to_pin:   "anchor.<inputName>"  (must include input name)
+    FString ConnectMaterialPinsOnGameThread(
+        const FString& MaterialPath, const FString& FromPin, const FString& ToPin)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("connect_material_pins");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        FString FromAnchor, FromSuffix, ToAnchor, ToInputName;
+        ParseMaterialPinRef(FromPin, FromAnchor, FromSuffix);
+        ParseMaterialPinRef(ToPin,   ToAnchor,   ToInputName);
+        if (ToInputName.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_to_input_name"),
+                TEXT("to_pin must be 'anchor.<InputName>', e.g. 'lerp.A' / 'add.B' / 'mask.Input'"));
+
+        UMaterialExpression* FromExpr = FindMaterialExpressionByDesc(Mat, FromAnchor);
+        UMaterialExpression* ToExpr   = FindMaterialExpressionByDesc(Mat, ToAnchor);
+        if (FromExpr == nullptr)
+            return JsonError(CmdName, TEXT("from_expression_not_found"), FromAnchor);
+        if (ToExpr == nullptr)
+            return JsonError(CmdName, TEXT("to_expression_not_found"), ToAnchor);
+
+        FExpressionInput* Input = FindExpressionInputByName(ToExpr, ToInputName);
+        if (Input == nullptr)
+            return JsonError(CmdName, TEXT("input_not_found"),
+                FString::Printf(TEXT("Expression '%s' (class %s) has no FExpressionInput named '%s'"),
+                    *ToAnchor, *ToExpr->GetClass()->GetName(), *ToInputName));
+
+        const int32 OutputIndex = ResolveOutputIndex(FromSuffix);
+        Input->Connect(OutputIndex, FromExpr);
+
+        // Batch flow — caller does save_all() at end. (See add_material_expression note.)
+        Mat->MarkPackageDirty();
+        const bool bSaved = false;
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"connect_material_pins\",\"from\":%s,\"to\":%s,\"output_index\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(FromPin),
+            *EscapeJsonString(ToPin),
+            OutputIndex,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ----- 5. connect_material_output -----
+    // material_output: "BaseColor" / "Metallic" / "Roughness" / "EmissiveColor" /
+    //                  "Normal" / "Opacity" / "OpacityMask" / "WorldPositionOffset" / etc.
+    // All resolve via reflection on UMaterialEditorOnlyData.
+    FString ConnectMaterialOutputOnGameThread(
+        const FString& MaterialPath, const FString& FromPin, const FString& OutputName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("connect_material_output");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+
+        FString FromAnchor, FromSuffix;
+        ParseMaterialPinRef(FromPin, FromAnchor, FromSuffix);
+        UMaterialExpression* FromExpr = FindMaterialExpressionByDesc(Mat, FromAnchor);
+        if (FromExpr == nullptr)
+            return JsonError(CmdName, TEXT("from_expression_not_found"), FromAnchor);
+
+        UMaterialEditorOnlyData* EditorData = Mat->GetEditorOnlyData();
+        if (EditorData == nullptr)
+            return JsonError(CmdName, TEXT("no_editor_data"));
+
+        FProperty* Prop = FindFProperty<FProperty>(EditorData->GetClass(), *OutputName);
+        if (Prop == nullptr)
+            return JsonError(CmdName, TEXT("unknown_output"),
+                FString::Printf(TEXT("'%s' is not a property on UMaterialEditorOnlyData. "
+                                     "Try BaseColor / Metallic / Specular / Roughness / "
+                                     "Normal / Tangent / EmissiveColor / Opacity / OpacityMask / "
+                                     "WorldPositionOffset / Refraction / AmbientOcclusion / "
+                                     "ClearCoat / SubsurfaceColor."),
+                    *OutputName));
+        FStructProperty* StructProp = CastField<FStructProperty>(Prop);
+        if (StructProp == nullptr)
+            return JsonError(CmdName, TEXT("not_a_material_input"), OutputName);
+        FExpressionInput* Input = StructProp->ContainerPtrToValuePtr<FExpressionInput>(EditorData);
+
+        const int32 OutputIndex = ResolveOutputIndex(FromSuffix);
+        Input->Connect(OutputIndex, FromExpr);
+
+        // Batch flow — caller does save_all() at end. (See add_material_expression note.)
+        Mat->MarkPackageDirty();
+        const bool bSaved = false;
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"connect_material_output\",\"from\":%s,\"output\":%s,\"output_index\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(FromPin),
+            *EscapeJsonString(OutputName),
+            OutputIndex,
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -6144,7 +6589,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.14.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.15.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -6436,6 +6881,119 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("create_widget_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.15.0 Material subsystem ---
+    if (Command.Equals(TEXT("create_material"), ESearchCase::IgnoreCase))
+    {
+        FString Name, Path;
+        if (!JsonObject->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+            return JsonError(TEXT("create_material"), TEXT("missing_field"), TEXT("name"));
+        if (!JsonObject->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+            Path = TEXT("/Game/Materials");
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Name, Path]() mutable
+            {
+                Promise.SetValue(CreateMaterialOnGameThread(Name, Path));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_material"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("add_material_expression"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, ExpressionType, AnchorName;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("add_material_expression"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("expression_type"), ExpressionType) || ExpressionType.IsEmpty())
+            return JsonError(TEXT("add_material_expression"), TEXT("missing_field"), TEXT("expression_type"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_material_expression"), TEXT("missing_field"), TEXT("anchor_name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, ExpressionType, AnchorName, PosX, PosY]() mutable
+            {
+                Promise.SetValue(AddMaterialExpressionOnGameThread(MaterialPath, ExpressionType, AnchorName, PosX, PosY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_material_expression"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("set_material_expression_property"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, AnchorName, PropertyPath, Value;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("set_material_expression_property"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("set_material_expression_property"), TEXT("missing_field"), TEXT("anchor_name"));
+        if (!JsonObject->TryGetStringField(TEXT("property"), PropertyPath) || PropertyPath.IsEmpty())
+            return JsonError(TEXT("set_material_expression_property"), TEXT("missing_field"), TEXT("property"));
+        JsonObject->TryGetStringField(TEXT("value"), Value);   // empty OK for clearing
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, AnchorName, PropertyPath, Value]() mutable
+            {
+                Promise.SetValue(SetMaterialExpressionPropertyOnGameThread(MaterialPath, AnchorName, PropertyPath, Value));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_material_expression_property"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("connect_material_pins"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, FromPin, ToPin;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("connect_material_pins"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("from_pin"), FromPin) || FromPin.IsEmpty())
+            return JsonError(TEXT("connect_material_pins"), TEXT("missing_field"), TEXT("from_pin"));
+        if (!JsonObject->TryGetStringField(TEXT("to_pin"), ToPin) || ToPin.IsEmpty())
+            return JsonError(TEXT("connect_material_pins"), TEXT("missing_field"), TEXT("to_pin"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, FromPin, ToPin]() mutable
+            {
+                Promise.SetValue(ConnectMaterialPinsOnGameThread(MaterialPath, FromPin, ToPin));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("connect_material_pins"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("connect_material_output"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath, FromPin, OutputName;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("connect_material_output"), TEXT("missing_field"), TEXT("material"));
+        if (!JsonObject->TryGetStringField(TEXT("from_pin"), FromPin) || FromPin.IsEmpty())
+            return JsonError(TEXT("connect_material_output"), TEXT("missing_field"), TEXT("from_pin"));
+        if (!JsonObject->TryGetStringField(TEXT("output"), OutputName) || OutputName.IsEmpty())
+            return JsonError(TEXT("connect_material_output"), TEXT("missing_field"), TEXT("output"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, FromPin, OutputName]() mutable
+            {
+                Promise.SetValue(ConnectMaterialOutputOnGameThread(MaterialPath, FromPin, OutputName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("connect_material_output"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

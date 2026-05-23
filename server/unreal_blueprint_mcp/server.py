@@ -171,6 +171,15 @@ def set_component_property(
         property_name="BodyInstance.CollisionProfileName"  value="OverlapAllDynamic"
         property_name="BodyInstance.bGenerateOverlapEvents"  value="True"
 
+    **v9.15.0** — array-index syntax ``Name[N]`` on any token. Auto-grows
+    the array when N is past the current size. The most common use is
+    setting material slots on a mesh component::
+
+        property_name="OverrideMaterials[0]"  value="/Game/Materials/M_HeightColor"
+        property_name="OverrideMaterials[2]"  value="/Game/Materials/M_Detail"
+
+    Closes 2026-05-23 feature request #4.
+
     Examples::
 
         # Make a StaticMeshComponent visible
@@ -2999,6 +3008,227 @@ def create_widget_blueprint(
     if parent_class:
         payload["parent_class"] = parent_class
     return _send_command(payload)
+
+
+# ---------------------------------------------------------------------------
+# v9.15.0 — Material subsystem (closes 2026-05-23 feature request #1/#2)
+# ---------------------------------------------------------------------------
+# Five tools that open the Material editing surface end-to-end.
+#
+# Anchoring: each expression's ``Desc`` UPROPERTY is the user-given label —
+# the same pattern as ``NodeComment`` on K2 nodes.
+#
+# Pin reference format mirrors v0's "<anchor>.<pin>" but for materials:
+#   "myExpr"      — first output of the expression named "myExpr"
+#   "myExpr.0"    — output index 0 (same as above)
+#   "myExpr.A"    — for to_pin: the input named "A" on the expression
+#
+# Material outputs are addressed by name (BaseColor / EmissiveColor /
+# Metallic / Roughness / Normal / Opacity / WorldPositionOffset / etc.).
+#
+# **Batch flow**: ``add_material_expression`` / ``set_material_expression_property``
+# / ``connect_material_pins`` / ``connect_material_output`` only mark the
+# material package dirty — they do NOT call ``PostEditChange`` or save. That
+# avoids per-op shader recompile (which can easily exceed the 12s TCP timeout).
+# Call ``save_all()`` after your batch is complete to actually persist. UE
+# recompiles the shader when the material is next loaded or opened.
+
+
+@mcp.tool()
+def create_material(
+    name: str,
+    path: str = "/Game/Materials",
+) -> dict[str, Any]:
+    """Create a new blank Material asset — v9.15.0.
+
+    Creates via ``UMaterialFactoryNew`` → ``UMaterial``. Domain defaults
+    to Surface, shading model DefaultLit (UE factory defaults).
+
+    Args:
+        name: Asset name (e.g. ``"M_HeightColor"``).
+        path: /Game-relative folder. Default ``/Game/Materials``.
+
+    Returns:
+        ``{"ok": True, "material_path": "/Game/...", "saved": True}``
+
+    Common errors:
+        asset_exists, creation_failed, wrong_asset_type
+    """
+    if not name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "create_material", "name": name, "path": path})
+
+
+@mcp.tool()
+def add_material_expression(
+    material: str,
+    expression_type: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+) -> dict[str, Any]:
+    """Add a UMaterialExpression node to a material's graph — v9.15.0.
+
+    Args:
+        material: Material asset path.
+        expression_type: Short name or aliases. Common ones:
+            - ``"Constant"`` (1 scalar), ``"Constant3Vector"`` /
+              ``"Vec3"`` (RGB), ``"Constant4Vector"`` / ``"Vec4"`` (RGBA)
+            - ``"Add"`` / ``"Subtract"`` / ``"Multiply"`` / ``"Divide"``
+            - ``"Lerp"`` (alias of ``"LinearInterpolate"``)
+            - ``"Saturate"``, ``"Power"``, ``"Sine"``, ``"Cosine"``,
+              ``"Abs"``, ``"Frac"``, ``"Floor"``, ``"Ceil"``
+            - ``"WorldPosition"`` / ``"WorldPos"`` (no inputs)
+            - ``"ComponentMask"`` / ``"Mask"`` (channel picker)
+            - ``"ScalarParameter"`` / ``"ScalarParam"``,
+              ``"VectorParameter"`` / ``"VectorParam"``
+            - ``"TextureSample"``, ``"TextureSampleParameter2D"``
+            - Or full path ``"/Script/Engine.MaterialExpressionFoo"``.
+        anchor_name: User-given label (becomes ``Desc`` on the expression).
+            Must be unique within the material.
+        position_x, position_y: Material-editor canvas position.
+
+    Returns:
+        ``{"ok": True, "anchor_name": ..., "expression_class": "...",
+            "node_guid": "...", "saved": True}``
+
+    Common errors:
+        material_not_found, unknown_expression_type, anchor_name_exists
+    """
+    if not material or not expression_type or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_material_expression",
+        "material": material,
+        "expression_type": expression_type,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    })
+
+
+@mcp.tool()
+def set_material_expression_property(
+    material: str,
+    anchor_name: str,
+    property: str,
+    value: str = "",
+) -> dict[str, Any]:
+    """Set a UPROPERTY on a material expression — v9.15.0.
+
+    Reflection-based — works on any UPROPERTY of any UMaterialExpression
+    subclass. Useful for:
+
+      - ``Constant.R = 0.5`` (single scalar)
+      - ``Constant3Vector.Constant = "(R=1,G=0.5,B=0.2)"`` (FLinearColor)
+      - ``ComponentMask.R = "true"``, ``ComponentMask.G = "false"``
+        (which channels to extract)
+      - ``ScalarParameter.ParameterName = "Tint"``
+      - ``ScalarParameter.DefaultValue = "1.0"``
+      - ``VectorParameter.DefaultValue = "(R=1,G=0,B=0,A=1)"``
+
+    Args:
+        material: Material asset path.
+        anchor_name: Expression's anchor (the ``Desc`` you gave to
+            ``add_material_expression``).
+        property: Property name or dot-notation path
+            (e.g. ``"Constant"`` for Constant3Vector, ``"R"`` for ComponentMask).
+        value: New value as a string. UE's standard import-text formats
+            apply: ``"true"``/``"false"`` for bools, numbers for scalars,
+            ``"(R=...,G=...,B=...)"`` for FLinearColor.
+
+    Returns:
+        ``{"ok": True, "anchor_name": ..., "property": ...,
+            "resolved_value": ..., "saved": True}``
+
+    Common errors:
+        material_not_found, expression_not_found, property_not_found, set_failed
+    """
+    if not material or not anchor_name or not property:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_material_expression_property",
+        "material": material,
+        "anchor_name": anchor_name,
+        "property": property,
+        "value": value,
+    })
+
+
+@mcp.tool()
+def connect_material_pins(
+    material: str,
+    from_pin: str,
+    to_pin: str,
+) -> dict[str, Any]:
+    """Wire two material expressions — v9.15.0.
+
+    Args:
+        material: Material asset path.
+        from_pin: Source. ``"<anchor>"`` (default output 0) or
+            ``"<anchor>.<index>"`` (e.g. ``"mask.0"``).
+        to_pin: Destination. **Must** include the input name —
+            ``"<anchor>.<InputName>"`` (e.g. ``"lerp.A"``, ``"add.B"``,
+            ``"mask.Input"``, ``"saturate.Input"``). The input name is
+            the UPROPERTY name on the expression class (look at the UE
+            source or material editor pin label).
+
+    Returns:
+        ``{"ok": True, "from": ..., "to": ..., "output_index": N,
+            "saved": True}``
+
+    Common errors:
+        material_not_found, from_expression_not_found,
+        to_expression_not_found, input_not_found, missing_to_input_name
+    """
+    if not material or not from_pin or not to_pin:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "connect_material_pins",
+        "material": material,
+        "from_pin": from_pin,
+        "to_pin": to_pin,
+    })
+
+
+@mcp.tool()
+def connect_material_output(
+    material: str,
+    from_pin: str,
+    output: str,
+) -> dict[str, Any]:
+    """Wire an expression into one of the material's outputs — v9.15.0.
+
+    The 'last step' that makes a material graph actually shade.
+
+    Args:
+        material: Material asset path.
+        from_pin: Source. ``"<anchor>"`` or ``"<anchor>.<index>"``.
+        output: One of the material output names (UPROPERTY on
+            UMaterialEditorOnlyData). Common picks:
+              ``"BaseColor"``, ``"Metallic"``, ``"Specular"``,
+              ``"Roughness"``, ``"Normal"``, ``"Tangent"``,
+              ``"EmissiveColor"``, ``"Opacity"``, ``"OpacityMask"``,
+              ``"WorldPositionOffset"``, ``"Refraction"``,
+              ``"AmbientOcclusion"``, ``"ClearCoat"``,
+              ``"SubsurfaceColor"``.
+
+    Returns:
+        ``{"ok": True, "from": ..., "output": ..., "output_index": N,
+            "saved": True}``
+
+    Common errors:
+        material_not_found, from_expression_not_found, unknown_output,
+        not_a_material_input
+    """
+    if not material or not from_pin or not output:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "connect_material_output",
+        "material": material,
+        "from_pin": from_pin,
+        "output": output,
+    })
 
 
 @mcp.tool()

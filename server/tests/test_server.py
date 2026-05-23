@@ -4387,3 +4387,181 @@ def test_ping_returns_plugin_version_9_14_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.14.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.15.0 — Material subsystem
+# ---------------------------------------------------------------------------
+
+
+def test_create_material_success() -> None:
+    response = b'{"ok":true,"command":"create_material","material_path":"/Game/Materials/M_X","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_material(name="M_X")
+    assert r["ok"] is True
+    assert r["material_path"] == "/Game/Materials/M_X"
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "create_material", "name": "M_X", "path": "/Game/Materials"}
+
+
+def test_create_material_asset_exists() -> None:
+    response = b'{"ok":false,"command":"create_material","error":"asset_exists","detail":"/Game/Materials/M_X"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_material(name="M_X")
+    assert r["error"] == "asset_exists"
+
+
+def test_create_material_local_validation() -> None:
+    assert server.create_material(name="")["error"] == "missing_argument"
+
+
+def test_add_material_expression_lerp() -> None:
+    response = (
+        b'{"ok":true,"command":"add_material_expression","anchor_name":"lerp",'
+        b'"expression_class":"/Script/Engine.MaterialExpressionLinearInterpolate",'
+        b'"node_guid":"AAAA","saved":false}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_material_expression(
+            material="/Game/Materials/M_X",
+            expression_type="Lerp",
+            anchor_name="lerp",
+            position_x=400, position_y=0,
+        )
+    assert r["ok"] is True
+    assert r["expression_class"].endswith("LinearInterpolate")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["expression_type"] == "Lerp"
+
+
+def test_add_material_expression_unknown_type() -> None:
+    response = b'{"ok":false,"command":"add_material_expression","error":"unknown_expression_type","detail":"..."}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_material_expression(
+            material="/Game/M", expression_type="DoesNotExist", anchor_name="x",
+        )
+    assert r["error"] == "unknown_expression_type"
+
+
+def test_add_material_expression_local_validation() -> None:
+    assert server.add_material_expression(material="", expression_type="Add", anchor_name="x")["error"] == "missing_argument"
+    assert server.add_material_expression(material="/G/M", expression_type="", anchor_name="x")["error"] == "missing_argument"
+    assert server.add_material_expression(material="/G/M", expression_type="Add", anchor_name="")["error"] == "missing_argument"
+
+
+def test_set_material_expression_property_component_mask() -> None:
+    """The rev8 use case: enable R channel on a ComponentMask."""
+    response = (
+        b'{"ok":true,"command":"set_material_expression_property","anchor_name":"mask",'
+        b'"property":"R","resolved_value":"True","saved":false}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_material_expression_property(
+            material="/Game/M_X", anchor_name="mask", property="R", value="True",
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["property"] == "R"
+    assert sent_dict["value"] == "True"
+
+
+def test_set_material_expression_property_const_color() -> None:
+    """Constant3Vector.Constant = (R=1,G=0,B=0) (red)."""
+    response = b'{"ok":true,"command":"set_material_expression_property","anchor_name":"red","property":"Constant","resolved_value":"(R=1,G=0,B=0)","saved":false}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_material_expression_property(
+            material="/Game/M_X", anchor_name="red", property="Constant", value="(R=1,G=0,B=0)",
+        )
+    assert r["ok"] is True
+    assert r["resolved_value"] == "(R=1,G=0,B=0)"
+
+
+def test_connect_material_pins_lerp_a() -> None:
+    """Wire a Constant3Vector (red) into Lerp's A input."""
+    response = b'{"ok":true,"command":"connect_material_pins","from":"red","to":"lerp.A","output_index":0,"saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.connect_material_pins(material="/Game/M_X", from_pin="red", to_pin="lerp.A")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["from_pin"] == "red"
+    assert sent_dict["to_pin"] == "lerp.A"
+
+
+def test_connect_material_pins_explicit_output_index() -> None:
+    response = b'{"ok":true,"command":"connect_material_pins","from":"worldpos.0","to":"mask.Input","output_index":0,"saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.connect_material_pins(material="/Game/M", from_pin="worldpos.0", to_pin="mask.Input")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["from_pin"] == "worldpos.0"
+
+
+def test_connect_material_pins_missing_input_name() -> None:
+    response = b'{"ok":false,"command":"connect_material_pins","error":"missing_to_input_name","detail":"..."}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_material_pins(material="/Game/M", from_pin="a", to_pin="b")
+    assert r["error"] == "missing_to_input_name"
+
+
+def test_connect_material_output_basecolor() -> None:
+    response = b'{"ok":true,"command":"connect_material_output","from":"lerp","output":"BaseColor","output_index":0,"saved":false}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.connect_material_output(material="/Game/M_X", from_pin="lerp", output="BaseColor")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["output"] == "BaseColor"
+
+
+def test_connect_material_output_emissive() -> None:
+    response = b'{"ok":true,"command":"connect_material_output","from":"lerp","output":"EmissiveColor","output_index":0,"saved":false}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_material_output(material="/Game/M_X", from_pin="lerp", output="EmissiveColor")
+    assert r["ok"] is True
+
+
+def test_connect_material_output_unknown() -> None:
+    response = b'{"ok":false,"command":"connect_material_output","error":"unknown_output","detail":"..."}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_material_output(material="/G/M", from_pin="x", output="DoesNotExist")
+    assert r["error"] == "unknown_output"
+
+
+def test_set_component_property_array_index() -> None:
+    """v9.15.0: OverrideMaterials[0] = material path."""
+    response = b'{"ok":true,"command":"set_component_property","blueprint":"/Game/BP","component":"VisualMesh","property":"OverrideMaterials[0]","resolved_value":"/Game/Materials/M_X","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_component_property(
+            blueprint="/Game/BP", component_name="VisualMesh",
+            property_name="OverrideMaterials[0]",
+            value="/Game/Materials/M_X",
+        )
+    assert r["ok"] is True
+    assert r["resolved_value"] == "/Game/Materials/M_X"
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["property_name"] == "OverrideMaterials[0]"
+
+
+def test_ping_returns_plugin_version_9_15_0() -> None:
+    """v9.15.0: ping surfaces 9.15.0."""
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.15.0","build_date":"May 23 2026 12:00:00",'
+        b'"timestamp":"2026-05-23T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["ok"] is True
+    assert r["plugin_version"] == "9.15.0"
