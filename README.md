@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.14.0](https://img.shields.io/badge/version-v9.14.0-brightgreen)](#status)
-[![78 tools](https://img.shields.io/badge/tools-78-blue)](#tools)
-[![236 tests](https://img.shields.io/badge/tests-236%20passing-success)](#requirements)
+[![v9.15.0](https://img.shields.io/badge/version-v9.15.0-brightgreen)](#status)
+[![83 tools](https://img.shields.io/badge/tools-83-blue)](#tools)
+[![252 tests](https://img.shields.io/badge/tests-252%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -77,7 +77,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.12.0** | ✅ Sizing tools: `get_player_capsule` (radius / half_height / diameter / full_height) + `spawn_actor(scale=)` (full-pose one-call) + `pie_set_player_location(snap_to_ground=True)` (line trace + capsule offset). LLM no longer blind to size when laying out corridors/doors |
 | **v9.13.0** | ✅ `add_component_get` (by-name SCS component ref node — closes "GetComponentByClass-only-finds-first" gap) + WP-aware spawn persistence (`AActor::MarkPackageDirty` for external actor files) + `add_node` invalid_node_type format hint + `set_pin_default` docs fix (class pins always worked) |
 | **v9.14.0** | ✅ `add_select` `num_options` actually grows past 2 (was silently capped — closes rev8 ISSUE-1). N-way data Select now usable in one node instead of Switch + N VariableSet workaround |
-| **Unit tests** | **236 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.15.0** | ✅ Material subsystem door-opener: `create_material` + `add_material_expression` + `set_material_expression_property` + `connect_material_pins` + `connect_material_output`. Plus `set_component_property` array-index syntax (`OverrideMaterials[0]`). LLM can now build height-color / param materials end-to-end |
+| **Unit tests** | **252 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -300,6 +301,20 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 | Tool | What it does |
 |------|--------------|
 | **`create_niagara_system`** (v9.3) | Blank `UNiagaraSystem` via `UNiagaraSystemFactoryNew` (resolved at runtime — factory class is not `NIAGARAEDITOR_API`-exported) |
+
+### Material subsystem (v9.15)
+
+Anchoring + pin-ref scheme mirrors v0 K2 BPs but applied to material graphs.
+Batch flow: ops mark dirty only — caller runs `save_all()` at the end of a
+batch to trigger one shader recompile + save (avoids the per-op 12s timeout).
+
+| Tool | What it does |
+|------|--------------|
+| **`create_material`** (v9.15) | Blank `UMaterial` via `UMaterialFactoryNew`. Domain Surface / DefaultLit |
+| **`add_material_expression`** (v9.15) | Add a `UMaterialExpression` subclass node. Short names (`Lerp` / `Mask` / `WorldPos` / `Constant3Vector` / `ScalarParameter` / etc.) or `/Script/Engine.MaterialExpressionX` full path |
+| **`set_material_expression_property`** (v9.15) | Set a UPROPERTY on an expression — FProperty reflection. `ComponentMask.R/G/B/A`, `Constant3Vector.Constant`, `ScalarParameter.DefaultValue`, etc. |
+| **`connect_material_pins`** (v9.15) | Wire `from_pin` ("anchor" / "anchor.0") into `to_pin` ("anchor.InputName"). Uses `FExpressionInput::Connect` |
+| **`connect_material_output`** (v9.15) | Wire into one of UMaterial's outputs: `BaseColor` / `EmissiveColor` / `Metallic` / `Roughness` / `Normal` / `Opacity` / `WorldPositionOffset` / etc. |
 
 ## v1 Collision-Timer demo
 

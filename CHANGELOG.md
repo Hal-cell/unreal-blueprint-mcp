@@ -6,7 +6,78 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.14.0.
+Everything shipped through v9.15.0.
+
+---
+
+## [v9.15.0] — 2026-05-23 — Material subsystem door-opener (closes 2026-05-23 feature request #1/#2/#4)
+
+### Closes 2026-05-23 feature request
+
+- **#1 + #2** (high) — Material editing was the one major editor surface
+  with zero tool coverage. rev8 specifically wanted a "height-color"
+  material (World Z → mask → saturate → Lerp two colors → BaseColor).
+- **#4** (medium) — `set_component_property` couldn't address array
+  elements like `OverrideMaterials[0]`, which is how a mesh component
+  takes a per-instance material override.
+
+### Added — 5 new tools + 1 extension (78 → 83)
+
+- **`create_material(name, path="/Game/Materials")`** — blank `UMaterial`
+  via `UMaterialFactoryNew`.
+- **`add_material_expression(material, expression_type, anchor, x, y)`** —
+  spawn a `UMaterialExpression` subclass and add to the material's
+  `ExpressionCollection`. Type name accepts short aliases (`Lerp`,
+  `Mask`, `WorldPos`, `Constant3Vector`, `ScalarParameter`, etc. — full
+  alias table) OR a full `/Script/Engine.MaterialExpressionFoo` path.
+  Anchor stored in the expression's `Desc` UPROPERTY (same NodeComment
+  pattern as K2 nodes).
+- **`set_material_expression_property(material, anchor, property, value)`** —
+  FProperty reflection on the expression. Reuses `WalkPropertyPath` and
+  the `FObjectProperty` / `ImportText_Direct` dispatch from
+  `set_component_property`. Useful for `ComponentMask.R/G/B/A`,
+  `Constant3Vector.Constant`, `ScalarParameter.DefaultValue`, etc.
+- **`connect_material_pins(material, from_pin, to_pin)`** — wire one
+  expression into a named input on another. `from_pin` = `"anchor"` or
+  `"anchor.<outputIndex>"`. `to_pin` = `"anchor.<InputName>"` where
+  InputName is the UPROPERTY name (`"A"`, `"B"`, `"Alpha"`, `"Input"`).
+  Uses `FExpressionInput::Connect`.
+- **`connect_material_output(material, from_pin, output)`** — wire to one
+  of UMaterial's outputs (BaseColor / EmissiveColor / Metallic / etc.).
+  Resolved via `FindFProperty` on `UMaterialEditorOnlyData`.
+- **`set_component_property(..., property_name="OverrideMaterials[N]")`** —
+  extended. `WalkPropertyPath` now recognizes `Name[N]` syntax on any
+  token. Detects `FArrayProperty`, uses `FScriptArrayHelper` to access
+  (or auto-grow) the Nth element. Closes #4.
+
+### Implementation note: batch flow (no per-op compile)
+
+After initial implementation, the live smoke test hit a 12s TCP timeout
+on `connect_material_output` — the call triggers `Mat->PostEditChange()`
+which kicks off a synchronous shader recompile. All 5 material ops were
+changed to SKIP `PostEditChange` and `SaveAsset`; they only call
+`MarkPackageDirty`. Caller runs `save_all()` at the end of the batch.
+UE recompiles on next material load or explicit reopen. This is the
+natural material-editing flow anyway — you build the graph first, then
+save once.
+
+### Live verification
+
+End-to-end build of the rev8 height-color material in 21 tool calls:
+
+  create_material → add_material_expression × 7
+  → set_material_expression_property × 3 (ComponentMask channels,
+    Constant3Vector colors, Multiply.ConstB scale)
+  → connect_material_pins × 6 (wpos → mask → scale → sat → lerp,
+    plus two color inputs into Lerp)
+  → connect_material_output(lerp → BaseColor)
+  → save_all
+  → set_component_property OverrideMaterials[0] = new material
+
+All 21 calls succeeded.
+
+### `ping.plugin_version`
+"9.14.0" → **"9.15.0"**.
 
 ---
 
