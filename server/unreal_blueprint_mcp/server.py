@@ -1547,28 +1547,56 @@ def set_pin_default(
 
 
 @mcp.tool()
-def add_function(blueprint: str, name: str) -> dict[str, Any]:
-    """Create a new user function graph in a Blueprint.
+def add_function(
+    blueprint: str,
+    name: str,
+    params: list[dict[str, str]] | None = None,
+    returns: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Create a new user function graph in a Blueprint — v5 + v9.17.0 params/returns.
 
-    Adds an empty function to the BP's Functions list. After creation, the
+    Adds a function to the BP's Functions list. After creation, the
     function can be called from elsewhere via `call_blueprint_function`.
 
-    **v5 limitation:** parameters / return values are not yet exposed; the
-    function is empty + no-arg. Add nodes to the body manually in editor (or
-    wait for v6).
+    **v9.17.0 — params + returns** (closes rev10 ISSUE-1): the function now
+    supports input parameters and return values, so the LLM can write
+    structured reusable functions instead of inlined copies.
+
+    Internally:
+      - input params become OUTPUT pins on the auto-created
+        ``K2Node_FunctionEntry`` (the function body reads them as inputs)
+      - return values create a new ``K2Node_FunctionResult`` node (anchor
+        ``"result"``) with INPUT pins (function body writes to them)
 
     Args:
         blueprint: Full Blueprint asset path.
         name: Function name (must be unique within this BP).
+        params: Optional list of ``{"name": "...", "type": "..."}`` dicts.
+            Same type syntax as ``add_variable`` (``"int"`` / ``"float"`` /
+            ``"string"`` / ``"object:Actor"`` / ``"int[]"`` / etc.).
+        returns: Same shape as params, but creates the function's return
+            values (output pins on the function call node).
 
     Returns:
-        On success: {"ok": True, "function_name": "...", "saved": True}
+        ``{"ok": True, "function_name": "...", "entry_anchor": "entry",
+            "result_anchor": "result" (or ""), "params_count": N,
+            "returns_count": N, "saved": True}``
 
     Common errors:
-        function_exists       - a function with this name already exists
-        graph_create_failed   - UE refused to create the graph
+        function_exists, graph_create_failed,
+        param_arity_mismatch, return_arity_mismatch,
+        unknown_param_type, unknown_return_type
     """
-    return _send_command({"command": "add_function", "blueprint": blueprint, "name": name})
+    payload: dict[str, Any] = {
+        "command": "add_function",
+        "blueprint": blueprint,
+        "name": name,
+    }
+    if params:
+        payload["params"] = list(params)
+    if returns:
+        payload["returns"] = list(returns)
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -2475,6 +2503,103 @@ def add_variable_set(
         "command": "add_variable_set",
         "blueprint": blueprint,
         "variable_name": variable_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
+def add_property_set(
+    blueprint: str,
+    target_class: str,
+    property: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Add a Set node for a property on an EXTERNAL object — v9.17.0.
+
+    Closes rev10 ISSUE-2. ``add_variable_set`` only sets the current BP's
+    own variables. To set ``PlayerController.bShowMouseCursor`` (or any
+    UPROPERTY on a different class), use this. Internally a
+    ``K2Node_VariableSet`` with ``VariableReference.SetExternalMember`` —
+    creates a node with a Target pin (the external object reference).
+
+    Pins on the resulting node:
+      - ``execute`` / ``then`` (exec)
+      - ``Target`` (input, type = target_class — wire in a getter like
+        ``GetPlayerController``)
+      - input pin named after the property (the new value)
+      - output pin named after the property (the post-set value)
+
+    Args:
+        blueprint: BP asset path (the BP whose graph we're editing).
+        target_class: The class the property lives on. Native short name
+            (``"PlayerController"`` / ``"Pawn"`` / ``"GameInstance"`` / etc.)
+            or BP path (``"BP_X"`` / ``"/Game/X/BP_Y"`` / full
+            ``"/Game/X/BP_Y.BP_Y_C"``).
+        property: UPROPERTY name on target_class. Many UE 5.4 booleans
+            dropped the ``b`` prefix — use the reflected name.
+        anchor_name: User-given label (unique within the target graph).
+        position_x, position_y: Graph position.
+        graph_name: Function / macro graph name (default empty = EventGraph).
+
+    Returns:
+        ``{"ok": True, "command": "add_property_set", "anchor_name": ...,
+            "target_class": "/Script/Engine.PlayerController",
+            "property_name": "bShowMouseCursor",
+            "node_guid": ..., "pins": [...], "saved": True}``
+
+    Common errors:
+        blueprint_not_found, target_class_not_found, property_not_found,
+        no_event_graph / graph_not_found, anchor_name_exists
+    """
+    if not blueprint or not target_class or not property or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_property_set",
+        "blueprint": blueprint,
+        "target_class": target_class,
+        "property": property,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
+def add_property_get(
+    blueprint: str,
+    target_class: str,
+    property: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Add a Get node for a property on an EXTERNAL object — v9.17.0.
+
+    Symmetric to ``add_property_set`` — produces a ``K2Node_VariableGet``
+    on an external member. The node has a ``Target`` input pin and a
+    single output pin named after the property.
+
+    Args / Returns: same shape as ``add_property_set``.
+    """
+    if not blueprint or not target_class or not property or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_property_get",
+        "blueprint": blueprint,
+        "target_class": target_class,
+        "property": property,
         "anchor_name": anchor_name,
         "position_x": position_x,
         "position_y": position_y,

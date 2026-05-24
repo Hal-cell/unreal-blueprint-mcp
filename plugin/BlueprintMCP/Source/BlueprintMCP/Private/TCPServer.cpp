@@ -175,6 +175,7 @@
 
 // v7.6 — event dispatchers (multicast delegates)
 #include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"   // v9.17.0 — for add_function returns
 #include "K2Node_CallDelegate.h"
 #include "K2Node_AddDelegate.h"
 #include "K2Node_RemoveDelegate.h"
@@ -248,6 +249,7 @@ namespace
     // v7.4: ResolveVariablePinType uses ResolveCastTargetClass for object/class ref types,
     // but the latter is defined further down. Forward-declare here.
     UClass* ResolveCastTargetClass(const FString& Name);
+    UClass* ResolveCallTargetClass(const FString& Name);   // v9.17.0 — needed by AddPropertyRefOnGameThread (earlier in file)
     // v7.7 fix: JsonGraphNotFound (below) calls JsonError, which is defined at L202.
     FString JsonError(const FString& Command, const FString& Error, const FString& Detail);
 
@@ -637,8 +639,28 @@ namespace
         UFunction* TargetFunc = OwningClass->FindFunctionByName(FName(*FunctionName));
         if (TargetFunc == nullptr)
         {
+            // v9.17.0 — closes rev10 ISSUE-3. The "function_not_found" was usually
+            // a UE-version rename (e.g. SetInputMode_GameAndUI → ..._GameAndUIEx
+            // in UE 5.4). Suggest up to 5 similar names so the LLM can self-correct
+            // without a round-trip through humans.
+            const FString LowerName = FunctionName.ToLower();
+            TArray<FString> Suggestions;
+            // Substring match in either direction
+            for (TFieldIterator<UFunction> It(OwningClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
+            {
+                const FString Name = It->GetName();
+                if (Name.ToLower().Contains(LowerName) || LowerName.Contains(Name.ToLower()))
+                {
+                    Suggestions.Add(Name);
+                    if (Suggestions.Num() >= 5) break;
+                }
+            }
+            FString HintSuffix;
+            if (Suggestions.Num() > 0)
+                HintSuffix = FString::Printf(TEXT(" — did you mean: %s?"),
+                    *FString::Join(Suggestions, TEXT(", ")));
             return JsonError(TEXT("add_node"), TEXT("function_not_found"),
-                FString::Printf(TEXT("%s.%s"), *OwningClassName, *FunctionName));
+                FString::Printf(TEXT("%s.%s%s"), *OwningClassName, *FunctionName, *HintSuffix));
         }
 
         // 7. Spawn K2Node_CallFunction in the EventGraph
@@ -1720,6 +1742,96 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.17.0 — add_property_set / add_property_get (rev10 ISSUE-2) =====
+    //
+    // Set / read a UPROPERTY on an EXTERNAL OBJECT (PlayerController,
+    // GameInstance, etc.) — the missing piece for "Set Show Mouse Cursor on
+    // PlayerController" type nodes. K2Node_VariableSet/Get with
+    // VariableReference.SetExternalMember(PropName, TargetClass) produces a
+    // node that has a Target pin instead of operating on self.
+
+    FString AddPropertyRefOnGameThread(
+        const FString& BlueprintPath, const FString& TargetClassName,
+        const FString& PropertyName, const FString& AnchorName,
+        int32 PosX, int32 PosY, bool bIsSet, const FString& GraphName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = bIsSet ? TEXT("add_property_set") : TEXT("add_property_get");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UClass* TargetClass = ResolveCallTargetClass(TargetClassName);
+        if (TargetClass == nullptr)
+            return JsonError(CmdName, TEXT("target_class_not_found"),
+                FString::Printf(TEXT("'%s' didn't resolve. Try a native class name "
+                                     "('PlayerController'/'Pawn'/'Character'/'GameInstance'/etc.), "
+                                     "or a BP path ('/Game/Blueprints/BP_X' or full '/Game/X/BP_Y.BP_Y_C')."),
+                    *TargetClassName));
+
+        // Validate the property exists on the target class
+        const FName PropFName(*PropertyName);
+        FProperty* Prop = FindFProperty<FProperty>(TargetClass, PropFName);
+        if (Prop == nullptr)
+            return JsonError(CmdName, TEXT("property_not_found"),
+                FString::Printf(TEXT("'%s' not a UPROPERTY of %s. Use the reflected name "
+                                     "(many UE 5.4 bool UPROPERTYs dropped the 'b' prefix)."),
+                    *PropertyName, *TargetClass->GetName()));
+
+        UEdGraph* TargetGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (TargetGraph == nullptr)
+            return JsonError(CmdName,
+                GraphName.IsEmpty() ? TEXT("no_event_graph") : TEXT("graph_not_found"),
+                GraphName.IsEmpty() ? BlueprintPath : GraphName);
+
+        if (FindNodeByAnchor(TargetGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        UK2Node_Variable* NewNode = nullptr;
+        if (bIsSet)
+        {
+            UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(TargetGraph);
+            SetNode->VariableReference.SetExternalMember(PropFName, TargetClass);
+            NewNode = SetNode;
+        }
+        else
+        {
+            UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(TargetGraph);
+            GetNode->VariableReference.SetExternalMember(PropFName, TargetClass);
+            NewNode = GetNode;
+        }
+
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+
+        TargetGraph->AddNode(NewNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        NewNode->CreateNewGuid();
+        NewNode->PostPlacedNewNode();
+        NewNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const FString CmdStr = FString(CmdName);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":%s,\"anchor_name\":%s,\"target_class\":%s,")
+            TEXT("\"property_name\":%s,\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(CmdStr),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(TargetClass->GetPathName()),
+            *EscapeJsonString(PropertyName),
+            *EscapeJsonString(GuidStr),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     // ===== v9.13.0 — add_component_get (rev7 ISSUE-1) =====
     //
     // Drop a K2Node_VariableGet referencing one of the BP's own SCS
@@ -2563,7 +2675,10 @@ namespace
 
     // ===== v5 — add_function (create user function graph) =====
 
-    FString AddFunctionOnGameThread(const FString& BlueprintPath, const FString& FunctionName)
+    FString AddFunctionOnGameThread(
+        const FString& BlueprintPath, const FString& FunctionName,
+        const TArray<FString>& ParamNames, const TArray<FString>& ParamTypes,
+        const TArray<FString>& ReturnNames, const TArray<FString>& ReturnTypes)   // v9.17.0
     {
         check(IsInGameThread());
 
@@ -2580,6 +2695,33 @@ namespace
             }
         }
 
+        // Pre-validate param + return types so we don't leave the BP half-built.
+        if (ParamNames.Num() != ParamTypes.Num())
+            return JsonError(TEXT("add_function"), TEXT("param_arity_mismatch"),
+                FString::Printf(TEXT("params=%d types=%d"), ParamNames.Num(), ParamTypes.Num()));
+        if (ReturnNames.Num() != ReturnTypes.Num())
+            return JsonError(TEXT("add_function"), TEXT("return_arity_mismatch"),
+                FString::Printf(TEXT("returns=%d types=%d"), ReturnNames.Num(), ReturnTypes.Num()));
+
+        TArray<FEdGraphPinType> ResolvedParamTypes;
+        for (int32 i = 0; i < ParamNames.Num(); ++i)
+        {
+            FEdGraphPinType PinType;
+            if (!ResolveVariablePinType(ParamTypes[i], PinType))
+                return JsonError(TEXT("add_function"), TEXT("unknown_param_type"),
+                    FString::Printf(TEXT("param '%s' has unknown type '%s'"), *ParamNames[i], *ParamTypes[i]));
+            ResolvedParamTypes.Add(PinType);
+        }
+        TArray<FEdGraphPinType> ResolvedReturnTypes;
+        for (int32 i = 0; i < ReturnNames.Num(); ++i)
+        {
+            FEdGraphPinType PinType;
+            if (!ResolveVariablePinType(ReturnTypes[i], PinType))
+                return JsonError(TEXT("add_function"), TEXT("unknown_return_type"),
+                    FString::Printf(TEXT("return '%s' has unknown type '%s'"), *ReturnNames[i], *ReturnTypes[i]));
+            ResolvedReturnTypes.Add(PinType);
+        }
+
         UEdGraph* NewFuncGraph = FBlueprintEditorUtils::CreateNewGraph(
             Blueprint, FuncFName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
         if (!NewFuncGraph)
@@ -2590,25 +2732,66 @@ namespace
         FBlueprintEditorUtils::AddFunctionGraph<UClass>(
             Blueprint, NewFuncGraph, /*bIsUserCreated*/ true, /*SignatureClass*/ nullptr);
 
-        // BUG-3 fix (a): tag the auto-created K2Node_FunctionEntry node with a well-known
-        // anchor ("entry") so connect_pins(graph_name="MyFunc", from_pin="entry.then", ...)
-        // can address it via FindNodeByAnchor.
+        // Tag the auto-created K2Node_FunctionEntry with the "entry" anchor (BUG-3 fix a)
+        // and add user-defined output pins for each input parameter (v9.17.0).
+        UK2Node_FunctionEntry* EntryNode = nullptr;
         for (UEdGraphNode* N : NewFuncGraph->Nodes)
         {
-            if (Cast<UK2Node_FunctionEntry>(N) != nullptr)
+            if (UK2Node_FunctionEntry* E = Cast<UK2Node_FunctionEntry>(N))
             {
+                EntryNode = E;
                 N->NodeComment = TEXT("entry");
                 N->bCommentBubbleVisible = true;
                 break;
             }
         }
+        if (EntryNode != nullptr)
+        {
+            // Input params = OUTPUT pins on the FunctionEntry node (the function
+            // body reads them as inputs). Same pattern as add_custom_event.
+            for (int32 i = 0; i < ParamNames.Num(); ++i)
+            {
+                EntryNode->CreateUserDefinedPin(
+                    FName(*ParamNames[i]), ResolvedParamTypes[i], EGPD_Output, /*bUseUniqueName*/ false);
+            }
+        }
 
-        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        // Return values require a K2Node_FunctionResult node. UE conventionally
+        // places it to the right of the function body. We anchor it as "result".
+        UK2Node_FunctionResult* ResultNode = nullptr;
+        if (ReturnNames.Num() > 0)
+        {
+            ResultNode = NewObject<UK2Node_FunctionResult>(NewFuncGraph);
+            ResultNode->SetFlags(RF_Transactional);
+            ResultNode->NodePosX = 600;
+            ResultNode->NodePosY = 0;
+            ResultNode->NodeComment = TEXT("result");
+            ResultNode->bCommentBubbleVisible = true;
+            NewFuncGraph->AddNode(ResultNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+            ResultNode->CreateNewGuid();
+            ResultNode->PostPlacedNewNode();
+            ResultNode->AllocateDefaultPins();
+
+            // Return values = INPUT pins on the FunctionResult node (the function
+            // body writes to them, which become outputs of the function).
+            for (int32 i = 0; i < ReturnNames.Num(); ++i)
+            {
+                ResultNode->CreateUserDefinedPin(
+                    FName(*ReturnNames[i]), ResolvedReturnTypes[i], EGPD_Input, /*bUseUniqueName*/ false);
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
 
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"add_function\",\"function_name\":%s,\"entry_anchor\":\"entry\",\"saved\":%s}\n"),
-            *EscapeJsonString(FunctionName), bSaved ? TEXT("true") : TEXT("false"));
+            TEXT("{\"ok\":true,\"command\":\"add_function\",\"function_name\":%s,\"entry_anchor\":\"entry\",")
+            TEXT("\"result_anchor\":%s,\"params_count\":%d,\"returns_count\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(FunctionName),
+            ResultNode != nullptr ? TEXT("\"result\"") : TEXT("\"\""),
+            ParamNames.Num(),
+            ReturnNames.Num(),
+            bSaved ? TEXT("true") : TEXT("false"));
     }
 
     // ===== v5 — call_blueprint_function (cross-BP function call) =====
@@ -6813,7 +6996,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.16.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.17.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -7602,6 +7785,40 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
+    // --- v9.17.0 add_property_set / add_property_get (rev10 ISSUE-2) ---
+    if (Command.Equals(TEXT("add_property_set"), ESearchCase::IgnoreCase) ||
+        Command.Equals(TEXT("add_property_get"), ESearchCase::IgnoreCase))
+    {
+        const bool bIsSet = Command.Equals(TEXT("add_property_set"), ESearchCase::IgnoreCase);
+        const TCHAR* CmdName = bIsSet ? TEXT("add_property_set") : TEXT("add_property_get");
+
+        FString Blueprint, TargetClassName, PropertyName, AnchorName, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("target_class"), TargetClassName) || TargetClassName.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_field"), TEXT("target_class"));
+        if (!JsonObject->TryGetStringField(TEXT("property"), PropertyName) || PropertyName.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_field"), TEXT("property"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(CmdName, TEXT("missing_field"), TEXT("anchor_name"));
+
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, TargetClassName, PropertyName, AnchorName, PosX, PosY, bIsSet, GraphName]() mutable
+            {
+                Promise.SetValue(AddPropertyRefOnGameThread(Blueprint, TargetClassName, PropertyName, AnchorName, PosX, PosY, bIsSet, GraphName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
     // --- v9.13.0 add_component_get ---
     if (Command.Equals(TEXT("add_component_get"), ESearchCase::IgnoreCase))
     {
@@ -7630,7 +7847,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- add_function (v5) ---
+    // --- add_function (v5 + v9.17.0 params/returns) ---
     if (Command.Equals(TEXT("add_function"), ESearchCase::IgnoreCase))
     {
         FString Blueprint, FunctionName;
@@ -7639,10 +7856,34 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         if (!JsonObject->TryGetStringField(TEXT("name"), FunctionName) || FunctionName.IsEmpty())
             return JsonError(TEXT("add_function"), TEXT("missing_field"), TEXT("name"));
 
+        // v9.17.0 — optional "params" / "returns" arrays of {name, type} objects.
+        // Same shape as add_custom_event's params.
+        TArray<FString> ParamNames, ParamTypes, ReturnNames, ReturnTypes;
+        auto ParseNameTypeArray = [&JsonObject](const TCHAR* Field, TArray<FString>& OutNames, TArray<FString>& OutTypes)
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+            if (JsonObject->TryGetArrayField(Field, Arr) && Arr != nullptr)
+            {
+                for (const TSharedPtr<FJsonValue>& Item : *Arr)
+                {
+                    const TSharedPtr<FJsonObject>* ObjPtr = nullptr;
+                    if (Item.IsValid() && Item->TryGetObject(ObjPtr) && ObjPtr != nullptr)
+                    {
+                        FString N, T;
+                        (*ObjPtr)->TryGetStringField(TEXT("name"), N);
+                        (*ObjPtr)->TryGetStringField(TEXT("type"), T);
+                        if (!N.IsEmpty() && !T.IsEmpty()) { OutNames.Add(N); OutTypes.Add(T); }
+                    }
+                }
+            }
+        };
+        ParseNameTypeArray(TEXT("params"),  ParamNames,  ParamTypes);
+        ParseNameTypeArray(TEXT("returns"), ReturnNames, ReturnTypes);
+
         TPromise<FString> Promise; TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Blueprint, FunctionName]() mutable
-            { Promise.SetValue(AddFunctionOnGameThread(Blueprint, FunctionName)); });
+            [Promise = MoveTemp(Promise), Blueprint, FunctionName, ParamNames, ParamTypes, ReturnNames, ReturnTypes]() mutable
+            { Promise.SetValue(AddFunctionOnGameThread(Blueprint, FunctionName, ParamNames, ParamTypes, ReturnNames, ReturnTypes)); });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_function"), TEXT("game_thread_timeout"));
         return Future.Get();

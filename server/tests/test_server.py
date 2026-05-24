@@ -4691,3 +4691,142 @@ def test_ping_returns_plugin_version_9_16_0() -> None:
         r = server.ping_ue()
     assert r["ok"] is True
     assert r["plugin_version"] == "9.16.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.17.0 — add_function(params, returns) + add_property_set/get + add_node hint
+# ---------------------------------------------------------------------------
+
+
+def test_add_function_default_no_params() -> None:
+    """Default add_function (no params) keeps backwards-compat payload."""
+    response = b'{"ok":true,"command":"add_function","function_name":"MyFunc","entry_anchor":"entry","result_anchor":"","params_count":0,"returns_count":0,"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_function(blueprint="/Game/BP", name="MyFunc")
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "params" not in sent_dict
+    assert "returns" not in sent_dict
+
+
+def test_add_function_with_params_and_returns() -> None:
+    """v9.17.0: params + returns reach the wire."""
+    response = b'{"ok":true,"command":"add_function","function_name":"Ripple","entry_anchor":"entry","result_anchor":"result","params_count":3,"returns_count":1,"saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_function(
+            blueprint="/Game/BP",
+            name="Ripple",
+            params=[
+                {"name": "Px", "type": "float"},
+                {"name": "Py", "type": "float"},
+                {"name": "StartT", "type": "float"},
+            ],
+            returns=[{"name": "Z", "type": "float"}],
+        )
+    assert r["params_count"] == 3
+    assert r["returns_count"] == 1
+    assert r["result_anchor"] == "result"
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert len(sent_dict["params"]) == 3
+    assert sent_dict["returns"] == [{"name": "Z", "type": "float"}]
+
+
+def test_add_function_unknown_param_type() -> None:
+    response = b'{"ok":false,"command":"add_function","error":"unknown_param_type","detail":"param \'Bad\' has unknown type \'NotAType\'"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_function(blueprint="/Game/BP", name="F", params=[{"name":"Bad","type":"NotAType"}])
+    assert r["error"] == "unknown_param_type"
+
+
+def test_add_property_set_player_controller() -> None:
+    """rev10 ISSUE-2 canonical use case: bShowMouseCursor on PlayerController."""
+    response = (
+        b'{"ok":true,"command":"add_property_set","anchor_name":"show_cursor",'
+        b'"target_class":"/Script/Engine.PlayerController","property_name":"bShowMouseCursor",'
+        b'"node_guid":"AAAA","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_property_set(
+            blueprint="/Game/BP", target_class="PlayerController",
+            property="bShowMouseCursor", anchor_name="show_cursor",
+        )
+    assert r["ok"] is True
+    assert r["target_class"].endswith("PlayerController")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_property_set",
+        "blueprint": "/Game/BP",
+        "target_class": "PlayerController",
+        "property": "bShowMouseCursor",
+        "anchor_name": "show_cursor",
+        "position_x": 0,
+        "position_y": 0,
+    }
+
+
+def test_add_property_set_target_class_not_found() -> None:
+    response = b'{"ok":false,"command":"add_property_set","error":"target_class_not_found","detail":"\'XXX\' didn\'t resolve."}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_property_set(blueprint="/Game/BP", target_class="XXX", property="X", anchor_name="a")
+    assert r["error"] == "target_class_not_found"
+
+
+def test_add_property_set_local_validation() -> None:
+    assert server.add_property_set(blueprint="", target_class="P", property="X", anchor_name="a")["error"] == "missing_argument"
+    assert server.add_property_set(blueprint="/G/B", target_class="", property="X", anchor_name="a")["error"] == "missing_argument"
+    assert server.add_property_set(blueprint="/G/B", target_class="P", property="", anchor_name="a")["error"] == "missing_argument"
+    assert server.add_property_set(blueprint="/G/B", target_class="P", property="X", anchor_name="")["error"] == "missing_argument"
+
+
+def test_add_property_get_symmetric() -> None:
+    response = (
+        b'{"ok":true,"command":"add_property_get","anchor_name":"get_cursor",'
+        b'"target_class":"/Script/Engine.PlayerController","property_name":"bShowMouseCursor",'
+        b'"node_guid":"BBBB","pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_property_get(
+            blueprint="/Game/BP", target_class="PlayerController",
+            property="bShowMouseCursor", anchor_name="get_cursor",
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_property_get"
+
+
+def test_add_node_function_not_found_includes_suggestions() -> None:
+    """rev10 ISSUE-3 — UE-version renames (SetInputMode_GameAndUI → _GameAndUIEx).
+    The hint should propose similar function names."""
+    response = (
+        b'{"ok":false,"command":"add_node","error":"function_not_found",'
+        b'"detail":"WidgetBlueprintLibrary.SetInputMode_GameAndUI \xe2\x80\x94 did you mean: '
+        b'SetInputMode_GameAndUIEx, SetInputMode_UIOnlyEx, SetInputMode_GameOnly?"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_node(
+            blueprint="/Game/BP",
+            node_type="K2Node_CallFunction:WidgetBlueprintLibrary.SetInputMode_GameAndUI",
+            anchor_name="x",
+        )
+    assert r["error"] == "function_not_found"
+    assert "did you mean" in r["detail"]
+    assert "SetInputMode_GameAndUIEx" in r["detail"]
+
+
+def test_ping_returns_plugin_version_9_17_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.17.0","build_date":"May 24 2026 12:00:00",'
+        b'"timestamp":"2026-05-24T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.17.0"
