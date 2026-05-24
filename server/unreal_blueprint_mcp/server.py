@@ -962,7 +962,15 @@ def add_unbind_dispatcher(
 
 
 @mcp.tool()
-def get_blueprint(name: str) -> dict[str, Any]:
+def get_blueprint(
+    name: str,
+    include_anchors: bool = True,
+    include_connections: bool = True,
+    include_variables: bool = True,
+    include_components: bool = True,
+    include_functions: bool = True,
+    anchor_filter: str = "",
+) -> dict[str, Any]:
     """Get a snapshot of a Blueprint's current state. **Call this BEFORE writing.**
 
     This is the "look before you leap" tool. Use it to:
@@ -1015,11 +1023,27 @@ def get_blueprint(name: str) -> dict[str, Any]:
     Common errors:
         blueprint_not_found  - path doesn't exist
         game_thread_timeout  - 10s deadline exceeded (rare; large BPs)
+
+    **v9.20.0 — filter kwargs** (closes rev14 ISSUE-2): set any section
+    flag to False to omit it from the response, and pass
+    ``anchor_filter`` (substring, case-insensitive) to only return
+    anchors / connections matching that substring. Big BPs (~150+ nodes)
+    can blow past the MCP tool output cap with the full snapshot — use
+    these to fetch only what you need:
+
+      get_blueprint(name=bp, anchor_filter="ripple")           # only ripple-related
+      get_blueprint(name=bp, include_variables=False, include_components=False,
+                    include_functions=False)                    # event-graph only
+      get_blueprint(name=bp, include_anchors=False)             # just connections (small)
     """
-    return _send_command({
-        "command": "get_blueprint",
-        "name": name,
-    })
+    payload: dict[str, Any] = {"command": "get_blueprint", "name": name}
+    if not include_anchors:     payload["include_anchors"]     = False
+    if not include_connections: payload["include_connections"] = False
+    if not include_variables:   payload["include_variables"]   = False
+    if not include_components:  payload["include_components"]  = False
+    if not include_functions:   payload["include_functions"]   = False
+    if anchor_filter:           payload["anchor_filter"]       = anchor_filter
+    return _send_command(payload)
 
 
 @mcp.tool()
@@ -1860,7 +1884,10 @@ def add_macro(
     Args:
         blueprint: Full Blueprint asset path.
         macro_type: One of (case-insensitive):
-            - "ForEachLoop"  — iterate array; pins: execute / Array / LoopBody / Array Element / Array Index / Completed
+            - "ForEachLoop"  — iterate array; pins: **Exec** (NOT "execute" — note casing!) / Array / LoopBody / Array Element / Array Index / Completed.
+                              (Per rev14 ISSUE-3: ForEachLoop's exec input is "Exec" (capitalized), while
+                              ForLoop's is "execute" (lowercase). Different macros, different names.
+                              Always look at the actual pins[] in add_macro's response.)
             - "ForLoop"      — N times; pins: execute / FirstIndex / LastIndex / LoopBody / Index / Completed
             - "WhileLoop"    — while bool; pins: execute / Condition / LoopBody / Completed
             - "FlipFlop"     — alternates between A and B exec outs each call
@@ -3364,6 +3391,67 @@ def connect_material_output(
         "from_pin": from_pin,
         "output": output,
     })
+
+
+@mcp.tool()
+def get_material(
+    material: str,
+    include_expressions: bool = True,
+    include_connections: bool = True,
+    include_outputs: bool = True,
+    include_material_properties: bool = True,
+    anchor_filter: str = "",
+) -> dict[str, Any]:
+    """Get a full snapshot of a material's graph — v9.20.0.
+
+    Closes rev14 ISSUE-1. Symmetric to ``get_blueprint``. Returns the
+    expressions (with anchors + classes + positions + UPROPERTY values),
+    all internal expression-to-expression connections, all material
+    output wires (BaseColor / EmissiveColor / etc.), and key
+    material-level properties (BlendMode / ShadingModel /
+    bUsedWithInstancedStaticMeshes / TwoSided / etc.).
+
+    Before v9.20.0, anchor names were only returned at expression-create
+    time. Cross-session material edits were blind: you had to know the
+    anchors from memory or rebuild the material from scratch. Now you
+    can list everything, find the anchor of (say) the Multiply node
+    you want to tweak, and call ``set_material_expression_property`` on it.
+
+    Args:
+        material: Material asset path.
+        include_expressions: Include the expressions array (default True).
+        include_connections: Include internal expression-to-expression
+            wires (default True).
+        include_outputs: Include material output wires (BaseColor etc.)
+            (default True).
+        include_material_properties: Include material-level UPROPERTYs
+            (BlendMode / ShadingModel / Usage flags / etc.) (default True).
+        anchor_filter: Substring (case-insensitive) — only emit
+            expressions / connections involving anchors matching this.
+            Default "" = no filter. Useful for large materials.
+
+    Returns:
+        ``{"ok": True, "material_path": "...",
+            "expressions": [{"anchor", "class", "position": [X,Y],
+                             "properties": {"R": "0.5", "G": "..."}}, ...],
+            "connections": [{"from": "anchor.output_index",
+                             "to":   "anchor.InputName"}, ...],
+            "outputs":     [{"output": "BaseColor",
+                             "from":   "anchor.output_index"}, ...],
+            "material_properties": {"BlendMode": "BLEND_Opaque", ...}}``
+
+    Common errors:
+        material_not_found, no_editor_data
+    """
+    if not material:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {"command": "get_material", "material": material}
+    if not include_expressions:         payload["include_expressions"]         = False
+    if not include_connections:         payload["include_connections"]         = False
+    if not include_outputs:             payload["include_outputs"]             = False
+    if not include_material_properties: payload["include_material_properties"] = False
+    if anchor_filter:                    payload["anchor_filter"]               = anchor_filter
+    return _send_command(payload)
 
 
 @mcp.tool()

@@ -4943,3 +4943,108 @@ def test_ping_returns_plugin_version_9_19_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.19.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.20.0 — get_material + get_blueprint filtering + add_macro docstring
+# ---------------------------------------------------------------------------
+
+
+def test_get_material_full_snapshot() -> None:
+    response = (
+        b'{"ok":true,"command":"get_material","material_path":"/Game/M_X",'
+        b'"expressions":[{"anchor":"mask","class":"/Script/Engine.MaterialExpressionComponentMask",'
+        b'"position":[-600,0],"properties":{"R":"False","G":"False","B":"True","A":"False"}}],'
+        b'"connections":[{"from":"wpos.0","to":"mask.Input"}],'
+        b'"outputs":[{"output":"BaseColor","from":"lerp.0"}],'
+        b'"material_properties":{"BlendMode":"BLEND_Opaque","TwoSided":"True",'
+        b'"bUsedWithInstancedStaticMeshes":"True"}}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_material(material="/Game/M_X")
+    assert r["ok"] is True
+    assert len(r["expressions"]) == 1
+    assert r["expressions"][0]["anchor"] == "mask"
+    assert r["expressions"][0]["properties"]["B"] == "True"
+    assert r["outputs"][0]["output"] == "BaseColor"
+    assert r["material_properties"]["BlendMode"] == "BLEND_Opaque"
+
+
+def test_get_material_filter_kwargs() -> None:
+    """Each False flag should be forwarded to the plugin."""
+    response = b'{"ok":true,"command":"get_material","material_path":"/Game/M","expressions":[]}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.get_material(
+            material="/Game/M",
+            include_expressions=True,        # default — should NOT appear in payload
+            include_connections=False,
+            include_outputs=False,
+            include_material_properties=False,
+            anchor_filter="mult",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["material"] == "/Game/M"
+    assert "include_expressions" not in sent_dict   # True is default → omitted
+    assert sent_dict["include_connections"] is False
+    assert sent_dict["include_outputs"] is False
+    assert sent_dict["include_material_properties"] is False
+    assert sent_dict["anchor_filter"] == "mult"
+
+
+def test_get_material_not_found() -> None:
+    response = b'{"ok":false,"command":"get_material","error":"material_not_found","detail":"/Game/Ghost"}\n'
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_material(material="/Game/Ghost")
+    assert r["error"] == "material_not_found"
+
+
+def test_get_material_local_validation() -> None:
+    assert server.get_material(material="")["error"] == "missing_argument"
+
+
+def test_get_blueprint_default_includes_all_sections() -> None:
+    """Existing behavior preserved — bare get_blueprint(name) sends just the name."""
+    response = b'{"ok":true,"command":"get_blueprint","path":"/Game/BP","anchors":{},"connections":[],"variables":[],"components":[],"functions":{}}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.get_blueprint(name="/Game/BP")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    # No filter kwargs in payload — backwards-compatible
+    assert sent_dict == {"command": "get_blueprint", "name": "/Game/BP"}
+
+
+def test_get_blueprint_with_filters() -> None:
+    """v9.20.0 — pass section flags + anchor filter to slice large BPs."""
+    response = b'{"ok":true,"command":"get_blueprint","path":"/Game/BP","anchors":{"ripple_x":{}}}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.get_blueprint(
+            name="/Game/BP",
+            include_variables=False,
+            include_components=False,
+            include_functions=False,
+            anchor_filter="ripple",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["include_variables"] is False
+    assert sent_dict["include_components"] is False
+    assert sent_dict["include_functions"] is False
+    assert sent_dict["anchor_filter"] == "ripple"
+    # Default-true flags omitted
+    assert "include_anchors" not in sent_dict
+    assert "include_connections" not in sent_dict
+
+
+def test_ping_returns_plugin_version_9_20_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.20.0","build_date":"May 24 2026 12:00:00",'
+        b'"timestamp":"2026-05-24T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.20.0"

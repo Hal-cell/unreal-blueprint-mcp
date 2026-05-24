@@ -2390,6 +2390,192 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.20.0 — get_material full snapshot (closes rev14 ISSUE-1) =====
+    //
+    // Walks a material's full graph (expressions + connections + material outputs +
+    // material-level UPROPERTYs) and emits JSON. Symmetric to get_blueprint —
+    // enables cross-session editing of materials (e.g. find a Multiply by anchor
+    // and tweak ConstB). Before this, anchor names were only returned at
+    // create-expression time, so any post-session material edits were blind.
+
+    /** Dump scalar/struct/string UPROPERTYs as a JSON object. Skips
+     *  FExpressionInput-derived structs (those go in the connections section)
+     *  and TObjectPtr fields (avoid dumping huge transitive UObject graphs). */
+    void WriteExpressionPropertiesJson(
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>>& Writer,
+        UMaterialExpression* Expr)
+    {
+        Writer->WriteObjectStart(TEXT("properties"));
+        for (TFieldIterator<FProperty> It(Expr->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+        {
+            FProperty* Prop = *It;
+            if (Prop == nullptr) continue;
+            const FString PropName = Prop->GetName();
+            // Skip internal / engine-housekeeping props
+            if (PropName == TEXT("Material") || PropName == TEXT("Function")
+                || PropName == TEXT("GraphNode") || PropName == TEXT("SubgraphExpression")
+                || PropName == TEXT("LastErrorText") || PropName == TEXT("MaterialExpressionGuid")
+                || PropName == TEXT("MaterialExpressionEditorX") || PropName == TEXT("MaterialExpressionEditorY")
+                || PropName == TEXT("Desc") || PropName == TEXT("NumExecutionInputs")
+                || PropName == TEXT("bRealtimePreview") || PropName == TEXT("bNeedToUpdatePreview")
+                || PropName == TEXT("bIsParameterExpression") || PropName == TEXT("bCommentBubbleVisible")
+                || PropName == TEXT("bShowOutputNameOnPin") || PropName == TEXT("bShowMaskColorsOnPin")
+                || PropName == TEXT("bHidePreviewWindow") || PropName == TEXT("bCollapsed")
+                || PropName == TEXT("bShaderInputData") || PropName == TEXT("bShowInputs")
+                || PropName == TEXT("bShowOutputs"))
+                continue;
+            // Skip FExpressionInput-derived fields (covered separately)
+            if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+            {
+                if (StructProp->Struct != nullptr
+                    && StructProp->Struct->GetName().Contains(TEXT("Input")))
+                    continue;
+            }
+            // Skip object/class properties (avoid huge transitive dumps)
+            if (CastField<FObjectProperty>(Prop) || CastField<FClassProperty>(Prop))
+                continue;
+            // Skip array/map/set props (rare on expressions; skip for output sanity)
+            if (CastField<FArrayProperty>(Prop) || CastField<FMapProperty>(Prop) || CastField<FSetProperty>(Prop))
+                continue;
+            // Export value as string
+            FString ValueStr;
+            void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Expr);
+            Prop->ExportTextItem_Direct(ValueStr, ValuePtr, nullptr, Expr, PPF_None);
+            Writer->WriteValue(*PropName, ValueStr);
+        }
+        Writer->WriteObjectEnd();
+    }
+
+    FString GetMaterialOnGameThread(
+        const FString& MaterialPath,
+        bool bIncludeExpressions, bool bIncludeConnections,
+        bool bIncludeOutputs, bool bIncludeMaterialProperties,
+        const FString& AnchorFilter)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("get_material");
+
+        UMaterial* Mat = LoadObject<UMaterial>(nullptr, *MaterialPath);
+        if (Mat == nullptr)
+            return JsonError(CmdName, TEXT("material_not_found"), MaterialPath);
+        UMaterialEditorOnlyData* EditorData = Mat->GetEditorOnlyData();
+        if (EditorData == nullptr)
+            return JsonError(CmdName, TEXT("no_editor_data"));
+
+        auto AnchorMatches = [&AnchorFilter](const FString& Anchor) {
+            return AnchorFilter.IsEmpty() || Anchor.Contains(AnchorFilter, ESearchCase::IgnoreCase);
+        };
+
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), CmdName);
+        Writer->WriteValue(TEXT("material_path"), MaterialPath);
+
+        // ---- expressions [{anchor, class, position, properties}] ----
+        if (bIncludeExpressions)
+        {
+            Writer->WriteArrayStart(TEXT("expressions"));
+            for (UMaterialExpression* Expr : EditorData->ExpressionCollection.Expressions)
+            {
+                if (Expr == nullptr) continue;
+                const FString Anchor = Expr->Desc;
+                if (!AnchorMatches(Anchor)) continue;
+                Writer->WriteObjectStart();
+                Writer->WriteValue(TEXT("anchor"), Anchor);
+                Writer->WriteValue(TEXT("class"), Expr->GetClass()->GetPathName());
+                Writer->WriteArrayStart(TEXT("position"));
+                Writer->WriteValue(Expr->MaterialExpressionEditorX);
+                Writer->WriteValue(Expr->MaterialExpressionEditorY);
+                Writer->WriteArrayEnd();
+                WriteExpressionPropertiesJson(Writer, Expr);
+                Writer->WriteObjectEnd();
+            }
+            Writer->WriteArrayEnd();
+        }
+
+        // ---- connections [{from, to}] — internal expression-to-expression wires ----
+        if (bIncludeConnections)
+        {
+            Writer->WriteArrayStart(TEXT("connections"));
+            for (UMaterialExpression* Expr : EditorData->ExpressionCollection.Expressions)
+            {
+                if (Expr == nullptr) continue;
+                const FString ToAnchor = Expr->Desc;
+                // Walk all FExpressionInput-derived struct UPROPERTYs on this expression
+                for (TFieldIterator<FStructProperty> It(Expr->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+                {
+                    FStructProperty* SP = *It;
+                    if (SP == nullptr || SP->Struct == nullptr) continue;
+                    if (!SP->Struct->GetName().Contains(TEXT("Input"))) continue;
+                    FExpressionInput* Input = SP->ContainerPtrToValuePtr<FExpressionInput>(Expr);
+                    if (Input == nullptr || Input->Expression == nullptr) continue;
+                    const FString FromAnchor = Input->Expression->Desc;
+                    if (!AnchorMatches(FromAnchor) && !AnchorMatches(ToAnchor)) continue;
+                    Writer->WriteObjectStart();
+                    Writer->WriteValue(TEXT("from"),
+                        FString::Printf(TEXT("%s.%d"), *FromAnchor, Input->OutputIndex));
+                    Writer->WriteValue(TEXT("to"),
+                        FString::Printf(TEXT("%s.%s"), *ToAnchor, *SP->GetName()));
+                    Writer->WriteObjectEnd();
+                }
+            }
+            Writer->WriteArrayEnd();
+        }
+
+        // ---- outputs [{output_name, from_anchor, output_index}] — material's BaseColor/Emissive/etc. wires ----
+        if (bIncludeOutputs)
+        {
+            Writer->WriteArrayStart(TEXT("outputs"));
+            for (TFieldIterator<FStructProperty> It(EditorData->GetClass()); It; ++It)
+            {
+                FStructProperty* SP = *It;
+                if (SP == nullptr || SP->Struct == nullptr) continue;
+                if (!SP->Struct->GetName().Contains(TEXT("Input"))) continue;
+                FExpressionInput* Input = SP->ContainerPtrToValuePtr<FExpressionInput>(EditorData);
+                if (Input == nullptr || Input->Expression == nullptr) continue;
+                const FString FromAnchor = Input->Expression->Desc;
+                Writer->WriteObjectStart();
+                Writer->WriteValue(TEXT("output"), SP->GetName());
+                Writer->WriteValue(TEXT("from"),
+                    FString::Printf(TEXT("%s.%d"), *FromAnchor, Input->OutputIndex));
+                Writer->WriteObjectEnd();
+            }
+            Writer->WriteArrayEnd();
+        }
+
+        // ---- material_properties {BlendMode, ShadingModel, bUsedWithInstancedStaticMeshes, ...} ----
+        if (bIncludeMaterialProperties)
+        {
+            Writer->WriteObjectStart(TEXT("material_properties"));
+            // Curated list of the most useful UMaterial flags/enums
+            static const TArray<const TCHAR*> kInterestingProps = {
+                TEXT("BlendMode"), TEXT("ShadingModel"), TEXT("MaterialDomain"),
+                TEXT("TwoSided"), TEXT("OpacityMaskClipValue"), TEXT("DitheredLODTransition"),
+                TEXT("bUsedWithInstancedStaticMeshes"), TEXT("bUsedWithStaticLighting"),
+                TEXT("bUsedWithSkeletalMesh"), TEXT("bUsedAsLightFunction"),
+                TEXT("bUsedWithNiagaraSprites"), TEXT("bUsedWithNiagaraRibbons"),
+                TEXT("bUsedWithNiagaraMeshParticles"), TEXT("bUsedWithGeometryCollections"),
+            };
+            for (const TCHAR* PropName : kInterestingProps)
+            {
+                FProperty* Prop = FindFProperty<FProperty>(Mat->GetClass(), PropName);
+                if (Prop == nullptr) continue;
+                FString ValueStr;
+                void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Mat);
+                Prop->ExportTextItem_Direct(ValueStr, ValuePtr, nullptr, Mat, PPF_None);
+                Writer->WriteValue(PropName, ValueStr);
+            }
+            Writer->WriteObjectEnd();
+        }
+
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
     // ===== v9.16.0 — Material subsystem completion (closes rev9 ISSUE-1/2/3) =====
     //
     // Helper: clear every FExpressionInput that points to `Target` on a given
@@ -3926,7 +4112,12 @@ namespace
      * Snapshot a Blueprint. MUST run on the game thread.
      * Returns a complete JSON response line (with trailing \n).
      */
-    FString GetBlueprintOnGameThread(const FString& BlueprintPath)
+    FString GetBlueprintOnGameThread(
+        const FString& BlueprintPath,
+        bool bIncludeAnchors = true, bool bIncludeConnections = true,
+        bool bIncludeVariables = true, bool bIncludeComponents = true,
+        bool bIncludeFunctions = true,
+        const FString& AnchorFilter = FString())   // v9.20.0
     {
         check(IsInGameThread());
 
@@ -3935,6 +4126,11 @@ namespace
         {
             return JsonError(TEXT("get_blueprint"), TEXT("blueprint_not_found"), BlueprintPath);
         }
+
+        // v9.20.0 — anchor filter helper. Empty filter = match all.
+        auto AnchorMatches = [&AnchorFilter](const FString& Anchor) {
+            return AnchorFilter.IsEmpty() || Anchor.Contains(AnchorFilter, ESearchCase::IgnoreCase);
+        };
 
         // Build per-node anchor lookup first (so connections can reference by anchor)
         TMap<const UEdGraphNode*, FString> NodeToAnchor;
@@ -3979,47 +4175,58 @@ namespace
         Writer->WriteValue(TEXT("status"), StatusStr);
 
         // anchors {anchor_name: {...}}
-        Writer->WriteObjectStart(TEXT("anchors"));
-        if (EventGraph != nullptr)
+        if (bIncludeAnchors)
         {
-            for (const TPair<const UEdGraphNode*, FString>& Kvp : NodeToAnchor)
+            Writer->WriteObjectStart(TEXT("anchors"));
+            if (EventGraph != nullptr)
             {
-                Writer->WriteIdentifierPrefix(*Kvp.Value);
-                WriteNodeAnchor(Writer, Kvp.Key);
+                for (const TPair<const UEdGraphNode*, FString>& Kvp : NodeToAnchor)
+                {
+                    if (!AnchorMatches(Kvp.Value)) continue;   // v9.20.0
+                    Writer->WriteIdentifierPrefix(*Kvp.Value);
+                    WriteNodeAnchor(Writer, Kvp.Key);
+                }
             }
+            Writer->WriteObjectEnd();
         }
-        Writer->WriteObjectEnd();
 
         // connections [{from, to}]
-        Writer->WriteArrayStart(TEXT("connections"));
-        if (EventGraph != nullptr)
+        if (bIncludeConnections)
         {
-            for (const UEdGraphNode* Node : EventGraph->Nodes)
+            Writer->WriteArrayStart(TEXT("connections"));
+            if (EventGraph != nullptr)
             {
-                if (Node == nullptr) continue;
-                const FString FromAnchor = NodeToAnchor.FindRef(Node);
-                for (const UEdGraphPin* Pin : Node->Pins)
+                for (const UEdGraphNode* Node : EventGraph->Nodes)
                 {
-                    if (Pin->Direction != EGPD_Output) continue;  // emit from output side only
-                    for (const UEdGraphPin* Linked : Pin->LinkedTo)
+                    if (Node == nullptr) continue;
+                    const FString FromAnchor = NodeToAnchor.FindRef(Node);
+                    for (const UEdGraphPin* Pin : Node->Pins)
                     {
-                        if (Linked == nullptr || Linked->GetOwningNode() == nullptr) continue;
-                        const FString ToAnchor = NodeToAnchor.FindRef(Linked->GetOwningNode());
-                        if (ToAnchor.IsEmpty()) continue;
-                        Writer->WriteObjectStart();
-                        Writer->WriteValue(TEXT("from"),
-                            FString::Printf(TEXT("%s.%s"), *FromAnchor, *Pin->PinName.ToString()));
-                        Writer->WriteValue(TEXT("to"),
-                            FString::Printf(TEXT("%s.%s"), *ToAnchor, *Linked->PinName.ToString()));
-                        Writer->WriteObjectEnd();
+                        if (Pin->Direction != EGPD_Output) continue;  // emit from output side only
+                        for (const UEdGraphPin* Linked : Pin->LinkedTo)
+                        {
+                            if (Linked == nullptr || Linked->GetOwningNode() == nullptr) continue;
+                            const FString ToAnchor = NodeToAnchor.FindRef(Linked->GetOwningNode());
+                            if (ToAnchor.IsEmpty()) continue;
+                            // v9.20.0 — anchor filter: emit only when either endpoint matches
+                            if (!AnchorMatches(FromAnchor) && !AnchorMatches(ToAnchor)) continue;
+                            Writer->WriteObjectStart();
+                            Writer->WriteValue(TEXT("from"),
+                                FString::Printf(TEXT("%s.%s"), *FromAnchor, *Pin->PinName.ToString()));
+                            Writer->WriteValue(TEXT("to"),
+                                FString::Printf(TEXT("%s.%s"), *ToAnchor, *Linked->PinName.ToString()));
+                            Writer->WriteObjectEnd();
+                        }
                     }
                 }
             }
+            Writer->WriteArrayEnd();
         }
-        Writer->WriteArrayEnd();
 
         // BUG-3 fix (b): functions { "MyFunc": { "anchors": {...}, "connections": [...] } }
         // So callers can inspect function-body graphs (created via add_function), not just EventGraph.
+        if (bIncludeFunctions)
+        {
         Writer->WriteObjectStart(TEXT("functions"));
         for (UEdGraph* FuncGraph : Blueprint->FunctionGraphs)
         {
@@ -4068,8 +4275,11 @@ namespace
             Writer->WriteObjectEnd();   // function obj end
         }
         Writer->WriteObjectEnd();   // functions obj end
+        }   // v9.20.0 — end if bIncludeFunctions
 
         // variables [{name, type, subcategory, container}]  — v6.0.2 P4: add container info
+        if (bIncludeVariables)
+        {
         Writer->WriteArrayStart(TEXT("variables"));
         for (const FBPVariableDescription& Var : Blueprint->NewVariables)
         {
@@ -4096,8 +4306,11 @@ namespace
             Writer->WriteObjectEnd();
         }
         Writer->WriteArrayEnd();
+        }   // v9.20.0 — end if bIncludeVariables
 
         // components [{name, class}]
+        if (bIncludeComponents)
+        {
         Writer->WriteArrayStart(TEXT("components"));
         if (Blueprint->SimpleConstructionScript != nullptr)
         {
@@ -4111,6 +4324,7 @@ namespace
             }
         }
         Writer->WriteArrayEnd();
+        }   // v9.20.0 — end if bIncludeComponents
 
         Writer->WriteObjectEnd();
         Writer->Close();
@@ -7084,7 +7298,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.19.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.20.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -7489,6 +7703,37 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("connect_material_output"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.20.0 get_material (rev14 ISSUE-1) ---
+    if (Command.Equals(TEXT("get_material"), ESearchCase::IgnoreCase))
+    {
+        FString MaterialPath;
+        if (!JsonObject->TryGetStringField(TEXT("material"), MaterialPath) || MaterialPath.IsEmpty())
+            return JsonError(TEXT("get_material"), TEXT("missing_field"), TEXT("material"));
+
+        bool bIncludeExpressions = true, bIncludeConnections = true;
+        bool bIncludeOutputs = true, bIncludeMaterialProperties = true;
+        FString AnchorFilter;
+        JsonObject->TryGetBoolField(TEXT("include_expressions"),         bIncludeExpressions);
+        JsonObject->TryGetBoolField(TEXT("include_connections"),         bIncludeConnections);
+        JsonObject->TryGetBoolField(TEXT("include_outputs"),             bIncludeOutputs);
+        JsonObject->TryGetBoolField(TEXT("include_material_properties"), bIncludeMaterialProperties);
+        JsonObject->TryGetStringField(TEXT("anchor_filter"),             AnchorFilter);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), MaterialPath, bIncludeExpressions, bIncludeConnections,
+             bIncludeOutputs, bIncludeMaterialProperties, AnchorFilter]() mutable
+            {
+                Promise.SetValue(GetMaterialOnGameThread(
+                    MaterialPath, bIncludeExpressions, bIncludeConnections,
+                    bIncludeOutputs, bIncludeMaterialProperties, AnchorFilter));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_material"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
@@ -8281,7 +8526,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- get_blueprint (v2) ---
+    // --- get_blueprint (v2 + v9.20.0 filter kwargs) ---
     if (Command.Equals(TEXT("get_blueprint"), ESearchCase::IgnoreCase))
     {
         FString Name;
@@ -8289,12 +8534,28 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         {
             return JsonError(TEXT("get_blueprint"), TEXT("missing_field"), TEXT("name"));
         }
+        // v9.20.0 — closes rev14 ISSUE-2. All flags default true (backwards-compat).
+        bool bIncludeAnchors = true, bIncludeConnections = true;
+        bool bIncludeVariables = true, bIncludeComponents = true;
+        bool bIncludeFunctions = true;
+        FString AnchorFilter;
+        JsonObject->TryGetBoolField(TEXT("include_anchors"),     bIncludeAnchors);
+        JsonObject->TryGetBoolField(TEXT("include_connections"), bIncludeConnections);
+        JsonObject->TryGetBoolField(TEXT("include_variables"),   bIncludeVariables);
+        JsonObject->TryGetBoolField(TEXT("include_components"),  bIncludeComponents);
+        JsonObject->TryGetBoolField(TEXT("include_functions"),   bIncludeFunctions);
+        JsonObject->TryGetStringField(TEXT("anchor_filter"),     AnchorFilter);
+
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), Name]() mutable
+            [Promise = MoveTemp(Promise), Name, bIncludeAnchors, bIncludeConnections,
+             bIncludeVariables, bIncludeComponents, bIncludeFunctions, AnchorFilter]() mutable
             {
-                Promise.SetValue(GetBlueprintOnGameThread(Name));
+                Promise.SetValue(GetBlueprintOnGameThread(
+                    Name, bIncludeAnchors, bIncludeConnections,
+                    bIncludeVariables, bIncludeComponents, bIncludeFunctions,
+                    AnchorFilter));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("get_blueprint"), TEXT("game_thread_timeout"));
