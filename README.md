@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.19.0](https://img.shields.io/badge/version-v9.19.0-brightgreen)](#status)
-[![89 tools](https://img.shields.io/badge/tools-89-blue)](#tools)
-[![280 tests](https://img.shields.io/badge/tests-280%20passing-success)](#requirements)
+[![v9.20.0](https://img.shields.io/badge/version-v9.20.0-brightgreen)](#status)
+[![90 tools](https://img.shields.io/badge/tools-90-blue)](#tools)
+[![287 tests](https://img.shields.io/badge/tests-287%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -82,7 +82,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.17.0** | ✅ `add_function(params, returns)` (functions can now have inputs/outputs) + `add_property_set`/`add_property_get` (Set/Get nodes for properties on EXTERNAL objects like `PlayerController.bShowMouseCursor`) + `add_node` "did you mean?" hint on function_not_found (catches UE-version renames). Closes rev10 ISSUE-1/2/3 |
 | **v9.18.0** | ✅ Array/wildcard pin pipeline fixed (closes rev12 blocking): pin JSON now includes `container` field, `add_variable` compiles to surface FProperty before next call, `connect_pins` verifies link actually formed + notifies K2Nodes for wildcard type propagation + returns `connection_dropped` error instead of silent ok. End-to-end `float[]` workflow with `Array_Add` now compiles |
 | **v9.19.0** | ✅ Specialized K2Node subclass for array funcs (closes rev13): `add_node` picks `UK2Node_CallArrayFunction` for any UFUNCTION with `MD_ArrayParam` metadata (was always generic `UK2Node_CallFunction`, which lacks `PropagateArrayTypeInfo`). `connect_pins` calls BOTH `PinConnectionListChanged` AND `NodeConnectionListChanged` so wildcards propagate on Array_*, ForEachLoop, Select, PromotableOperator alike. Array_Add wired into exec chain now compiles with zero "undetermined" warnings |
-| **Unit tests** | **280 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.20.0** | ✅ `get_material` (closes rev14 ISSUE-1 — material is now READABLE end-to-end with anchors+classes+properties+wires+material-level flags, enabling cross-session edits) + `get_blueprint` filter kwargs (closes rev14 ISSUE-2 — slice large BPs by section / anchor substring, ~17× shrink possible) + `add_macro` docstring fix for ForEachLoop's `Exec` (capital) vs ForLoop's `execute` (lowercase) (rev14 ISSUE-3) |
+| **Unit tests** | **287 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -325,6 +326,7 @@ batch to trigger one shader recompile + save (avoids the per-op 12s timeout).
 | **`set_material_property`** (v9.16) | Material-level UPROPERTY (NOT inside the graph). Critical for ISM: `bUsedWithInstancedStaticMeshes=true`. Also `TwoSided` / `BlendMode` / `ShadingModel` / `MaterialDomain` |
 | **`delete_material_expression`** (v9.16) | Remove an expression. Auto-cleans dangling refs — walks all other expressions + material outputs, clears FExpressionInput pointing to the target |
 | **`disconnect_material_pins`** (v9.16) | Break a connection. `to_pin="anchor.InputName"` for an expression input, `to_pin="output:BaseColor"` for a material output |
+| **`get_material`** (v9.20) | Full snapshot — expressions / connections / outputs / material_properties (BlendMode, Usage flags, etc.). Symmetric to `get_blueprint`. Enables cross-session edits (anchor names recoverable after the create session) |
 
 ## v1 Collision-Timer demo
 

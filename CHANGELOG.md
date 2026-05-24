@@ -6,7 +6,70 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.19.0.
+Everything shipped through v9.20.0.
+
+---
+
+## [v9.20.0] — 2026-05-24 — get_material + get_blueprint filtering (closes rev14 ISSUE-1/2/3)
+
+### Closes rev14 issues
+
+After rev13 unblocked arrays and rev14 successfully built "infinite
+ripples" + a height-color material, the rev14 review surfaced three
+post-success polish items.
+
+- **ISSUE-1** (medium) — No `get_material`. Material was write-only;
+  anchor names returned at create-expression time and never again.
+  Cross-session edits = "rebuild the whole material from scratch."
+- **ISSUE-2** (low-medium) — `get_blueprint` output too large.
+  150-node BPs returned ~70KB JSON, exceeding the MCP tool output cap.
+- **ISSUE-3** (low) — `add_macro` docstring claimed ForEachLoop's exec
+  input is `"execute"`; actual is `"Exec"` (capital). ForLoop's IS
+  `"execute"` (lowercase). Different macros, different casings —
+  docstring made the LLM hit `pin_not_found` on first try.
+
+### Added — 1 new tool + 1 extension + 1 docstring fix (89 → 90)
+
+- **`get_material(material, include_expressions=True, include_connections=True,
+   include_outputs=True, include_material_properties=True, anchor_filter="")`**
+  — symmetric to `get_blueprint`. Walks the material's
+  `ExpressionCollection`, dumps each expression's anchor + class +
+  position + UPROPERTYs (via `ExportTextItem_Direct`), all internal
+  expression-to-expression connections (via `FExpressionInput`
+  reflection on every UMaterialExpression subclass), all material
+  output wires (BaseColor / EmissiveColor / etc.), and a curated set
+  of material-level UPROPERTYs (BlendMode, ShadingModel,
+  bUsedWithInstancedStaticMeshes, TwoSided, Niagara usage flags, etc.).
+  Each section can be skipped via `include_*=False`; `anchor_filter`
+  is a case-insensitive substring on anchor names.
+
+- **`get_blueprint(..., include_anchors=True, include_connections=True,
+   include_variables=True, include_components=True, include_functions=True,
+   anchor_filter="")`** — extended. Each flag wraps its section.
+   `anchor_filter` only emits anchors / connections whose endpoints'
+   anchors match the substring. Backwards-compatible: defaults
+   preserve old behavior; payload unchanged when called bare.
+
+- **`add_macro` docstring** — ForEachLoop's exec input is `Exec`
+  (capital E), NOT `execute`. ForLoop's is `execute` (lowercase).
+  Docstring now flags the casing inconsistency and reminds the
+  caller to read the actual `pins[]` array in `add_macro`'s response.
+
+### Verification
+
+Live smoke on a 6-expression material:
+  `get_material` returns 6 expressions (with `scale.ConstB =
+  "0.005000"`), 5 connections, 1 output (`BaseColor ← lerp.0`), and 13
+  material_properties including the flags we set.
+  `get_material(anchor_filter="scale")` returns only the matching
+  expression.
+
+`get_blueprint` payload shrink (small test BP): full 2431B →
+bare(all-flags-false) 145B = **16.8x smaller**. Bigger gains on the
+70KB-class BPs from rev14.
+
+### `ping.plugin_version`
+"9.19.0" → **"9.20.0"**.
 
 ---
 
