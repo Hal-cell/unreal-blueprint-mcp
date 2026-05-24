@@ -4900,3 +4900,46 @@ def test_ping_returns_plugin_version_9_18_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.18.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.19.0 — specialized K2Node selection for array functions (closes rev13)
+# ---------------------------------------------------------------------------
+# The actual change is server-side (C++): add_node now spawns
+# UK2Node_CallArrayFunction (not generic UK2Node_CallFunction) for any
+# UFUNCTION marked with MD_ArrayParam metadata, so wildcard pin
+# propagation works correctly. Mock tests just verify the wire format
+# is unchanged.
+
+
+def test_add_node_array_function_wire_unchanged() -> None:
+    """Adding Array_Add should still use the K2Node_CallFunction: prefix.
+    The K2Node SUBCLASS UE spawns server-side changes (now CallArrayFunction
+    for MD_ArrayParam funcs), but the wire-level node_type stays the same."""
+    response = (
+        b'{"ok":true,"command":"add_node","anchor_name":"arr_add","node_guid":"X",'
+        b'"pins":[{"name":"TargetArray","direction":"input","type":"wildcard","container":"array"},'
+        b'{"name":"NewItem","direction":"input","type":"wildcard","container":""}],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_node(
+            blueprint="/Game/BP",
+            node_type="K2Node_CallFunction:KismetArrayLibrary.Array_Add",
+            anchor_name="arr_add",
+        )
+    assert r["ok"] is True
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["node_type"] == "K2Node_CallFunction:KismetArrayLibrary.Array_Add"
+
+
+def test_ping_returns_plugin_version_9_19_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.19.0","build_date":"May 24 2026 12:00:00",'
+        b'"timestamp":"2026-05-24T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.19.0"

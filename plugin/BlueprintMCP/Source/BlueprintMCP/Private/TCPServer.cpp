@@ -176,6 +176,9 @@
 // v7.6 — event dispatchers (multicast delegates)
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"   // v9.17.0 — for add_function returns
+#include "K2Node_CallArrayFunction.h"   // v9.19.0 — for array-pin wildcard propagation
+#include "EdGraphSchema_K2.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "K2Node_CallDelegate.h"
 #include "K2Node_AddDelegate.h"
 #include "K2Node_RemoveDelegate.h"
@@ -681,8 +684,26 @@ namespace
                 FString::Printf(TEXT("%s.%s%s"), *OwningClassName, *FunctionName, *HintSuffix));
         }
 
-        // 7. Spawn K2Node_CallFunction in the EventGraph
-        UK2Node_CallFunction* NewNode = NewObject<UK2Node_CallFunction>(EventGraph);
+        // 7. Spawn the right K2Node subclass for this function.
+        // v9.19.0 — closes rev13 root cause. The default UK2Node_CallFunction
+        // lacks array-specific wildcard propagation; using it for array-library
+        // functions makes Array_Add/Get/Length compile with "undetermined type"
+        // errors. UE's editor (UBlueprintFunctionNodeSpawner) picks a
+        // specialized subclass based on function metadata — we mirror that
+        // selection here.
+        UClass* NodeClassToSpawn = UK2Node_CallFunction::StaticClass();
+        if (TargetFunc->HasMetaData(FBlueprintMetadata::MD_ArrayParam))
+        {
+            // Array_Add, Array_Get, Array_Length, Array_Contains, etc.
+            // Note: UE replaces Array_Get with UK2Node_GetArrayItem at LOAD
+            // time via ConvertDeprecatedNode — we use the generic
+            // UK2Node_CallArrayFunction for all of them and let UE migrate
+            // on next BP load. PropagateArrayTypeInfo handles the wildcards
+            // correctly via NotifyPinConnectionListChanged.
+            NodeClassToSpawn = UK2Node_CallArrayFunction::StaticClass();
+        }
+        UK2Node_CallFunction* NewNode = static_cast<UK2Node_CallFunction*>(
+            NewObject<UObject>(EventGraph, NodeClassToSpawn));
         NewNode->SetFlags(RF_Transactional);
         NewNode->FunctionReference.SetExternalMember(TargetFunc->GetFName(), OwningClass);
         NewNode->NodePosX = PosX;
@@ -4703,16 +4724,25 @@ namespace
                     *FromPinRef, *ToPinRef));
         }
 
-        // v9.18.0 — defensive: explicitly notify both K2Nodes that their pin
-        // connection lists changed. UEdGraphPin::MakeLinkTo SHOULD trigger
-        // this internally, but for some K2Node subclasses (notably
-        // K2Node_CallArrayFunction's PropagateArrayTypeInfo) the wildcard
-        // pin type only morphs if NotifyPinConnectionListChanged fires after
-        // both ends have valid LinkedTo arrays.
-        if (UK2Node* FromK2 = Cast<UK2Node>(FromPin->GetOwningNode()))
-            FromK2->NotifyPinConnectionListChanged(FromPin);
-        if (UK2Node* ToK2 = Cast<UK2Node>(ToPin->GetOwningNode()))
-            ToK2->NotifyPinConnectionListChanged(ToPin);
+        // v9.18.0 + v9.19.0 (rev13) — explicitly notify both nodes.
+        //
+        // UEdGraphPin::MakeLinkTo does NOT call these — verified from UE 5.4
+        // source. The editor's wire-drag handler (FDragConnection) calls
+        // NodeConnectionListChanged() after TryCreateConnection. Without these,
+        // K2Nodes that hook these callbacks for wildcard propagation never run.
+        //
+        // Two different callbacks (different K2Nodes hook different ones):
+        //   - PinConnectionListChanged(Pin) → triggers UK2Node_CallArrayFunction's
+        //     PropagateArrayTypeInfo (rev12 case: Array_Add/Get wildcards)
+        //   - NodeConnectionListChanged() → triggers UK2Node_MacroInstance's
+        //     wildcard resolution (rev13 case: ForEachLoop), plus
+        //     UK2Node_Select / UK2Node_PromotableOperator etc.
+        UEdGraphNode* FromNode = FromPin->GetOwningNode();
+        UEdGraphNode* ToNode   = ToPin->GetOwningNode();
+        if (FromNode) FromNode->PinConnectionListChanged(FromPin);
+        if (ToNode)   ToNode->PinConnectionListChanged(ToPin);
+        if (FromNode) FromNode->NodeConnectionListChanged();
+        if (ToNode && ToNode != FromNode) ToNode->NodeConnectionListChanged();
 
         // 5. Mark + save
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
@@ -7054,7 +7084,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.18.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.19.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
