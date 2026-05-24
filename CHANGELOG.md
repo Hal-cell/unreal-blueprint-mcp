@@ -6,7 +6,59 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.17.0.
+Everything shipped through v9.18.0.
+
+---
+
+## [v9.18.0] — 2026-05-24 — Array/wildcard pin pipeline fixed (closes rev12 ISSUE-1)
+
+### Closes rev12 blocking bug
+
+The rev12 attempt to build an "infinite ripple" BP using `float[]` +
+`Array_Add` / `Array_Get` / `ForEachLoop` failed because: the
+variable's get-node reported scalar type in JSON; `connect_pins`
+returned `ok=true` for array→wildcard wires that silently never
+formed; and even when they did form, the wildcard type wasn't
+propagated. Three independent fixes:
+
+### Fixed
+
+- **`BuildPinsJsonArray` container field** — every pin entry now
+  includes `"container": "array"/"set"/"map"/""`. Backwards-compatible
+  additive field. Closes rev12 ISSUE-1 (a): a `float[]` variable's
+  get-node was reporting `"type": "real"` with no array signal —
+  user (LLM) saw it as scalar and went down the wrong path.
+- **`AddVariableOnGameThread` post-compile** — `FKismetEditorUtilities::
+  CompileBlueprint` now runs after `AddMemberVariable`. Without this,
+  the FProperty doesn't exist on the GeneratedClass yet, and
+  K2Node_VariableGet's pin-type resolution (`GetPropertyForVariable`)
+  falls back through stale paths. Adds ~50ms per `add_variable` call.
+- **`ConnectPinsOnGameThread` verify + notify** —
+  - After `TryCreateConnection`, verify
+    `FromPin->LinkedTo.Contains(ToPin)`. If not, return new
+    `connection_dropped` error with a hint (mentions wildcard +
+    container). Closes the silent-failure path that misled rev12.
+  - Explicitly call `K2Node::NotifyPinConnectionListChanged` on both
+    ends. UEdGraphPin::MakeLinkTo should trigger this internally, but
+    being explicit ensures `UK2Node_CallArrayFunction::PropagateArrayTypeInfo`
+    actually runs (so wildcards morph to the connected container type).
+  - Response now includes `from_container` / `to_container` so callers
+    can verify the wildcard morphed as expected.
+
+### Live verification
+
+End-to-end array workflow that was blocking in rev12 now compiles:
+
+  add_variable("RippleOX", "float[]")
+  add_variable_get → pin: {type: "real", container: "array"}  ← was "real" alone
+  add Array_Add (TargetArray/NewItem are wildcard array)
+  connect_pins("get_arr.RippleOX", "arr_add.TargetArray")
+    → ok=true, from_container=array, to_container=array
+  get_blueprint shows 1 connection (was empty)
+  compile_blueprint → up_to_date
+
+### `ping.plugin_version`
+"9.17.0" → **"9.18.0"**.
 
 ---
 

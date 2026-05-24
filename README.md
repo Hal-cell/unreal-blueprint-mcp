@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.17.0](https://img.shields.io/badge/version-v9.17.0-brightgreen)](#status)
+[![v9.18.0](https://img.shields.io/badge/version-v9.18.0-brightgreen)](#status)
 [![89 tools](https://img.shields.io/badge/tools-89-blue)](#tools)
-[![274 tests](https://img.shields.io/badge/tests-274%20passing-success)](#requirements)
+[![278 tests](https://img.shields.io/badge/tests-278%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -80,7 +80,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.15.0** | ✅ Material subsystem door-opener: `create_material` + `add_material_expression` + `set_material_expression_property` + `connect_material_pins` + `connect_material_output`. Plus `set_component_property` array-index syntax (`OverrideMaterials[0]`). LLM can now build height-color / param materials end-to-end |
 | **v9.16.0** | ✅ Material subsystem completion: `compile_material` (= "Apply" button, 75s timeout) + `set_material_property` (material-level UPROPERTYs incl. `bUsedWithInstancedStaticMeshes` for ISM) + `delete_material_expression` (with auto-cleanup of dangling refs) + `disconnect_material_pins` (input form + `output:Name` form). Closes rev9 ISSUE-1/2/3 |
 | **v9.17.0** | ✅ `add_function(params, returns)` (functions can now have inputs/outputs) + `add_property_set`/`add_property_get` (Set/Get nodes for properties on EXTERNAL objects like `PlayerController.bShowMouseCursor`) + `add_node` "did you mean?" hint on function_not_found (catches UE-version renames). Closes rev10 ISSUE-1/2/3 |
-| **Unit tests** | **274 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.18.0** | ✅ Array/wildcard pin pipeline fixed (closes rev12 blocking): pin JSON now includes `container` field, `add_variable` compiles to surface FProperty before next call, `connect_pins` verifies link actually formed + notifies K2Nodes for wildcard type propagation + returns `connection_dropped` error instead of silent ok. End-to-end `float[]` workflow with `Array_Add` now compiles |
+| **Unit tests** | **278 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
