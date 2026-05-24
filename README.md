@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.16.0](https://img.shields.io/badge/version-v9.16.0-brightgreen)](#status)
-[![87 tools](https://img.shields.io/badge/tools-87-blue)](#tools)
-[![265 tests](https://img.shields.io/badge/tests-265%20passing-success)](#requirements)
+[![v9.17.0](https://img.shields.io/badge/version-v9.17.0-brightgreen)](#status)
+[![89 tools](https://img.shields.io/badge/tools-89-blue)](#tools)
+[![274 tests](https://img.shields.io/badge/tests-274%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -79,7 +79,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.14.0** | ✅ `add_select` `num_options` actually grows past 2 (was silently capped — closes rev8 ISSUE-1). N-way data Select now usable in one node instead of Switch + N VariableSet workaround |
 | **v9.15.0** | ✅ Material subsystem door-opener: `create_material` + `add_material_expression` + `set_material_expression_property` + `connect_material_pins` + `connect_material_output`. Plus `set_component_property` array-index syntax (`OverrideMaterials[0]`). LLM can now build height-color / param materials end-to-end |
 | **v9.16.0** | ✅ Material subsystem completion: `compile_material` (= "Apply" button, 75s timeout) + `set_material_property` (material-level UPROPERTYs incl. `bUsedWithInstancedStaticMeshes` for ISM) + `delete_material_expression` (with auto-cleanup of dangling refs) + `disconnect_material_pins` (input form + `output:Name` form). Closes rev9 ISSUE-1/2/3 |
-| **Unit tests** | **265 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.17.0** | ✅ `add_function(params, returns)` (functions can now have inputs/outputs) + `add_property_set`/`add_property_get` (Set/Get nodes for properties on EXTERNAL objects like `PlayerController.bShowMouseCursor`) + `add_node` "did you mean?" hint on function_not_found (catches UE-version renames). Closes rev10 ISSUE-1/2/3 |
+| **Unit tests** | **274 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements
@@ -197,7 +198,9 @@ Quit Claude Desktop completely (Cmd+Q, not just close the window) and reopen.
 
 | Tool | What it does |
 |------|--------------|
-| `add_function` | Create an empty user function graph in the BP (entry anchor `entry`) |
+| `add_function` | Create a user function graph in the BP (entry anchor `entry`). **v9.17 adds `params=[{name,type}]` + `returns=[{name,type}]`** — function-result node is anchored `result` |
+| **`add_property_set`** (v9.17) | Set a UPROPERTY on an EXTERNAL object (e.g. `PlayerController.bShowMouseCursor`). `K2Node_VariableSet` with `SetExternalMember`. Pin layout includes a `Target` input |
+| **`add_property_get`** (v9.17) | Symmetric Get node — read a UPROPERTY from an external object |
 | `call_blueprint_function` | Call a function on another class — native or BP class path. **Auto-compiles target BP on function miss (v7.1.3)** |
 | **`add_event_dispatcher`** (v7) | Create a multicast delegate on the BP (signature graph + member variable + auto-compile) |
 | **`add_call_dispatcher`** (v7) | `K2Node_CallDelegate` — broadcast the dispatcher |

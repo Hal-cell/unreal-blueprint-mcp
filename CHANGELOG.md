@@ -6,7 +6,50 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.16.0.
+Everything shipped through v9.17.0.
+
+---
+
+## [v9.17.0] — 2026-05-24 — Function params/returns + property_set + function_not_found hint (closes rev10 ISSUE-1/2/3)
+
+### Closes rev10 issues
+
+- **ISSUE-1** (medium) — `add_function` had no params / returns. LLM had
+  to inline function bodies N times (rev10 hit this when the ripple
+  formula needed to be called per wave slot — couldn't be factored).
+- **ISSUE-2** (medium) — `add_variable_set` could only set the BP's OWN
+  variables. No way to set "PlayerController.bShowMouseCursor" or any
+  property on a different class.
+- **ISSUE-3** (low) — `add_node` returned bare `function_not_found` when
+  the function name was wrong. rev10 hit `SetInputMode_GameAndUI` →
+  in UE 5.4 it's `SetInputMode_GameAndUIEx` — no signal from the error.
+
+### Added — 2 new tools + 1 extension + 1 hint (87 → 89)
+
+- **`add_function(blueprint, name, params=[], returns=[])`** — extended.
+  `params` / `returns` are lists of `{name, type}` dicts (same shape as
+  `add_custom_event`). Internally:
+    - input params → OUTPUT pins on the auto-created `K2Node_FunctionEntry`
+      (function body reads them as inputs)
+    - return values → a NEW `K2Node_FunctionResult` node anchored
+      `"result"` with INPUT pins (function body writes them as outputs)
+  Backwards-compat: omitting both gives the v5 empty function.
+- **`add_property_set(blueprint, target_class, property, anchor_name, ...)`** —
+  `K2Node_VariableSet` with `VariableReference.SetExternalMember`. The
+  generated node has a `Target` input pin (the external object) plus the
+  value-input pin named after the property. `target_class` resolves via
+  the existing `ResolveCallTargetClass` (native short names or BP paths).
+- **`add_property_get(...)`** — symmetric Get-node for reading external
+  object properties.
+- **`add_node` `function_not_found` hint** — when the function lookup
+  fails, walks the class via `TFieldIterator<UFunction>` (incl. supers)
+  and suggests up to 5 functions whose names substring-overlap with the
+  requested name. Closes rev10 ISSUE-3 by catching UE-version renames.
+  Live-confirmed: `WidgetBlueprintLibrary.SetInputMode_GameAndUI` →
+  detail says `"did you mean: SetInputMode_GameAndUIEx?"`.
+
+### `ping.plugin_version`
+"9.16.0" → **"9.17.0"**.
 
 ---
 
