@@ -546,6 +546,18 @@ namespace
      *  v7.1.1 (BUG-4 fix): skip Pin->bHidden so internal pins (e.g. K2Node_Switch's
      *  NotEqual_IntInt function-ref pin, K2Node_CallFunction's self when implicit)
      *  don't leak into the public pin list. */
+    /** Container suffix string for a pin type: "array"/"set"/"map" or "" for scalar. */
+    static FString GetContainerTypeString(const FEdGraphPinType& PinType)
+    {
+        switch (PinType.ContainerType)
+        {
+            case EPinContainerType::Array: return TEXT("array");
+            case EPinContainerType::Set:   return TEXT("set");
+            case EPinContainerType::Map:   return TEXT("map");
+            default:                        return FString();
+        }
+    }
+
     FString BuildPinsJsonArray(const UEdGraphNode* Node)
     {
         TArray<FString> PinJsonItems;
@@ -555,11 +567,17 @@ namespace
             const FString PinName = Pin->PinName.ToString();
             const FString Direction = (Pin->Direction == EGPD_Input) ? TEXT("input") : TEXT("output");
             const FString TypeCategory = Pin->PinType.PinCategory.ToString();
+            // v9.18.0 — rev12 ISSUE-1 (a): emit ContainerType so callers can
+            // tell scalar from array/set/map. Previously a float[] variable's
+            // get-node pin reported "real" in JSON even though the underlying
+            // pin was correctly array-typed.
+            const FString ContainerStr = GetContainerTypeString(Pin->PinType);
             PinJsonItems.Add(FString::Printf(
-                TEXT("{\"name\":%s,\"direction\":\"%s\",\"type\":%s}"),
+                TEXT("{\"name\":%s,\"direction\":\"%s\",\"type\":%s,\"container\":%s}"),
                 *EscapeJsonString(PinName),
                 *Direction,
-                *EscapeJsonString(TypeCategory)));
+                *EscapeJsonString(TypeCategory),
+                *EscapeJsonString(ContainerStr)));
         }
         return TEXT("[") + FString::Join(PinJsonItems, TEXT(",")) + TEXT("]");
     }
@@ -1538,7 +1556,14 @@ namespace
                 *PropertyFlags &= ~CPF_DisableEditOnInstance;
         }
 
-        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        // v9.18.0 — rev12 ISSUE-1 (a) fix: compile so the FProperty exists on
+        // the GeneratedClass before subsequent add_variable_get/set creates a
+        // K2Node_VariableGet. Without this, K2Node_Variable::GetPropertyForVariable
+        // falls back through stale paths and can produce a SCALAR pin for an
+        // array variable (container info dropped). Compile is fast for simple
+        // single-variable changes.
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
         return FString::Printf(
@@ -4661,15 +4686,48 @@ namespace
                 FString::Printf(TEXT("%s -> %s"), *FromPinRef, *ToPinRef));
         }
 
+        // v9.18.0 — rev12 ISSUE-1 (b) fix: TryCreateConnection can return true
+        // and still leave the pins disconnected — e.g. when Schema chose
+        // MAKE_WITH_CONVERSION_NODE but the conversion didn't apply (notably
+        // for wildcard/array combos). Verify the link actually formed and
+        // bail with a loud error if not. The user's report had Array_Add's
+        // TargetArray apparently connected but silently dropped on next read.
+        const bool bLinkExists = FromPin->LinkedTo.Contains(ToPin)
+                              || ToPin->LinkedTo.Contains(FromPin);
+        if (!bLinkExists)
+        {
+            return JsonError(TEXT("connect_pins"), TEXT("connection_dropped"),
+                FString::Printf(TEXT("Schema accepted %s -> %s (possibly inserting a conversion node) but no direct link formed. "
+                                     "Common cause: a wildcard pin couldn't infer its type — make sure the SOURCE pin has a concrete type. "
+                                     "If source is a variable_get on an array variable, verify the pin's container is 'array' (v9.18.0+ JSON shows this)."),
+                    *FromPinRef, *ToPinRef));
+        }
+
+        // v9.18.0 — defensive: explicitly notify both K2Nodes that their pin
+        // connection lists changed. UEdGraphPin::MakeLinkTo SHOULD trigger
+        // this internally, but for some K2Node subclasses (notably
+        // K2Node_CallArrayFunction's PropagateArrayTypeInfo) the wildcard
+        // pin type only morphs if NotifyPinConnectionListChanged fires after
+        // both ends have valid LinkedTo arrays.
+        if (UK2Node* FromK2 = Cast<UK2Node>(FromPin->GetOwningNode()))
+            FromK2->NotifyPinConnectionListChanged(FromPin);
+        if (UK2Node* ToK2 = Cast<UK2Node>(ToPin->GetOwningNode()))
+            ToK2->NotifyPinConnectionListChanged(ToPin);
+
         // 5. Mark + save
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
-        // 6. Response (echo back the canonical pin refs UE has)
+        // 6. Response (echo back the canonical pin refs UE has + container info)
+        const FString FromContainer = GetContainerTypeString(FromPin->PinType);
+        const FString ToContainer   = GetContainerTypeString(ToPin->PinType);
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"connect_pins\",\"from\":%s,\"to\":%s,\"saved\":%s}\n"),
+            TEXT("{\"ok\":true,\"command\":\"connect_pins\",\"from\":%s,\"to\":%s,")
+            TEXT("\"from_container\":%s,\"to_container\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(FromPinRef),
             *EscapeJsonString(ToPinRef),
+            *EscapeJsonString(FromContainer),
+            *EscapeJsonString(ToContainer),
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -6996,7 +7054,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.17.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.18.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }

@@ -4830,3 +4830,73 @@ def test_ping_returns_plugin_version_9_17_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.17.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.18.0 — pin container info + connect_pins verify-and-notify (closes rev12 ISSUE-1)
+# ---------------------------------------------------------------------------
+
+
+def test_pins_json_includes_container_field() -> None:
+    """v9.18.0 — every pin in node-creation responses now has a 'container' field.
+
+    For a get-node on a float[] variable, container should be 'array'.
+    Existing scalar tests keep working because container is just an additional
+    field (empty string for scalars)."""
+    response = (
+        b'{"ok":true,"command":"add_variable_get","anchor_name":"get_array","variable_name":"RippleOX",'
+        b'"node_guid":"AAAA","pins":['
+        b'{"name":"RippleOX","direction":"output","type":"real","container":"array"}'
+        b'],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_variable_get(
+            blueprint="/Game/BP", variable_name="RippleOX", anchor_name="get_array",
+        )
+    assert r["ok"] is True
+    out_pin = next(p for p in r["pins"] if p["name"] == "RippleOX")
+    assert out_pin["type"] == "real"
+    assert out_pin["container"] == "array"
+
+
+def test_connect_pins_returns_container_info() -> None:
+    """v9.18.0 — connect_pins response now includes from_container / to_container."""
+    response = (
+        b'{"ok":true,"command":"connect_pins","from":"get_arr","to":"arr_add.TargetArray",'
+        b'"from_container":"array","to_container":"array","saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_pins(
+            blueprint="/Game/BP", from_pin="get_arr", to_pin="arr_add.TargetArray",
+        )
+    assert r["ok"] is True
+    assert r["from_container"] == "array"
+    assert r["to_container"] == "array"
+
+
+def test_connect_pins_dropped_silent_failure_now_loud() -> None:
+    """rev12 ISSUE-1 (b) — silent ok-but-not-connected now becomes a loud
+    connection_dropped error."""
+    response = (
+        b'{"ok":false,"command":"connect_pins","error":"connection_dropped",'
+        b'"detail":"Schema accepted real -> wildcard but no direct link formed. '
+        b'Common cause: a wildcard pin couldn\'t infer its type."}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_pins(
+            blueprint="/Game/BP", from_pin="get_scalar", to_pin="arr_add.TargetArray",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "connection_dropped"
+    assert "wildcard" in r["detail"]
+
+
+def test_ping_returns_plugin_version_9_18_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.18.0","build_date":"May 24 2026 12:00:00",'
+        b'"timestamp":"2026-05-24T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.18.0"
