@@ -6,7 +6,68 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.18.0.
+Everything shipped through v9.19.0.
+
+---
+
+## [v9.19.0] — 2026-05-24 — Specialized K2Node subclass for array funcs + dual-callback connect (closes rev13)
+
+### rev13: v9.18.0 fixed half the problem
+
+rev13 confirmed v9.18.0 made connections form, but wildcard pin types
+on `Array_Add` / `Array_Get` / `ForEachLoop` still didn't propagate —
+arrays in the exec chain compiled with `undetermined type` errors.
+
+Walking UE 5.4 source revealed two real root causes:
+
+1. **`UEdGraphPin::MakeLinkTo` does NOT call any of the connection
+   callbacks** (verified in `Engine/Source/Runtime/Engine/Private/
+   EdGraph/EdGraphPin.cpp:512-540`). The editor's wire-drag handler
+   (`FDragConnection::DroppedOnPin`) explicitly calls
+   `NodeConnectionListChanged()` after `TryCreateConnection`.
+2. **Array-library functions need a specialized K2Node subclass**.
+   `UBlueprintFunctionNodeSpawner::Create` checks
+   `MD_ArrayParam` metadata and picks `UK2Node_CallArrayFunction`
+   (which has `PropagateArrayTypeInfo`) instead of the generic
+   `UK2Node_CallFunction` (which has no wildcard propagation at all).
+
+### Fixed
+
+- **`AddNodeOnGameThread` — specialized K2Node selection**. If
+  `TargetFunc->HasMetaData(FBlueprintMetadata::MD_ArrayParam)`, spawn
+  `UK2Node_CallArrayFunction::StaticClass()` instead of
+  `UK2Node_CallFunction::StaticClass()`. Mirrors UE's editor selection
+  logic. The wire-level `node_type` JSON string is unchanged
+  (`K2Node_CallFunction:KismetArrayLibrary.Array_Add`) — only the
+  underlying instantiated subclass changes.
+
+- **`ConnectPinsOnGameThread` — dual callback**. After
+  `TryCreateConnection`, now calls BOTH `PinConnectionListChanged(Pin)`
+  AND `NodeConnectionListChanged()` on each node. Different K2Node
+  subclasses hook different callbacks:
+  - `PinConnectionListChanged` → `UK2Node_CallArrayFunction::
+    PropagateArrayTypeInfo` (Array_Add / Array_Get / Array_Length)
+  - `NodeConnectionListChanged` → `UK2Node_MacroInstance` (ForEachLoop),
+    `UK2Node_Select`, `UK2Node_PromotableOperator`
+  Calling both covers all wildcard-resolving subclasses.
+
+### Live verification
+
+End-to-end with `Array_Add` IN the exec chain (so the compiler can't
+dead-strip it — rev13's false-positive trap):
+
+  add_variable("RippleOX", "float[]")
+  add_node("K2Node_CallFunction:KismetArrayLibrary.Array_Add")
+    → instantiated as UK2Node_CallArrayFunction (was generic in v9.18)
+    → TargetArray container=array (correct from the start)
+  add_variable_get + connect get_arr.RippleOX → arr_add.TargetArray
+    → from_container/to_container = array (wildcards morphed)
+  connect_pins begin_play.then → arr_add.execute   ← in exec chain
+  compile_blueprint → status=up_to_date            ← was "undetermined"
+  UE compile log: zero "wildcard" / "undetermined" warnings
+
+### `ping.plugin_version`
+"9.18.0" → **"9.19.0"**.
 
 ---
 
