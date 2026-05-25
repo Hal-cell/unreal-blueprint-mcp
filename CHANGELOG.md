@@ -6,7 +6,72 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.20.0.
+Everything shipped through v9.21.0.
+
+---
+
+## [v9.21.0] — 2026-05-25 — get_pie_perf_stats + add_node KismetArrayLibrary docstring (closes rev15 ISSUE-1/2)
+
+### Closes rev15 issues
+
+rev15 ("ripple-grid Tick optimization") was a **smooth task** — the existing
+tooling handled the ForLoop + double Branch + Array_Remove cleanup pattern
+end-to-end. Two small follow-ups:
+
+- **ISSUE-1** (medium) — No way to measure PIE runtime perf. With no
+  access to frame time / FPS / `stat unit`, optimization tasks can only
+  use indirect indicators (PrintString-the-array-length and watch it
+  drain). The "did the frame budget improve?" question stayed
+  unanswerable from the LLM side.
+- **ISSUE-2** (low) — `add_node` docstring didn't list the common
+  `KismetArrayLibrary` function names. The plugin's fuzzy "did you
+  mean?" saved the call (`Array_RemoveIndex` → `Array_Remove`), but
+  the editor's display name ≠ C++ function name for the array helpers
+  (display "REMOVE INDEX" → C++ `Array_Remove`; display "REMOVE" →
+  C++ `Array_RemoveItem`), so it's still trial-and-error on first try.
+
+### Added — 1 new tool + 1 docstring expansion (90 → 91)
+
+- **`get_pie_perf_stats()`** — reads engine perf globals. Returns
+  `{average_fps, average_frame_ms, delta_time_ms, game_thread_ms,
+  render_thread_ms, rhi_thread_ms, gpu_frame_ms, frame_counter,
+  pie_running}`. Equivalent of `stat unit` from the viewport, but as
+  a JSON payload the LLM can compare across before/after samples.
+  Works in editor-idle too — perf globals tick unconditionally.
+
+  Implementation note: `GAverageFPS` / `GAverageMS` have no public
+  Engine header, so they're declared as `extern ENGINE_API float`
+  at file scope in `TCPServer.cpp` (NOT inside the anonymous
+  namespace — that would give them internal linkage and the linker
+  wouldn't find the engine's external definitions). Added
+  `RenderCore` to `Build.cs` for the `GGameThreadTime` /
+  `GRenderThreadTime` / `GRHIThreadTime` cycle counters.
+
+- **`add_node` docstring — KismetArrayLibrary common functions** —
+  added a curated list of C++ function names with their editor
+  display names side-by-side. Highlights the index-vs-value trap
+  (`Array_Remove` takes index; `Array_RemoveItem` takes value).
+  Includes 15 staples: Add, AddUnique, Get, Set, Length, IsEmpty,
+  Contains, Find, Insert, Remove, RemoveItem, Clear, Reverse, Shuffle,
+  Append, LastIndex.
+
+### Verification
+
+Live smoke against a freshly-launched UE editor on TESTMCP:
+- **Editor-idle**: `pie_running=false`, frame_counter=34, all 9 timing
+  fields populate (the engine ticks the globals even when no PIE is
+  running).
+- **PIE running**: `pie_running=true`, frame_counter increments
+  60 → 67 between two samples taken 2 s apart (engine is ticking),
+  `game_thread_ms=6.08`, `gpu_frame_ms=22.48`, render & RHI both
+  populated. Numbers are low-FPS because the editor was un-focused
+  while being driven from Python — exactly what the docstring says
+  to expect.
+
+Integration: 10/10 passed clean (no flake retries).
+
+### `ping.plugin_version`
+"9.20.0" → **"9.21.0"**.
 
 ---
 
