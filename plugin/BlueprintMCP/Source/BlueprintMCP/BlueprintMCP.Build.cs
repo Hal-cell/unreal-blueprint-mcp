@@ -49,6 +49,9 @@ public class BlueprintMCP : ModuleRules
             // v9.15.0: Material subsystem — MaterialEditingLibrary, expression
             // helpers, UMaterialFactoryNew (UMaterial itself is Engine-core).
             "MaterialEditor",
+            // v9.21.0: RenderCore — GGameThreadTime / GRenderThreadTime /
+            // GRHIThreadTime perf globals for get_pie_perf_stats
+            "RenderCore",
         });
     }
 }

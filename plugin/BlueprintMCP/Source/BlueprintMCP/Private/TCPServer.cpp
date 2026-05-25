@@ -143,6 +143,10 @@
 // v9.9.0 — FTSTicker for asynchronous key-hold / move-player scheduling
 #include "Containers/Ticker.h"
 
+// v9.21.0 — perf globals for get_pie_perf_stats
+#include "RenderTimer.h"        // GGameThreadTime / GRenderThreadTime / GRHIThreadTime
+#include "EngineGlobals.h"      // GGPUFrameTime
+
 // v9.15.0 — Material subsystem
 #include "Materials/Material.h"
 #include "Materials/MaterialExpression.h"
@@ -241,6 +245,15 @@ void FBlueprintMCPLogCapture::Clear()
     FScopeLock Lock(&Mutex);
     Lines.Empty();
 }
+
+// v9.21.0 — perf globals needed by GetPIEPerfStatsOnGameThread.
+// These live at *file scope* (not inside the anonymous namespace below) because
+// extern declarations inside an anonymous namespace get internal linkage and
+// the linker then can't find the engine's external definitions. There is no
+// public Engine header that exposes GAverageFPS/GAverageMS; engine code uses
+// them the same way (e.g. Engine/Private/Stats/StatsHUD.cpp).
+extern ENGINE_API float GAverageFPS;
+extern ENGINE_API float GAverageMS;
 
 namespace
 {
@@ -6784,6 +6797,52 @@ namespace
             bRequestQueued ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.21.0 — get_pie_perf_stats (closes rev15 ISSUE-1) =====
+    //
+    // Read engine perf globals so the LLM can quantify optimization effects.
+    // Equivalent of `stat unit` in the UE viewport:
+    //   - frame time (delta seconds → ms)
+    //   - GameThreadTime, RenderThreadTime, RHIThreadTime, GPUFrameTime (cycles → ms)
+    //   - GAverageFPS / GAverageMS (rolling average)
+    //   - GFrameCounter (total frames since engine startup)
+    //
+    // Works in both editor and PIE — the perf globals tick unconditionally.
+    // pie_running flag reported so callers can distinguish editor-idle stats
+    // from real PIE workload.
+
+    FString GetPIEPerfStatsOnGameThread()
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("get_pie_perf_stats");
+        // GAverageFPS / GAverageMS declared at file scope (above anon namespace).
+
+        const bool bRunning = IsPIERunningChecked();
+
+        // Convert cycles → ms via the platform timer. GGameThreadTime etc. hold
+        // the most recent frame's cycles spent on that thread.
+        const float GameThreadMs   = FPlatformTime::ToMilliseconds(GGameThreadTime);
+        const float RenderThreadMs = FPlatformTime::ToMilliseconds(GRenderThreadTime);
+        const float RHIThreadMs    = FPlatformTime::ToMilliseconds(GRHIThreadTime);
+        const float GPUFrameMs     = FPlatformTime::ToMilliseconds(GGPUFrameTime);
+
+        // FApp::GetDeltaTime is the engine's last frame delta in seconds.
+        const float DeltaTimeMs = FApp::GetDeltaTime() * 1000.0f;
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"get_pie_perf_stats\",")
+            TEXT("\"pie_running\":%s,\"average_fps\":%f,\"average_frame_ms\":%f,")
+            TEXT("\"delta_time_ms\":%f,")
+            TEXT("\"game_thread_ms\":%f,\"render_thread_ms\":%f,")
+            TEXT("\"rhi_thread_ms\":%f,\"gpu_frame_ms\":%f,")
+            TEXT("\"frame_counter\":%llu}\n"),
+            bRunning ? TEXT("true") : TEXT("false"),
+            GAverageFPS, GAverageMS,
+            DeltaTimeMs,
+            GameThreadMs, RenderThreadMs,
+            RHIThreadMs, GPUFrameMs,
+            (unsigned long long)GFrameCounter);
+    }
+
     // ===== v8.3 — Input simulation (v9.9.0 extends with duration + player movement) =====
 
     FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex, float DurationSec)
@@ -7298,7 +7357,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.20.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.21.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -9338,6 +9397,22 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(CmdName, TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.21.0 get_pie_perf_stats (closes rev15 ISSUE-1) ---
+    // No JSON params required — just marshal to the game thread and read globals.
+    if (Command.Equals(TEXT("get_pie_perf_stats"), ESearchCase::IgnoreCase))
+    {
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise)]() mutable
+            {
+                Promise.SetValue(GetPIEPerfStatsOnGameThread());
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("get_pie_perf_stats"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

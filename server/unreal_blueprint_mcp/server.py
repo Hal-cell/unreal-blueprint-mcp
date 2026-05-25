@@ -1075,6 +1075,30 @@ def add_node(
             - Short name (v0+v1 whitelist): `PrintString`, `Delay`,
               `SetTimerByEvent`, `ClearAndInvalidateTimerByHandle`
             - Fully qualified: `K2Node_CallFunction:KismetSystemLibrary.PrintString`
+
+            **v9.21.0 — common KismetArrayLibrary function names** (closes
+            rev15 ISSUE-2). Display names in the editor often differ from
+            the C++ function names; use the C++ name here:
+                - ``KismetArrayLibrary.Array_Add``        (display: "ADD",         append by value)
+                - ``KismetArrayLibrary.Array_AddUnique``  (display: "ADD UNIQUE")
+                - ``KismetArrayLibrary.Array_Get``        (display: "GET (a copy)", index access)
+                - ``KismetArrayLibrary.Array_Set``        (display: "SET ARRAY ELEM", index write)
+                - ``KismetArrayLibrary.Array_Length``     (display: "LENGTH")
+                - ``KismetArrayLibrary.Array_IsEmpty``    (display: "IS EMPTY")
+                - ``KismetArrayLibrary.Array_Contains``   (display: "CONTAINS")
+                - ``KismetArrayLibrary.Array_Find``       (display: "FIND ITEM",   returns index)
+                - ``KismetArrayLibrary.Array_Insert``     (display: "INSERT",      by index)
+                - ``KismetArrayLibrary.Array_Remove``     (display: "REMOVE INDEX", **by index**)
+                - ``KismetArrayLibrary.Array_RemoveItem`` (display: "REMOVE",      **by value**)
+                - ``KismetArrayLibrary.Array_Clear``      (display: "CLEAR")
+                - ``KismetArrayLibrary.Array_Reverse``    (display: "REVERSE")
+                - ``KismetArrayLibrary.Array_Shuffle``    (display: "SHUFFLE")
+                - ``KismetArrayLibrary.Array_LastIndex``  (display: "LAST INDEX")
+                - ``KismetArrayLibrary.Array_Append``     (display: "APPEND ARRAY")
+            All resolve to ``K2Node_CallArrayFunction`` automatically (v9.19.0)
+            so wildcard ``TargetArray`` propagates when connected to a typed
+            array pin. Note: ``Array_Remove`` takes an **index**; for value
+            removal use ``Array_RemoveItem``.
         anchor_name: User-given label. **Stored as the node's comment in the editor**
             and used to reference this node in subsequent tools (set_pin_default,
             connect_pins, ...). Must be unique within the target graph.
@@ -3782,6 +3806,51 @@ def is_pie_running() -> dict[str, Any]:
         ticked through yet.
     """
     return _send_command({"command": "is_pie_running"})
+
+
+@mcp.tool()
+def get_pie_perf_stats() -> dict[str, Any]:
+    """Read engine runtime perf globals — v9.21.0 (closes rev15 ISSUE-1).
+
+    Equivalent to ``stat unit`` in the UE viewport. Lets you **quantify**
+    optimization effects (e.g. "before X ms → after Y ms" on a Tick-heavy
+    Blueprint) instead of guessing from PrintString counters.
+
+    Works in both editor-idle and PIE — the engine ticks these globals
+    unconditionally. ``pie_running`` is reported so you can distinguish
+    "editor sitting idle at 120 FPS" from "PIE under real workload".
+
+    Typical use:
+        1. ``start_pie`` and let it warm up a few frames.
+        2. ``get_pie_perf_stats`` → record baseline ``average_frame_ms``.
+        3. Trigger the workload (e.g. spam ``pie_press_key`` to spawn ripples).
+        4. ``get_pie_perf_stats`` again → diff to see the cost.
+        5. Apply optimization, repeat steps 1-4, compare deltas.
+
+    Returns:
+        ``{"ok": True, "command": "get_pie_perf_stats",
+            "pie_running": bool,
+            "average_fps": float,          # GAverageFPS (rolling)
+            "average_frame_ms": float,     # GAverageMS (rolling, ms/frame)
+            "delta_time_ms": float,        # FApp::GetDeltaTime() last frame
+            "game_thread_ms": float,       # GGameThreadTime — gameplay cost
+            "render_thread_ms": float,     # GRenderThreadTime — RT cost
+            "rhi_thread_ms": float,        # GRHIThreadTime — RHI cost
+            "gpu_frame_ms": float,         # GGPUFrameTime — GPU cost
+            "frame_counter": int}``        # GFrameCounter (total frames since engine startup)
+
+        All times are in milliseconds. ``stat unit``'s "Frame / Game / Draw / GPU"
+        readouts correspond to ``average_frame_ms`` / ``game_thread_ms`` /
+        ``render_thread_ms`` / ``gpu_frame_ms``.
+
+        Errors: ``game_thread_timeout`` (rare — game thread hung).
+
+    Note: GPU time may be 0 in headless / no-GPU situations; render/RHI may
+    be near-zero in the editor if nothing is drawing. The ``average_*``
+    fields are smoothed over ~0.5s by the engine, so a single bad frame
+    won't dominate them.
+    """
+    return _send_command({"command": "get_pie_perf_stats"})
 
 
 @mcp.tool()

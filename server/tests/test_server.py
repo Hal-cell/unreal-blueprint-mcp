@@ -5048,3 +5048,94 @@ def test_ping_returns_plugin_version_9_20_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.20.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.21.0 — get_pie_perf_stats + add_node docstring (closes rev15)
+# ---------------------------------------------------------------------------
+
+
+def test_get_pie_perf_stats_success() -> None:
+    """v9.21.0: get_pie_perf_stats returns frame/thread timings + FPS."""
+    response = (
+        b'{"ok":true,"command":"get_pie_perf_stats",'
+        b'"pie_running":true,"average_fps":120.5,"average_frame_ms":8.298755,'
+        b'"delta_time_ms":8.333333,'
+        b'"game_thread_ms":4.123456,"render_thread_ms":2.345678,'
+        b'"rhi_thread_ms":0.456789,"gpu_frame_ms":3.789012,'
+        b'"frame_counter":1234567}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.get_pie_perf_stats()
+    assert r["ok"] is True
+    assert r["pie_running"] is True
+    assert r["average_fps"] == 120.5
+    assert r["average_frame_ms"] == 8.298755
+    assert r["delta_time_ms"] == 8.333333
+    assert r["game_thread_ms"] == 4.123456
+    assert r["render_thread_ms"] == 2.345678
+    assert r["rhi_thread_ms"] == 0.456789
+    assert r["gpu_frame_ms"] == 3.789012
+    assert r["frame_counter"] == 1234567
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "get_pie_perf_stats"}
+
+
+def test_get_pie_perf_stats_editor_idle() -> None:
+    """v9.21.0: editor-idle case — pie_running=false, perf globals still tick."""
+    response = (
+        b'{"ok":true,"command":"get_pie_perf_stats",'
+        b'"pie_running":false,"average_fps":59.94,"average_frame_ms":16.683333,'
+        b'"delta_time_ms":16.66,'
+        b'"game_thread_ms":1.0,"render_thread_ms":0.5,'
+        b'"rhi_thread_ms":0.1,"gpu_frame_ms":0.0,'
+        b'"frame_counter":42}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_pie_perf_stats()
+    assert r["ok"] is True
+    assert r["pie_running"] is False
+    assert r["average_fps"] == 59.94
+    # GPU may legitimately be 0 in headless/no-GPU situations
+    assert r["gpu_frame_ms"] == 0.0
+
+
+def test_get_pie_perf_stats_timeout_error() -> None:
+    """v9.21.0: surfaces game_thread_timeout if the GT hangs."""
+    response = (
+        b'{"ok":false,"command":"get_pie_perf_stats",'
+        b'"error":"game_thread_timeout"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.get_pie_perf_stats()
+    assert r["ok"] is False
+    assert r["error"] == "game_thread_timeout"
+
+
+def test_add_node_docstring_lists_kismet_array_library() -> None:
+    """v9.21.0 (rev15 ISSUE-2): add_node docstring lists the common
+    KismetArrayLibrary function names so callers don't have to guess
+    between display name and C++ function name."""
+    doc = server.add_node.__doc__ or ""
+    # Sentinel — section header
+    assert "KismetArrayLibrary" in doc
+    # The historically-confusing pair: index vs value remove
+    assert "Array_Remove" in doc
+    assert "Array_RemoveItem" in doc
+    # A handful of the staples
+    for fn in ("Array_Add", "Array_Get", "Array_Set", "Array_Length", "Array_Contains", "Array_Insert"):
+        assert fn in doc, f"missing {fn} in add_node docstring"
+
+
+def test_ping_returns_plugin_version_9_21_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.21.0","build_date":"May 25 2026 12:00:00",'
+        b'"timestamp":"2026-05-25T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.21.0"
