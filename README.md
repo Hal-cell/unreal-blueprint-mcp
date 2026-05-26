@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.21.0](https://img.shields.io/badge/version-v9.21.0-brightgreen)](#status)
+[![v9.22.0](https://img.shields.io/badge/version-v9.22.0-brightgreen)](#status)
 [![91 tools](https://img.shields.io/badge/tools-91-blue)](#tools)
-[![292 tests](https://img.shields.io/badge/tests-292%20passing-success)](#requirements)
+[![302 tests](https://img.shields.io/badge/tests-302%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -84,7 +84,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.19.0** | ✅ Specialized K2Node subclass for array funcs (closes rev13): `add_node` picks `UK2Node_CallArrayFunction` for any UFUNCTION with `MD_ArrayParam` metadata (was always generic `UK2Node_CallFunction`, which lacks `PropagateArrayTypeInfo`). `connect_pins` calls BOTH `PinConnectionListChanged` AND `NodeConnectionListChanged` so wildcards propagate on Array_*, ForEachLoop, Select, PromotableOperator alike. Array_Add wired into exec chain now compiles with zero "undetermined" warnings |
 | **v9.20.0** | ✅ `get_material` (closes rev14 ISSUE-1 — material is now READABLE end-to-end with anchors+classes+properties+wires+material-level flags, enabling cross-session edits) + `get_blueprint` filter kwargs (closes rev14 ISSUE-2 — slice large BPs by section / anchor substring, ~17× shrink possible) + `add_macro` docstring fix for ForEachLoop's `Exec` (capital) vs ForLoop's `execute` (lowercase) (rev14 ISSUE-3) |
 | **v9.21.0** | ✅ `get_pie_perf_stats` (closes rev15 ISSUE-1 — reads engine perf globals: `average_fps` / `average_frame_ms` / `delta_time_ms` / `game_thread_ms` / `render_thread_ms` / `rhi_thread_ms` / `gpu_frame_ms` / `frame_counter` / `pie_running`; equivalent of `stat unit` so optimization tasks can quantify before/after) + `add_node` docstring lists common `KismetArrayLibrary` C++ names with display-name mapping (closes rev15 ISSUE-2 — calls out `Array_Remove` takes index vs `Array_RemoveItem` takes value, plus 13 other staples) |
-| **Unit tests** | **292 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.22.0** | ✅ Four rev16 fixes: `add_component_get` regression on ISM (closes rev16 ISSUE-1 — force-compile + pin synthesis so SCS-added components' Get nodes always have output pins, even without a manual `compile_blueprint` in between) + `connect_pins` int→real auto-conversion now reports `ok=true, conversion_inserted=true` instead of `connection_dropped` (closes rev16 ISSUE-2 — handles `CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE` via link-delta check) + `list_level_actors(world="auto"\|"editor"\|"pie")` so the LLM can see PIE-spawned actors during a running PIE session (closes rev16 ISSUE-3) + `add_property_set` docstring documents the deferred-spawn-needs-Cast pattern (closes rev16 ISSUE-4 — `BeginDeferredActorSpawnFromClass.ReturnValue` is base-`Actor`-typed even with a concrete `ActorClass`) |
+| **Unit tests** | **302 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements

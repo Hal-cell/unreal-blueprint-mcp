@@ -6,7 +6,97 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.21.0.
+Everything shipped through v9.22.0.
+
+---
+
+## [v9.22.0] — 2026-05-26 — add_component_get ISM + connect_pins auto-conversion + list_level_actors world (closes rev16 ISSUE-1/2/3/4)
+
+### Closes rev16 issues
+
+rev16 ("infinite cube tunnel" — 2 new BPs, ~70 nodes, multi-segment
+self-spawning ISM tunnels with destroy-on-pass + 6 motion modes + height-
+color material) was the largest single build to date and exercised the
+surface harder than any previous round. Four real issues surfaced:
+
+- **ISSUE-1** (medium) — `add_component_get` returned `pins=[]` for an ISM
+  component. Root cause: `K2Node_VariableGet::AllocateDefaultPins` →
+  `GetPropertyForVariable` returns nullptr when the SCS component's
+  FProperty hasn't surfaced on the generated class (no compile since
+  `add_component`). User had to fall back to `GetComponentByClass`. This
+  is a regression of the rev7 ISSUE-1 closure for any newly-added SCS
+  component the caller hadn't recompiled.
+- **ISSUE-2** (low-medium) — `connect_pins` reported `connection_dropped`
+  on int → real wires. The v9.18 verification check only looked for a
+  direct `LinkedTo`, missing the indirect link the UE schema makes via
+  `Conv_IntToDouble` (`CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE`).
+- **ISSUE-3** (low-medium) — `list_level_actors` returned empty during PIE.
+  `UEditorActorSubsystem::GetAllLevelActors()` always returns the editor
+  preview world's actors; spawned-at-runtime actors live in `PlayWorld`.
+  Runtime spawn verification required PrintString-and-grep-log probes.
+- **ISSUE-4** (docs) — `BeginDeferredActorSpawnFromClass.ReturnValue` is
+  base-`Actor`-typed even when `ActorClass` is concrete (UE doesn't narrow
+  from class pin like the `K2Node_SpawnActorFromClass` convenience node
+  does). Wiring directly to `add_property_set(target_class="BP_X")` fails
+  with `incompatible_pins`. Pattern is "insert an `add_cast` in between" —
+  docstring now says so.
+
+### Added — 0 new tools + 4 fixes (90 → 90, no new surface — rev16 fixes regressions and extends existing tools)
+
+- **`add_component_get` — ISM regression fix**: force-compile the BP if
+  the SCS component's FProperty isn't on the generated class yet, then
+  belt-and-braces synthesize the output pin from the SCS template's
+  ComponentClass if `AllocateDefaultPins` still produces nothing. Closes
+  rev16 ISSUE-1.
+
+- **`connect_pins` — auto-conversion accepted as success**: capture
+  link-count delta before/after `TryCreateConnection`. Both
+  (a) direct link AND (b) both pins gained a link (conversion node
+  inserted between them) are success. Only fire `connection_dropped`
+  if neither happens (the genuine v9.18 wildcard-silent-drop case).
+  New JSON field: `conversion_inserted: bool` surfaces graph-topology
+  changes to the caller (the inserted `Conv_*` node has no user anchor,
+  so the LLM needs to know it exists). Closes rev16 ISSUE-2.
+
+- **`list_level_actors(world=)` — runtime visibility**: new
+  `world="auto"|"editor"|"pie"` kwarg. Default `"auto"` switches to
+  PlayWorld if PIE is running, otherwise editor world. Walks
+  `World->GetLevels()` directly (covers WP-streamed sublevels for both).
+  Response now includes the `world` tag. Errors: `pie_not_running`
+  (`world="pie"` requested without PIE), `invalid_world` (unknown mode).
+  Closes rev16 ISSUE-3.
+
+- **`add_property_set` docstring — deferred-spawn cast pattern**: explains
+  that `BeginDeferredActorSpawnFromClass.ReturnValue` is base-`Actor`-typed
+  and needs an intermediate `add_cast` before hitting `Target/self`.
+  Closes rev16 ISSUE-4.
+
+### Verification
+
+Live smoke on TESTMCP:
+- **FIX #1**: `add_component_get(ISMComponent)` without explicit compile →
+  `pins=[{name: "Cubes", direction: "output", type: "object"}]` ✅
+- **FIX #2**: `connect_pins(int_var.IntVar → MakeVector.X)` →
+  `ok=true, conversion_inserted=true` ✅
+  Direct exec wire → `ok=true, conversion_inserted=false` (control)
+- **FIX #3**: spawn `BP_v922Test` into editor → `world="auto"` returns
+  `world: "editor", count: 1`. `start_pie` → `world="auto"` returns
+  `world: "pie", count: 1`. `stop_pie` → `world="pie"` surfaces
+  `pie_not_running` error. `world="galaxy"` → `invalid_world` ✅
+
+Integration: 10/10 passed clean.
+
+### `ping.plugin_version`
+"9.21.0" → **"9.22.0"**.
+
+### Known leftover (no fix this round)
+
+- One PIE-end GC crash observed during the 3-batch spawn iteration
+  (`IncrementalPurgeGarbage` in `UEditorEngine::EndPlayMap()`), did not
+  recur after reducing batch to 2. Not a plugin bug — looks like UE 5.4's
+  known ISM/MID PIE-shutdown GC flake. Would need the user's
+  `Saved/Crashes/UELog.txt` to root-cause; nothing the plugin tooling
+  can change here.
 
 ---
 
