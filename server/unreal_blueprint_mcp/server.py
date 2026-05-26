@@ -1229,13 +1229,19 @@ def list_level_actors(
     name_contains: str = "",
     max_results: int = 500,
     include_bounds: bool = False,
+    world: str = "auto",
 ) -> dict[str, Any]:
-    """List actors in the current editor level — v9.7.0 + v9.11.0 bounds.
+    """List actors in the current level — v9.7.0 + v9.11.0 bounds + v9.22.0 world.
 
     Lets the LLM see the level layout instead of being blind to the scene.
     Each actor is reported with its `name` (canonical UE name, what
     ``spawn_actor`` returns), `label` (Outliner display), `class`, and
     world-space `location` [X, Y, Z].
+
+    **v9.22.0 — runtime-spawn visibility** (closes rev16 ISSUE-3): can now
+    inspect the PIE world's actors during a running PIE session, not just
+    the editor preview world. Use this to verify "is the spawn chain still
+    firing?" without needing PrintString-and-read-log probes.
 
     Args:
         class_filter: Restrict to actors of this class. Accepts a bare
@@ -1249,15 +1255,28 @@ def list_level_actors(
             same shape as ``AActor::GetActorBounds``). Useful for
             scanning a level for "what can I place stuff against."
             Off by default — bounds query has a per-actor cost.
+        world: **v9.22.0** — which world to inspect:
+            - ``"auto"`` (default) — use PIE PlayWorld if a PIE session
+              is running, otherwise the editor world. Recommended.
+            - ``"editor"`` — always the editor preview world (legacy
+              v9.7 behaviour; runtime-spawned actors invisible).
+            - ``"pie"`` — require a PIE session; returns ``pie_not_running``
+              error if none is active.
+            For BP_Class filters during PIE: the runtime class name has a
+            ``_C`` suffix (``BP_TunnelSegment_C``). Pass that exact name.
 
     Returns:
         ``{"ok": True, "actors": [{"name", "label", "class", "location",
                                     + "bounds_origin", "bounds_extent" if include_bounds}, ...],
-            "count": N, "class_filter": "..."}``
+            "count": N, "class_filter": "...", "world": "editor"|"pie"}``
+        ``world`` reports which world was actually inspected — useful when
+        the default ``"auto"`` switched modes between calls.
 
     Common errors:
         class_not_found       — class_filter didn't resolve to a UClass
-        no_editor / no_actor_subsystem — editor unavailable
+        invalid_world         — world not in {"auto","editor","pie"}
+        pie_not_running       — world="pie" but no active PIE
+        no_editor_world       — editor world unresolvable (rare)
     """
     payload: dict[str, Any] = {
         "command": "list_level_actors",
@@ -1269,6 +1288,8 @@ def list_level_actors(
         payload["name_contains"] = name_contains
     if include_bounds:
         payload["include_bounds"] = True
+    if world and world != "auto":
+        payload["world"] = world
     return _send_command(payload)
 
 
@@ -1505,12 +1526,27 @@ def connect_pins(
         For nodes added via `add_node`, use the `anchor_name` you provided.
 
     Returns:
-        On success: {"ok": True, "from": "...", "to": "...", "saved": True}
-        On error:   {"ok": False, "error": "...", "detail": "..."}
+        On success: ``{"ok": True, "from": "...", "to": "...",
+                       "from_container": "none|array|set|map",
+                       "to_container":   "none|array|set|map",
+                       "conversion_inserted": bool,
+                       "saved": True}``
+
+            **v9.22.0** — ``conversion_inserted=True`` means UE's schema dropped
+            an autocast node (e.g. ``Conv_IntToDouble``) between the two pins.
+            The connection still succeeds; the LLM just needs to know an
+            extra node exists in the graph (it doesn't have a user-provided
+            anchor, so it can't be referenced by name afterwards). Common
+            triggers: int → real, real → int, byte → int, int → string,
+            object → bool, etc.
+
+        On error:   ``{"ok": False, "error": "...", "detail": "..."}``
 
     The K2 schema enforces direction + type compatibility:
         - For exec: from must be output, to must be input
-        - For data: types must be compatible (UE may coerce automatically)
+        - For data: types must be compatible. UE inserts a Conv_* autocast
+          node when the types are "compatible with conversion" (int↔real,
+          byte↔int, etc.) — see ``conversion_inserted`` above.
 
     Common errors:
         invalid_pin_ref       - missing "." in pin_ref
@@ -1518,6 +1554,11 @@ def connect_pins(
         pin_not_found         - pin name not on that node (case-sensitive)
         incompatible_pins     - schema rejected the connection; UE's reason is in `detail`
         connection_failed     - schema allowed but TryCreateConnection returned false (rare)
+        connection_dropped    - schema accepted but NO link formed (neither direct nor via
+                                conversion node). Usually a wildcard source pin that
+                                couldn't infer its type — make sure the SOURCE pin has
+                                a concrete type. v9.22.0 narrowed this to only fire when
+                                truly nothing happened, not when a Conv node was inserted.
         game_thread_timeout   - 10s deadline exceeded
     """
     payload: dict[str, Any] = {
@@ -2588,6 +2629,21 @@ def add_property_set(
       - input pin named after the property (the new value)
       - output pin named after the property (the post-set value)
 
+    **v9.22.0 — deferred-spawn pattern note** (rev16 ISSUE-4): if you're
+    setting a property on a newly-spawned actor via
+    ``BeginDeferredActorSpawnFromClass`` + ``FinishSpawningActor``, the
+    `BeginDeferred...ReturnValue` pin's static type is `Actor` (base class)
+    even when you passed a concrete ``ActorClass``. UE does NOT narrow the
+    return type from the class pin like ``SpawnActorFromClass`` (the
+    convenience K2Node) does. So wiring it directly to ``Target`` of an
+    ``add_property_set(target_class="BP_MyThing")`` will fail with
+    ``incompatible_pins: Actor Object Reference is not compatible with BP MyThing``.
+    Fix: insert an ``add_cast(target_class="/Game/.../BP_MyThing.BP_MyThing_C")``
+    between them and wire ``BeginDeferred.ReturnValue → cast.Object``,
+    ``cast.As<BP_MyThing> → property_set.self``, then continue to
+    ``FinishSpawningActor``. The Cast's ``CastFailed`` is defensive — in
+    practice it never fails here.
+
     Args:
         blueprint: BP asset path (the BP whose graph we're editing).
         target_class: The class the property lives on. Native short name
@@ -2669,7 +2725,7 @@ def add_component_get(
     position_y: int = 0,
     graph_name: str = "",
 ) -> dict[str, Any]:
-    """Add a Get node for one of the BP's own components — v9.13.0.
+    """Add a Get node for one of the BP's own components — v9.13.0 + v9.22.0 ISM fix.
 
     Closes rev7 ISSUE-1. Previously the only way to reference a BP's
     component in its EventGraph was ``GetComponentByClass``, which
@@ -2682,6 +2738,16 @@ def add_component_get(
     The output pin's type is the component's class. Wire it into any
     function's Target/Self pin that expects that class (e.g. the ISM's
     ``Target`` pin on ``AddInstance``).
+
+    **v9.22.0 — ISM regression fix** (rev16 ISSUE-1): if the BP hadn't
+    been recompiled since the SCS component was added (e.g. you just
+    called ``add_component`` and went straight to ``add_component_get``),
+    UE's ``K2Node_VariableGet::AllocateDefaultPins`` couldn't find the
+    component's FProperty on the generated class and produced an empty
+    ``pins[]`` array. ``add_component_get`` now (a) force-compiles the BP
+    if the FProperty is missing, then (b) synthesizes the pin directly
+    from the SCS template class as a belt-and-braces fallback. Both
+    paths are no-ops if the FProperty was already surfaced.
 
     Args:
         blueprint: Full BP asset path.

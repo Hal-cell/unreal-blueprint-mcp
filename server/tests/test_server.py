@@ -5139,3 +5139,171 @@ def test_ping_returns_plugin_version_9_21_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.21.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.22.0 — rev16 fixes (ISM component_get + connect_pins int→real
+# conversion-inserted + list_level_actors world kwarg + docstring catch-ups)
+# ---------------------------------------------------------------------------
+
+
+def test_connect_pins_surfaces_conversion_inserted_true() -> None:
+    """v9.22.0 — rev16 ISSUE-2: int → real auto-conversion now reports
+    success with conversion_inserted=True, not connection_dropped."""
+    response = (
+        b'{"ok":true,"command":"connect_pins",'
+        b'"from":"b_x.ReturnValue","to":"b_loc.X",'
+        b'"from_container":"none","to_container":"none",'
+        b'"conversion_inserted":true,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_pins(
+            blueprint="/Game/BP_Test",
+            from_pin="b_x.ReturnValue",
+            to_pin="b_loc.X",
+        )
+    assert r["ok"] is True
+    assert r["conversion_inserted"] is True
+    assert r["from_container"] == "none"
+    assert r["to_container"] == "none"
+
+
+def test_connect_pins_surfaces_conversion_inserted_false() -> None:
+    """v9.22.0 — direct link (no conversion) still reports
+    conversion_inserted=False for symmetry."""
+    response = (
+        b'{"ok":true,"command":"connect_pins",'
+        b'"from":"a.then","to":"b.execute",'
+        b'"from_container":"none","to_container":"none",'
+        b'"conversion_inserted":false,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_pins(
+            blueprint="/Game/BP_Test",
+            from_pin="a.then",
+            to_pin="b.execute",
+        )
+    assert r["ok"] is True
+    assert r["conversion_inserted"] is False
+
+
+def test_connect_pins_dropped_error_unchanged() -> None:
+    """v9.22.0 — the wildcard-silent-drop case (no link AND no conv inserted)
+    still surfaces connection_dropped (v9.18 behaviour preserved)."""
+    response = (
+        b'{"ok":false,"command":"connect_pins","error":"connection_dropped",'
+        b'"detail":"Schema accepted x.Y -> z.W but no link formed (neither '
+        b'direct nor via conversion node). Common cause: a wildcard pin..."}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.connect_pins(
+            blueprint="/Game/BP_Test",
+            from_pin="x.Y",
+            to_pin="z.W",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "connection_dropped"
+
+
+def test_list_level_actors_default_omits_world_field() -> None:
+    """v9.22.0 — world='auto' (default) is implicit; the payload omits
+    the field so existing servers (pre-v9.22) don't see an unknown key."""
+    response = (
+        b'{"ok":true,"command":"list_level_actors","class_filter":"",'
+        b'"world":"editor","actors":[],"count":0}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.list_level_actors()
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "world" not in sent_dict
+
+
+def test_list_level_actors_explicit_pie_world() -> None:
+    """v9.22.0 — world='pie' surfaces in payload; response carries the
+    world tag the plugin actually inspected."""
+    response = (
+        b'{"ok":true,"command":"list_level_actors","class_filter":"BP_TunnelSegment_C",'
+        b'"world":"pie","actors":[{"name":"BP_TunnelSegment_C_2","label":"BP_TunnelSegment_2",'
+        b'"class":"BP_TunnelSegment_C","location":[100,0,0]}],"count":1}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.list_level_actors(class_filter="BP_TunnelSegment_C", world="pie")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["world"] == "pie"
+    assert sent_dict["class_filter"] == "BP_TunnelSegment_C"
+    assert r["ok"] is True
+    assert r["world"] == "pie"
+    assert r["count"] == 1
+
+
+def test_list_level_actors_pie_not_running_error() -> None:
+    """v9.22.0 — world='pie' but no PIE → pie_not_running error."""
+    response = (
+        b'{"ok":false,"command":"list_level_actors","error":"pie_not_running",'
+        b'"detail":"world=\'pie\' requested but no active PIE session"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_level_actors(world="pie")
+    assert r["ok"] is False
+    assert r["error"] == "pie_not_running"
+
+
+def test_list_level_actors_invalid_world() -> None:
+    """v9.22.0 — anything else → invalid_world."""
+    response = (
+        b'{"ok":false,"command":"list_level_actors","error":"invalid_world",'
+        b'"detail":"world must be \'auto\' | \'editor\' | \'pie\' (got \'xyz\')"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_level_actors(world="xyz")
+    assert r["ok"] is False
+    assert r["error"] == "invalid_world"
+
+
+def test_add_component_get_succeeds_with_ism_pin_synth() -> None:
+    """v9.22.0 — rev16 ISSUE-1: add_component_get for an ISM that had no
+    surfaced FProperty now returns a non-empty pins[] (either via the
+    force-compile path or the manual pin synthesis fallback)."""
+    response = (
+        b'{"ok":true,"command":"add_component_get","anchor_name":"sg_ism",'
+        b'"component_name":"Cubes","component_class":"/Script/Engine.InstancedStaticMeshComponent",'
+        b'"node_guid":"00000000-0000-0000-0000-000000000001",'
+        b'"pins":[{"name":"Cubes","direction":"output","type":"object","container":"none"}],'
+        b'"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component_get(
+            blueprint="/Game/BP_TunnelSegment",
+            component_name="Cubes",
+            anchor_name="sg_ism",
+        )
+    assert r["ok"] is True
+    assert len(r["pins"]) == 1
+    assert r["pins"][0]["name"] == "Cubes"
+    assert r["pins"][0]["direction"] == "output"
+
+
+def test_add_property_set_docstring_mentions_deferred_spawn_cast() -> None:
+    """v9.22.0 — rev16 ISSUE-4: docstring tells callers to insert a
+    DynamicCast between BeginDeferredActorSpawnFromClass and add_property_set
+    because the spawn node's ReturnValue is base-Actor typed."""
+    doc = server.add_property_set.__doc__ or ""
+    assert "BeginDeferredActorSpawnFromClass" in doc
+    assert "Cast" in doc or "cast" in doc
+    # The specific failure mode it's preventing
+    assert "incompatible_pins" in doc or "not compatible" in doc
+
+
+def test_ping_returns_plugin_version_9_22_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.22.0","build_date":"May 26 2026 12:00:00",'
+        b'"timestamp":"2026-05-26T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.22.0"

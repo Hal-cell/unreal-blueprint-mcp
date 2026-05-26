@@ -1973,6 +1973,26 @@ namespace
                     *ComponentName, *BlueprintPath));
         }
 
+        // v9.22.0 — rev16 ISSUE-1 fix:
+        // K2Node_VariableGet::AllocateDefaultPins calls GetPropertyForVariable()
+        // → VariableReference.ResolveMember<FProperty>(GeneratedClass). For an
+        // SCS component, that FProperty only exists AFTER the BP has been
+        // compiled since the add_component call. If it's missing, no output
+        // pin is created → empty pins[] → subsequent connect_pins fails with
+        // pin_not_found.
+        //
+        // rev16 hit this on an ISMComponent that hadn't been recompiled
+        // between add_component and add_component_get. Force-compile if the
+        // FProperty isn't surfaced yet. (No-op if it already is — quick
+        // single FindPropertyByName check.)
+        const bool bPropertySurfaced =
+            Blueprint->GeneratedClass != nullptr
+            && Blueprint->GeneratedClass->FindPropertyByName(ComponentFName) != nullptr;
+        if (!bPropertySurfaced)
+        {
+            FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        }
+
         // Anchor uniqueness within the chosen graph
         if (FindNodeByAnchor(TargetGraph, AnchorName) != nullptr)
             return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
@@ -1989,6 +2009,31 @@ namespace
         GetNode->CreateNewGuid();
         GetNode->PostPlacedNewNode();
         GetNode->AllocateDefaultPins();
+
+        // v9.22.0 — rev16 ISSUE-1 belt-and-braces:
+        // If AllocateDefaultPins STILL didn't produce the variable's output
+        // pin (e.g. the compile above failed silently, or the FProperty
+        // resolution disagrees with the SCS template), synthesize the pin
+        // from the SCS-resolved ComponentClass so connect_pins has something
+        // to bind to. Without this, the caller's only recourse is the
+        // GetComponentByClass workaround that rev16 documented.
+        bool bHasOutputPin = false;
+        for (const UEdGraphPin* Pin : GetNode->Pins)
+        {
+            if (Pin != nullptr && Pin->Direction == EGPD_Output
+                && Pin->PinName == ComponentFName)
+            {
+                bHasOutputPin = true;
+                break;
+            }
+        }
+        if (!bHasOutputPin && ResolvedComponentClass != nullptr)
+        {
+            FEdGraphPinType PinType;
+            PinType.PinCategory = UEdGraphSchema_K2::PC_Object;
+            PinType.PinSubCategoryObject = ResolvedComponentClass;
+            GetNode->CreatePin(EGPD_Output, PinType, ComponentFName);
+        }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
@@ -4470,16 +4515,50 @@ namespace
         const FString& ClassFilter,
         const FString& NameContains,
         int32 MaxResults,
-        bool bIncludeBounds)   // v9.11.0 ISSUE-2 — opt-in per-actor world bounds
+        bool bIncludeBounds,           // v9.11.0 ISSUE-2 — opt-in per-actor world bounds
+        const FString& WorldSelector)  // v9.22.0 rev16 ISSUE-3 — "auto"|"editor"|"pie"
     {
         check(IsInGameThread());
         const TCHAR* CmdName = TEXT("list_level_actors");
 
         if (GEditor == nullptr)
             return JsonError(CmdName, TEXT("no_editor"), TEXT("GEditor null"));
-        UEditorActorSubsystem* AS = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
-        if (AS == nullptr)
-            return JsonError(CmdName, TEXT("no_actor_subsystem"));
+
+        // v9.22.0 — rev16 ISSUE-3: choose which world to inspect.
+        // Previously this always asked the editor subsystem, which during PIE
+        // returns the *preview* editor world (no runtime-spawned actors).
+        // Modes:
+        //   auto   (default): use PIE PlayWorld if PIE is running, else editor world.
+        //   pie             : require PIE; error if not running.
+        //   editor          : always the editor world (legacy v9.7 behaviour).
+        FString Mode = WorldSelector.IsEmpty() ? TEXT("auto") : WorldSelector.ToLower();
+        if (Mode != TEXT("auto") && Mode != TEXT("editor") && Mode != TEXT("pie"))
+        {
+            return JsonError(CmdName, TEXT("invalid_world"),
+                FString::Printf(TEXT("world must be 'auto' | 'editor' | 'pie' (got '%s')"), *WorldSelector));
+        }
+
+        UWorld* World = nullptr;
+        FString ActiveWorld;   // for response — which world we actually used
+        if (Mode == TEXT("pie") || (Mode == TEXT("auto") && GEditor->PlayWorld != nullptr))
+        {
+            World = GEditor->PlayWorld;
+            ActiveWorld = TEXT("pie");
+            if (World == nullptr)
+                return JsonError(CmdName, TEXT("pie_not_running"),
+                    TEXT("world='pie' requested but no active PIE session"));
+        }
+        else
+        {
+            // editor mode (explicit or auto-fallback)
+            FWorldContext* WC = GEditor->GetEditorWorldContext().World()
+                ? &GEditor->GetEditorWorldContext() : nullptr;
+            World = (WC != nullptr) ? WC->World() : nullptr;
+            ActiveWorld = TEXT("editor");
+            if (World == nullptr)
+                return JsonError(CmdName, TEXT("no_editor_world"),
+                    TEXT("could not resolve editor world"));
+        }
 
         // Resolve class filter — accepts bare class name OR /Script/Module.Class
         UClass* FilterClass = nullptr;
@@ -4504,7 +4583,18 @@ namespace
                 return JsonError(CmdName, TEXT("class_not_found"), ClassFilter);
         }
 
-        TArray<AActor*> All = AS->GetAllLevelActors();
+        // v9.22.0 — walk the chosen world's levels directly (covers PIE
+        // runtime-spawned actors AND World-Partition streamed levels). For
+        // the editor world this matches the legacy GetAllLevelActors() output.
+        TArray<AActor*> All;
+        for (ULevel* Level : World->GetLevels())
+        {
+            if (Level == nullptr) continue;
+            for (AActor* A : Level->Actors)
+            {
+                if (A != nullptr) All.Add(A);
+            }
+        }
 
         FString OutJson;
         TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
@@ -4513,6 +4603,7 @@ namespace
         Writer->WriteValue(TEXT("ok"), true);
         Writer->WriteValue(TEXT("command"), CmdName);
         Writer->WriteValue(TEXT("class_filter"), ClassFilter);
+        Writer->WriteValue(TEXT("world"), ActiveWorld);   // v9.22.0
         Writer->WriteArrayStart(TEXT("actors"));
 
         int32 Count = 0;
@@ -4926,7 +5017,15 @@ namespace
                 CanConnect.Message.ToString());
         }
 
-        // 4. Actually connect
+        // v9.22.0 — rev16 ISSUE-2: capture link-count delta to distinguish
+        // (a) direct link formed, (b) auto-conversion node inserted between
+        // FromPin and ToPin, (c) nothing happened. (c) is the v9.18 silent-
+        // wildcard-drop case; (a) and (b) are both legitimate success.
+        const int32 FromLinksBefore = FromPin->LinkedTo.Num();
+        const int32 ToLinksBefore   = ToPin->LinkedTo.Num();
+
+        // 4. Actually connect — handles CONNECT_RESPONSE_MAKE,
+        //    MAKE_WITH_CONVERSION_NODE, BREAK_OTHERS_A/B/AB internally.
         const bool bConnected = Schema->TryCreateConnection(FromPin, ToPin);
         if (!bConnected)
         {
@@ -4937,15 +5036,27 @@ namespace
         // v9.18.0 — rev12 ISSUE-1 (b) fix: TryCreateConnection can return true
         // and still leave the pins disconnected — e.g. when Schema chose
         // MAKE_WITH_CONVERSION_NODE but the conversion didn't apply (notably
-        // for wildcard/array combos). Verify the link actually formed and
-        // bail with a loud error if not. The user's report had Array_Add's
-        // TargetArray apparently connected but silently dropped on next read.
-        const bool bLinkExists = FromPin->LinkedTo.Contains(ToPin)
+        // for wildcard/array combos). v9.22.0 — rev16 ISSUE-2 refinement:
+        // distinguish two cases here:
+        //   (a) direct link: FromPin->LinkedTo.Contains(ToPin) → easy success.
+        //   (b) conversion node inserted: NO direct link, but BOTH pins gained
+        //       a new link to a brand-new Conv_* node sitting between them.
+        //       This is what int → real / int → float etc. produces; rev16
+        //       reported these as "connection_dropped" because the old check
+        //       only looked for a direct link.
+        // Only (c) — no direct link AND no new links anywhere — is the real
+        // wildcard-silent-drop bug from v9.18; that's the only case we should
+        // still surface as connection_dropped.
+        const bool bDirectLink = FromPin->LinkedTo.Contains(ToPin)
                               || ToPin->LinkedTo.Contains(FromPin);
-        if (!bLinkExists)
+        const bool bFromGainedLink = FromPin->LinkedTo.Num() > FromLinksBefore;
+        const bool bToGainedLink   = ToPin->LinkedTo.Num()   > ToLinksBefore;
+        const bool bConversionInserted = !bDirectLink && bFromGainedLink && bToGainedLink;
+
+        if (!bDirectLink && !bConversionInserted)
         {
             return JsonError(TEXT("connect_pins"), TEXT("connection_dropped"),
-                FString::Printf(TEXT("Schema accepted %s -> %s (possibly inserting a conversion node) but no direct link formed. "
+                FString::Printf(TEXT("Schema accepted %s -> %s but no link formed (neither direct nor via conversion node). "
                                      "Common cause: a wildcard pin couldn't infer its type — make sure the SOURCE pin has a concrete type. "
                                      "If source is a variable_get on an array variable, verify the pin's container is 'array' (v9.18.0+ JSON shows this)."),
                     *FromPinRef, *ToPinRef));
@@ -4976,15 +5087,19 @@ namespace
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
         // 6. Response (echo back the canonical pin refs UE has + container info)
+        // v9.22.0: also report conversion_inserted so the LLM knows the graph
+        // topology gained an extra autocast node (e.g. Conv_IntToDouble).
         const FString FromContainer = GetContainerTypeString(FromPin->PinType);
         const FString ToContainer   = GetContainerTypeString(ToPin->PinType);
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"connect_pins\",\"from\":%s,\"to\":%s,")
-            TEXT("\"from_container\":%s,\"to_container\":%s,\"saved\":%s}\n"),
+            TEXT("\"from_container\":%s,\"to_container\":%s,")
+            TEXT("\"conversion_inserted\":%s,\"saved\":%s}\n"),
             *EscapeJsonString(FromPinRef),
             *EscapeJsonString(ToPinRef),
             *EscapeJsonString(FromContainer),
             *EscapeJsonString(ToContainer),
+            bConversionInserted ? TEXT("true") : TEXT("false"),
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -7357,7 +7472,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.21.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.22.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -8684,12 +8799,13 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         return Future.Get();
     }
 
-    // --- v9.7.0 list_level_actors (v9.11.0 include_bounds) ---
+    // --- v9.7.0 list_level_actors (v9.11.0 include_bounds + v9.22.0 world kwarg) ---
     if (Command.Equals(TEXT("list_level_actors"), ESearchCase::IgnoreCase))
     {
-        FString ClassFilter, NameContains;
+        FString ClassFilter, NameContains, WorldSelector;
         JsonObject->TryGetStringField(TEXT("class_filter"), ClassFilter);
         JsonObject->TryGetStringField(TEXT("name_contains"), NameContains);
+        JsonObject->TryGetStringField(TEXT("world"), WorldSelector);   // v9.22.0 rev16 ISSUE-3
         int32 MaxResults = 500;
         JsonObject->TryGetNumberField(TEXT("max_results"), MaxResults);
         bool bIncludeBounds = false;
@@ -8698,9 +8814,9 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         TPromise<FString> Promise;
         TFuture<FString> Future = Promise.GetFuture();
         AsyncTask(ENamedThreads::GameThread,
-            [Promise = MoveTemp(Promise), ClassFilter, NameContains, MaxResults, bIncludeBounds]() mutable
+            [Promise = MoveTemp(Promise), ClassFilter, NameContains, MaxResults, bIncludeBounds, WorldSelector]() mutable
             {
-                Promise.SetValue(ListLevelActorsOnGameThread(ClassFilter, NameContains, MaxResults, bIncludeBounds));
+                Promise.SetValue(ListLevelActorsOnGameThread(ClassFilter, NameContains, MaxResults, bIncludeBounds, WorldSelector));
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("list_level_actors"), TEXT("game_thread_timeout"));
