@@ -68,6 +68,10 @@
 // Spike B8: add_custom_event
 #include "K2Node_CustomEvent.h"
 
+// v9.24.0: add_component_bound_event — bind exec to a component's multicast delegate
+// (OnComponentHit, OnComponentBeginOverlap, OnClicked, etc.)
+#include "K2Node_ComponentBoundEvent.h"
+
 // Spike B9: add_variable (+ TimerHandle struct)
 #include "Engine/EngineTypes.h"  // FTimerHandle
 
@@ -1178,6 +1182,66 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.24.0 — delete_component (rev17 ISSUE-1: SCS deletion symmetry) =====
+    //
+    // Mirror of add_component. Find the SCS node by name and remove it from the
+    // SimpleConstructionScript. The component class's CDO entry on the
+    // generated class will go away on the next compile.
+    //
+    // Caller is responsible for first removing any graph-side references
+    // (`add_component_get` nodes referencing this component, `set_component_property`
+    // calls, etc.) — those won't be auto-cleaned, but `delete_node` already
+    // handles disconnecting their pins.
+
+    FString DeleteComponentOnGameThread(
+        const FString& BlueprintPath,
+        const FString& ComponentName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("delete_component");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+        if (SCS == nullptr)
+            return JsonError(CmdName, TEXT("no_scs"), BlueprintPath);
+
+        const FName ComponentFName(*ComponentName);
+        USCS_Node* Node = SCS->FindSCSNode(ComponentFName);
+        if (Node == nullptr)
+            return JsonError(CmdName, TEXT("component_not_found"),
+                FString::Printf(TEXT("'%s' not in SCS of '%s' (use add_component first; inherited "
+                                     "components from parent class cannot be removed here)"),
+                    *ComponentName, *BlueprintPath));
+
+        // Capture the class name for the response BEFORE removing.
+        const FString ComponentClassName = (Node->ComponentTemplate != nullptr)
+            ? Node->ComponentTemplate->GetClass()->GetName()
+            : FString(TEXT("<unknown>"));
+
+        // RemoveNodeAndPromoteChildren detaches the node and re-parents children
+        // (if it was a parent of attached components). RemoveNode just unhooks.
+        // We use RemoveNodeAndPromoteChildren so the BP doesn't end up with
+        // orphaned dangling children.
+        SCS->RemoveNodeAndPromoteChildren(Node);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        // Compile so the FProperty surface updates immediately — subsequent
+        // calls to set_component_property on this component will then fail
+        // cleanly with property_not_found instead of returning stale data.
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"delete_component\",\"component_name\":%s,")
+            TEXT("\"component_class\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(ComponentName),
+            *EscapeJsonString(ComponentClassName),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     // ===== v7.1 — set_component_property (FProperty reflection) =====
 
     /**
@@ -1542,6 +1606,172 @@ namespace
             *EscapeJsonString(EventName),
             *EscapeJsonString(GuidStr),
             ParamNames.Num(),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.24.0 — add_component_bound_event (rev17 ISSUE-2) =====
+    //
+    // Spawn a K2Node_ComponentBoundEvent that fires when a specific component's
+    // multicast delegate broadcasts. The most common use cases:
+    //   - PrimitiveComponent.OnComponentHit         (physics collision)
+    //   - PrimitiveComponent.OnComponentBeginOverlap (trigger volumes)
+    //   - PrimitiveComponent.OnComponentEndOverlap
+    //   - PrimitiveComponent.OnClicked / OnReleased
+    //   - StaticMeshComponent.OnComponentWake / OnComponentSleep
+    //   - UMG widgets: Button.OnClicked, etc. (when this BP is a UserWidget)
+    //
+    // Without this tool, the LLM was forced to use Tick-polling
+    // (GetAllActorsOfClass + per-frame distance/state check) instead of true
+    // event-driven flow — rev17's "ripple-on-hit" example degraded to
+    // O(N)-per-frame polling because of this gap.
+    //
+    // Implementation mirrors UBlueprintNodeBinder logic: the bound event needs
+    // (1) the component property (via UBlueprintDelegateNodeSpawner-style lookup),
+    // and (2) the delegate property on that component class. Then the K2Node's
+    // InitializeComponentBoundEventParams sets both up.
+
+    FString AddComponentBoundEventOnGameThread(
+        const FString& BlueprintPath,
+        const FString& ComponentName,
+        const FString& DelegateName,
+        const FString& AnchorName,
+        int32 PosX, int32 PosY,
+        const FString& GraphName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_component_bound_event");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* TargetGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (TargetGraph == nullptr)
+            return JsonGraphNotFound(CmdName, GraphName);
+
+        // 1. Resolve component → find its class via SCS or generated class
+        const FName ComponentFName(*ComponentName);
+        UClass* ComponentClass = nullptr;
+        FObjectProperty* ComponentProperty = nullptr;
+
+        USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+        if (SCS != nullptr)
+        {
+            USCS_Node* SCSNode = SCS->FindSCSNode(ComponentFName);
+            if (SCSNode != nullptr && SCSNode->ComponentTemplate != nullptr)
+            {
+                ComponentClass = SCSNode->ComponentTemplate->GetClass();
+            }
+        }
+        // Always look on the generated class too — for the FObjectProperty
+        // that K2Node_ComponentBoundEvent will reference.
+        if (Blueprint->GeneratedClass != nullptr)
+        {
+            FProperty* Prop = Blueprint->GeneratedClass->FindPropertyByName(ComponentFName);
+            ComponentProperty = CastField<FObjectProperty>(Prop);
+            if (ComponentProperty != nullptr && ComponentClass == nullptr)
+            {
+                ComponentClass = ComponentProperty->PropertyClass;
+            }
+        }
+
+        // The FProperty must exist on the generated class for the K2Node to
+        // serialize correctly. If not, force-compile (same pattern as
+        // v9.22 add_component_get fix).
+        if (ComponentProperty == nullptr && ComponentClass != nullptr)
+        {
+            FKismetEditorUtilities::CompileBlueprint(Blueprint);
+            if (Blueprint->GeneratedClass != nullptr)
+            {
+                FProperty* Prop = Blueprint->GeneratedClass->FindPropertyByName(ComponentFName);
+                ComponentProperty = CastField<FObjectProperty>(Prop);
+            }
+        }
+
+        if (ComponentClass == nullptr || ComponentProperty == nullptr)
+        {
+            return JsonError(CmdName, TEXT("component_not_found"),
+                FString::Printf(TEXT("'%s' not in SCS or as a UPROPERTY on '%s'. "
+                                     "Add via add_component first."),
+                    *ComponentName, *BlueprintPath));
+        }
+
+        // 2. Resolve delegate (FMulticastDelegateProperty) on the component class.
+        const FName DelegateFName(*DelegateName);
+        FMulticastDelegateProperty* DelegateProperty = FindFProperty<FMulticastDelegateProperty>(
+            ComponentClass, DelegateFName);
+        if (DelegateProperty == nullptr)
+        {
+            // Build a small helper list of available delegates for the hint.
+            TArray<FString> AvailableDelegates;
+            for (TFieldIterator<FMulticastDelegateProperty> It(ComponentClass); It; ++It)
+            {
+                AvailableDelegates.Add(It->GetName());
+                if (AvailableDelegates.Num() >= 12) break;
+            }
+            const FString Hint = AvailableDelegates.Num() > 0
+                ? FString::Printf(TEXT("'%s' has no multicast delegate '%s'. Available (first 12): %s"),
+                    *ComponentClass->GetName(), *DelegateName,
+                    *FString::Join(AvailableDelegates, TEXT(", ")))
+                : FString::Printf(TEXT("'%s' has no multicast delegates at all"),
+                    *ComponentClass->GetName());
+            return JsonError(CmdName, TEXT("delegate_not_found"), Hint);
+        }
+
+        // 3. Anchor uniqueness check.
+        if (FindNodeByAnchor(TargetGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        // 4. Don't allow a second binding to the same (component, delegate) — UE
+        //    only fires the first one anyway, so emit a clean error.
+        for (UEdGraphNode* Existing : TargetGraph->Nodes)
+        {
+            if (UK2Node_ComponentBoundEvent* BE = Cast<UK2Node_ComponentBoundEvent>(Existing))
+            {
+                if (BE->ComponentPropertyName == ComponentFName
+                    && BE->DelegatePropertyName == DelegateFName)
+                {
+                    return JsonError(CmdName, TEXT("binding_exists"),
+                        FString::Printf(TEXT("Already bound: %s.%s on this graph"),
+                            *ComponentName, *DelegateName));
+                }
+            }
+        }
+
+        // 5. Spawn the K2Node_ComponentBoundEvent.
+        UK2Node_ComponentBoundEvent* NewNode = NewObject<UK2Node_ComponentBoundEvent>(TargetGraph);
+        NewNode->SetFlags(RF_Transactional);
+        NewNode->NodePosX = PosX;
+        NewNode->NodePosY = PosY;
+        NewNode->NodeComment = AnchorName;
+        NewNode->bCommentBubbleVisible = true;
+
+        // InitializeComponentBoundEventParams sets ComponentPropertyName +
+        // DelegatePropertyName + DelegateOwnerClass internally. Without this
+        // call the node won't compile.
+        NewNode->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
+
+        TargetGraph->AddNode(NewNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        NewNode->CreateNewGuid();
+        NewNode->PostPlacedNewNode();
+        NewNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(NewNode);
+        const FString GuidStr = NewNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_component_bound_event\",\"anchor_name\":%s,")
+            TEXT("\"component_name\":%s,\"delegate_name\":%s,\"component_class\":%s,")
+            TEXT("\"node_guid\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(ComponentName),
+            *EscapeJsonString(DelegateName),
+            *EscapeJsonString(ComponentClass->GetName()),
+            *EscapeJsonString(GuidStr),
             *PinsJson,
             bSaved ? TEXT("true") : TEXT("false"));
     }
@@ -7081,7 +7311,81 @@ namespace
         return Out;
     }
 
-    // ===== v9.23.0 — auto_layout_graph =====
+    // v9.24.0 — predecessors via exec input pins (inverse of GetExecSuccessors).
+    // Used by the layout pass to do median-of-parents sort for crossing reduction.
+    TArray<UEdGraphNode*> GetExecPredecessors(const UEdGraphNode* Node)
+    {
+        TArray<UEdGraphNode*> Out;
+        if (Node == nullptr) return Out;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin == nullptr) continue;
+            if (Pin->Direction != EGPD_Input) continue;
+            if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+            for (UEdGraphPin* Linked : Pin->LinkedTo)
+            {
+                if (Linked == nullptr) continue;
+                if (UEdGraphNode* PN = Linked->GetOwningNode())
+                {
+                    Out.AddUnique(PN);
+                }
+            }
+        }
+        return Out;
+    }
+
+    // v9.24.0 — data input nodes for an exec node, in pin order.
+    // Used by the layout pass to "fan" data nodes around their specific consumer
+    // rather than dumping every data node into one big column.
+    TArray<UEdGraphNode*> GetDataInputNodesOrdered(const UEdGraphNode* Node)
+    {
+        TArray<UEdGraphNode*> Out;
+        if (Node == nullptr) return Out;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin == nullptr) continue;
+            if (Pin->Direction != EGPD_Input) continue;
+            if (Pin->bHidden) continue;
+            if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+            for (UEdGraphPin* Linked : Pin->LinkedTo)
+            {
+                if (Linked == nullptr) continue;
+                if (UEdGraphNode* DN = Linked->GetOwningNode())
+                {
+                    Out.AddUnique(DN);
+                }
+            }
+        }
+        return Out;
+    }
+
+    // ===== v9.24.0 — auto_layout_graph v2 (rewrite of v9.23 for readability) =====
+    //
+    // v9.23 problems user reported ("nodes still overlap, wires criss-cross"):
+    //   (P1) All data nodes were dumped into a single column at depth-1 relative
+    //        to their consumers, creating a vertical wall of data nodes with
+    //        wires going every which way to find their specific consumer.
+    //   (P2) Multiple entries (BeginPlay + Tick + auto-spawned ActorBeginOverlap)
+    //        all stacked in column 0 → their downstream chains overlapped each
+    //        other in a single canvas region.
+    //   (P3) Within a column, nodes were sorted by current Y — when consumers in
+    //        col N+1 didn't follow that order, the wires from col N to col N+1
+    //        crossed unnecessarily.
+    //
+    // v2 fixes:
+    //   (F1) **Per-entry lanes**: each entry's exec chain (BFS-reachable via
+    //        exec successors) gets its own vertical band, stacked top-to-bottom.
+    //        No two chains overlap.
+    //   (F2) **Data nodes hug their specific consumer**: for each exec node, its
+    //        data-input nodes fan out vertically just to its left. A data node
+    //        with multiple consumers binds to the first one we visit (deterministic),
+    //        and wires extend from there to the other consumers.
+    //   (F3) **Median-of-predecessors sort within each column**: for col d > 0,
+    //        nodes are ordered by the median rank of their exec predecessors in
+    //        col d-1. This is the standard layered-graph-drawing heuristic for
+    //        minimizing edge crossings (Sugiyama-style).
+    //
+    // Output shape unchanged — only the placement algorithm differs.
     //
     // Algorithm:
     //   1. Skip Knot (reroute) and Comment nodes — leave alone.
@@ -7120,8 +7424,6 @@ namespace
         for (UEdGraphNode* N : Graph->Nodes)
         {
             if (N == nullptr) continue;
-            // Knots are reroute nodes — their position is meaningful for wire shape.
-            // Comment frames likewise wrap other content; leave them alone.
             const FString Cls = N->GetClass()->GetName();
             if (Cls == TEXT("K2Node_Knot") || Cls == TEXT("EdGraphNode_Comment")) continue;
             AllNodes.Add(N);
@@ -7130,146 +7432,320 @@ namespace
         if (AllNodes.Num() == 0)
         {
             return FString::Printf(
-                TEXT("{\"ok\":true,\"command\":\"auto_layout_graph\",\"graph\":%s,\"moved_count\":0,\"node_count\":0,\"columns\":0,\"saved\":true}\n"),
+                TEXT("{\"ok\":true,\"command\":\"auto_layout_graph\",\"graph\":%s,\"moved_count\":0,\"node_count\":0,\"chains\":0,\"columns\":0,\"saved\":true}\n"),
                 *EscapeJsonString(GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
         }
 
-        // 2. Partition.
-        TArray<UEdGraphNode*> ExecNodes;
-        TArray<UEdGraphNode*> DataNodes;
+        // 2. Partition exec vs data.
+        TArray<UEdGraphNode*> ExecNodes, DataNodes;
         for (UEdGraphNode* N : AllNodes)
         {
-            if (NodeHasExecInput(N) || NodeHasExecOutput(N))
-                ExecNodes.Add(N);
-            else
-                DataNodes.Add(N);
+            if (NodeHasExecInput(N) || NodeHasExecOutput(N)) ExecNodes.Add(N);
+            else DataNodes.Add(N);
         }
 
-        // 3. Entry exec nodes (no exec input).
+        // 3. Find entries (exec nodes with no exec input). Sort deterministically
+        //    by current Y then X so the same input always produces the same lane
+        //    ordering across runs.
         TArray<UEdGraphNode*> Entries;
         for (UEdGraphNode* N : ExecNodes)
         {
             if (!NodeHasExecInput(N)) Entries.Add(N);
         }
+        Entries.Sort([](const UEdGraphNode& A, const UEdGraphNode& B) {
+            if (A.NodePosY != B.NodePosY) return A.NodePosY < B.NodePosY;
+            return A.NodePosX < B.NodePosX;
+        });
 
-        // 4. BFS longest-path depth from entries. Cap at NumExecNodes to truncate cycles.
-        TMap<UEdGraphNode*, int32> Depth;
-        for (UEdGraphNode* N : ExecNodes) Depth.Add(N, 0);
+        // 4. Per-entry BFS: claim reachable exec nodes for a "chain", computing
+        //    longest-path depth from this entry. Multiple chains can't overlap
+        //    in our layout — each gets its own horizontal band.
+        struct FChain
+        {
+            UEdGraphNode* Entry = nullptr;
+            TArray<UEdGraphNode*> ExecMembers;
+            TMap<UEdGraphNode*, int32> NodeDepth;     // exec node → column index within chain
+            TMap<int32, TArray<UEdGraphNode*>> Cols;   // column index → ordered exec nodes
+        };
 
-        struct FBfsItem { UEdGraphNode* Node; int32 NewDepth; };
-        TArray<FBfsItem> Queue;
+        TArray<FChain> Chains;
+        TSet<UEdGraphNode*> ClaimedExec;
+
+        auto BuildChainFromEntry = [&](UEdGraphNode* StartEntry)
+        {
+            FChain Chain;
+            Chain.Entry = StartEntry;
+            // 4a. Collect reachable exec nodes via BFS.
+            TArray<UEdGraphNode*> Q;
+            Q.Push(StartEntry);
+            while (Q.Num() > 0)
+            {
+                UEdGraphNode* N = Q.Pop(EAllowShrinking::No);
+                if (ClaimedExec.Contains(N)) continue;
+                ClaimedExec.Add(N);
+                Chain.ExecMembers.Add(N);
+                for (UEdGraphNode* S : GetExecSuccessors(N))
+                {
+                    if (!ClaimedExec.Contains(S)) Q.Push(S);
+                }
+                // Also walk predecessors — handles "Done" pin of latent nodes
+                // that loops back into our chain via a different entry-relative
+                // path. Keeps a single connected exec component in one chain.
+                for (UEdGraphNode* P : GetExecPredecessors(N))
+                {
+                    if (!ClaimedExec.Contains(P)) Q.Push(P);
+                }
+            }
+
+            // 4b. Compute longest-path depth from StartEntry (cycle-capped).
+            for (UEdGraphNode* N : Chain.ExecMembers) Chain.NodeDepth.Add(N, 0);
+            const int32 Cap = Chain.ExecMembers.Num();
+            int32 Safety = Cap * 8 + 16;
+            TArray<TPair<UEdGraphNode*, int32>> RQ;
+            RQ.Push({StartEntry, 0});
+            while (RQ.Num() > 0 && Safety-- > 0)
+            {
+                TPair<UEdGraphNode*, int32> Item = RQ.Pop(EAllowShrinking::No);
+                int32* D = Chain.NodeDepth.Find(Item.Key);
+                if (D == nullptr) continue;
+                if (Item.Value > Cap) continue;          // cycle truncation
+                if (Item.Value <= *D && !(Item.Value == 0 && Item.Key == StartEntry)) continue;
+                *D = Item.Value;
+                for (UEdGraphNode* S : GetExecSuccessors(Item.Key))
+                {
+                    if (Chain.NodeDepth.Contains(S)) RQ.Push({S, Item.Value + 1});
+                }
+            }
+
+            // 4c. Group by depth.
+            for (const TPair<UEdGraphNode*, int32>& Kv : Chain.NodeDepth)
+            {
+                Chain.Cols.FindOrAdd(Kv.Value).Add(Kv.Key);
+            }
+            return Chain;
+        };
+
         for (UEdGraphNode* Entry : Entries)
         {
-            Queue.Push({Entry, 0});
+            if (ClaimedExec.Contains(Entry)) continue;
+            Chains.Add(BuildChainFromEntry(Entry));
+        }
+        // Orphan exec nodes (cycles with no entry): treat as standalone chains.
+        for (UEdGraphNode* N : ExecNodes)
+        {
+            if (!ClaimedExec.Contains(N)) Chains.Add(BuildChainFromEntry(N));
         }
 
-        const int32 MaxDepthCap = ExecNodes.Num();   // any node visited at depth > MaxDepthCap is in a cycle
-        int32 SafetyIterations = ExecNodes.Num() * 8 + 16;   // hard guard against pathological input
-        while (Queue.Num() > 0 && SafetyIterations-- > 0)
+        // 5. Within each chain, sort each column to minimize crossings using
+        //    the median-of-predecessors heuristic (standard Sugiyama).
+        //    First column = trivially ordered (single entry, or stable Y).
+        for (FChain& Chain : Chains)
         {
-            const FBfsItem Item = Queue.Pop(EAllowShrinking::No);
-            if (Item.NewDepth > MaxDepthCap) continue;     // cycle truncation
-            int32* Existing = Depth.Find(Item.Node);
-            if (Existing == nullptr) continue;
-            if (Item.NewDepth <= *Existing && *Existing != 0) continue;
-            // Accept the deeper depth (or initial assignment from a 0 entry).
-            if (Item.NewDepth > *Existing || (Item.NewDepth == 0 && Entries.Contains(Item.Node)))
-            {
-                *Existing = Item.NewDepth;
-            }
-            for (UEdGraphNode* Succ : GetExecSuccessors(Item.Node))
-            {
-                Queue.Push({Succ, Item.NewDepth + 1});
-            }
-        }
+            TArray<int32> ColIdx;
+            Chain.Cols.GetKeys(ColIdx);
+            ColIdx.Sort();
+            if (ColIdx.Num() == 0) continue;
 
-        // 5. Data nodes: pin to (min consumer depth - 1), clamped.
-        // First pass: pure data->exec consumers.
-        TMap<UEdGraphNode*, int32> DataDepth;
-        for (UEdGraphNode* D : DataNodes)
-        {
-            int32 BestDepth = INT_MAX;
-            for (UEdGraphNode* Consumer : GetDataConsumers(D))
-            {
-                if (int32* CD = Depth.Find(Consumer))
-                {
-                    BestDepth = FMath::Min(BestDepth, *CD);
-                }
-                else if (int32* CD2 = DataDepth.Find(Consumer))
-                {
-                    // data->data chain; consumer hasn't been placed yet, skip this pass
-                    BestDepth = FMath::Min(BestDepth, *CD2);
-                }
-            }
-            DataDepth.Add(D, BestDepth == INT_MAX ? 0 : FMath::Max(0, BestDepth - 1));
-        }
-
-        // 6. Combine all into Column → [Node] map.
-        TMap<int32, TArray<UEdGraphNode*>> ColumnNodes;
-        for (const TPair<UEdGraphNode*, int32>& Kv : Depth)
-        {
-            ColumnNodes.FindOrAdd(Kv.Value).Add(Kv.Key);
-        }
-        for (const TPair<UEdGraphNode*, int32>& Kv : DataDepth)
-        {
-            ColumnNodes.FindOrAdd(Kv.Value).Add(Kv.Key);
-        }
-
-        // 7. Sort columns ascending; within each column sort nodes by current Y.
-        TArray<int32> Cols;
-        ColumnNodes.GetKeys(Cols);
-        Cols.Sort();
-
-        // Compute max width of each column → determines next column's X offset.
-        TArray<float> ColumnMaxWidth;
-        ColumnMaxWidth.SetNumZeroed(Cols.Num() == 0 ? 1 : Cols.Last() + 1);
-        for (int32 Col : Cols)
-        {
-            float W = 0.0f;
-            for (UEdGraphNode* N : ColumnNodes[Col])
-            {
-                W = FMath::Max(W, EstimateNodeWidth(N));
-            }
-            ColumnMaxWidth[Col] = W;
-        }
-
-        int32 MovedCount = 0;
-        for (int32 Col : Cols)
-        {
-            TArray<UEdGraphNode*>& ColNodes = ColumnNodes[Col];
-            ColNodes.Sort([](const UEdGraphNode& A, const UEdGraphNode& B) {
-                return A.NodePosY < B.NodePosY;
+            // Col 0: stable sort by current Y, ties broken by X.
+            Chain.Cols[ColIdx[0]].Sort([](const UEdGraphNode& A, const UEdGraphNode& B) {
+                if (A.NodePosY != B.NodePosY) return A.NodePosY < B.NodePosY;
+                return A.NodePosX < B.NodePosX;
             });
 
-            // Compute this column's X = OriginX + sum(prev column widths + padding_x).
-            float X = (float)OriginX;
-            for (int32 PrevCol = 0; PrevCol < Col; ++PrevCol)
+            for (int32 i = 1; i < ColIdx.Num(); ++i)
             {
-                X += ColumnMaxWidth[PrevCol] + (float)PaddingX;
-            }
+                const int32 Curr = ColIdx[i];
+                const int32 Prev = ColIdx[i - 1];
+                const TArray<UEdGraphNode*>& PrevOrder = Chain.Cols[Prev];
 
-            float Y = (float)OriginY;
-            for (UEdGraphNode* N : ColNodes)
-            {
-                const int32 OldX = N->NodePosX;
-                const int32 OldY = N->NodePosY;
-                N->NodePosX = (int32)X;
-                N->NodePosY = (int32)Y;
-                if (OldX != N->NodePosX || OldY != N->NodePosY) ++MovedCount;
-                Y += EstimateNodeHeight(N) + (float)PaddingY;
+                TMap<UEdGraphNode*, int32> PrevRank;
+                for (int32 R = 0; R < PrevOrder.Num(); ++R) PrevRank.Add(PrevOrder[R], R);
+
+                Chain.Cols[Curr].Sort([&PrevRank](const UEdGraphNode& A, const UEdGraphNode& B) {
+                    auto MedianRank = [&PrevRank](const UEdGraphNode* N) -> float
+                    {
+                        TArray<int32> Ranks;
+                        for (const UEdGraphPin* P : N->Pins)
+                        {
+                            if (P == nullptr) continue;
+                            if (P->Direction != EGPD_Input) continue;
+                            if (P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+                            for (UEdGraphPin* L : P->LinkedTo)
+                            {
+                                if (L == nullptr) continue;
+                                if (UEdGraphNode* PN = L->GetOwningNode())
+                                {
+                                    if (int32* R = PrevRank.Find(PN)) Ranks.Add(*R);
+                                }
+                            }
+                        }
+                        if (Ranks.Num() == 0)
+                        {
+                            // No predecessor in prev col — fall back to current Y for stability.
+                            return (float)N->NodePosY * 0.001f;
+                        }
+                        Ranks.Sort();
+                        return (float)Ranks[Ranks.Num() / 2];
+                    };
+                    return MedianRank(&A) < MedianRank(&B);
+                });
             }
+        }
+
+        // 6. Decide column X positions. To keep chains aligned, use a SHARED
+        //    column-index → X coordinate map across all chains. Column N's X is
+        //    cumulative from origin_x + (max width of cols 0..N-1) + padding gaps.
+        TMap<int32, float> ColMaxWidth;
+        int32 MaxColIdx = 0;
+        for (const FChain& Chain : Chains)
+        {
+            for (const TPair<int32, TArray<UEdGraphNode*>>& Kv : Chain.Cols)
+            {
+                MaxColIdx = FMath::Max(MaxColIdx, Kv.Key);
+                float W = 0.0f;
+                for (UEdGraphNode* N : Kv.Value) W = FMath::Max(W, EstimateNodeWidth(N));
+                float& Existing = ColMaxWidth.FindOrAdd(Kv.Key, 0.0f);
+                Existing = FMath::Max(Existing, W);
+            }
+        }
+
+        TMap<int32, float> ColX;
+        {
+            float Acc = (float)OriginX;
+            for (int32 C = 0; C <= MaxColIdx; ++C)
+            {
+                ColX.Add(C, Acc);
+                const float W = ColMaxWidth.Contains(C) ? ColMaxWidth[C] : 200.0f;
+                Acc += W + (float)PaddingX;
+            }
+        }
+
+        // 7. Place each chain's exec nodes. Each chain occupies its own band
+        //    starting at ChainYBase. Within the chain, each row = a node's
+        //    row-in-its-column. After the band fits, leave a vertical gap and
+        //    start the next chain.
+        TMap<UEdGraphNode*, FVector2D> Positions;
+        float ChainYBase = (float)OriginY;
+        // Within-chain vertical step: leave room for the tallest node + padding.
+        const float RowStep = 180.0f + (float)PaddingY;
+        // Gap between two chains' bands.
+        const float ChainGap = FMath::Max((float)PaddingY * 1.5f, 200.0f);
+
+        for (FChain& Chain : Chains)
+        {
+            TArray<int32> ColIdx;
+            Chain.Cols.GetKeys(ColIdx);
+            ColIdx.Sort();
+
+            int32 MaxRowsInThisChain = 0;
+            for (int32 C : ColIdx)
+            {
+                const TArray<UEdGraphNode*>& ColNodes = Chain.Cols[C];
+                MaxRowsInThisChain = FMath::Max(MaxRowsInThisChain, ColNodes.Num());
+                const float X = ColX[C];
+                for (int32 Row = 0; Row < ColNodes.Num(); ++Row)
+                {
+                    Positions.Add(ColNodes[Row], FVector2D(X, ChainYBase + Row * RowStep));
+                }
+            }
+            ChainYBase += FMath::Max(1, MaxRowsInThisChain) * RowStep + ChainGap;
+        }
+
+        // 8. Data nodes hug their specific exec consumer. Iterate exec nodes in
+        //    placement order and fan each one's data inputs out vertically to
+        //    its left. A data node binds to the first exec consumer that
+        //    references it; wires to other consumers will extend from there.
+        //
+        //    PASS A: data node feeds an exec node directly.
+        const float DataOffsetX = FMath::Max((float)PaddingX * 0.7f, 240.0f);
+        const float DataFanY = 60.0f;
+        TSet<UEdGraphNode*> PlacedData;
+
+        // Snapshot exec positions so we can iterate without mutating during loop.
+        TArray<TPair<UEdGraphNode*, FVector2D>> ExecPlaced;
+        for (const TPair<UEdGraphNode*, FVector2D>& P : Positions) ExecPlaced.Add(P);
+
+        for (const TPair<UEdGraphNode*, FVector2D>& Pair : ExecPlaced)
+        {
+            UEdGraphNode* ExecN = Pair.Key;
+            const FVector2D ExecPos = Pair.Value;
+            const TArray<UEdGraphNode*> Inputs = GetDataInputNodesOrdered(ExecN);
+            int32 Row = 0;
+            for (UEdGraphNode* DN : Inputs)
+            {
+                // Skip if it's an exec node (already placed via chain).
+                if (NodeHasExecInput(DN) || NodeHasExecOutput(DN)) continue;
+                if (PlacedData.Contains(DN)) continue;
+
+                const float DX = ExecPos.X - DataOffsetX;
+                // Center the fan around ExecPos.Y: idx 0 above, idx 1 below, etc.
+                // Use ((Row - (Count-1)/2.0)) * DataFanY for a symmetric fan.
+                const int32 N = Inputs.Num();
+                const float Mid = (N - 1) * 0.5f;
+                const float DY = ExecPos.Y + (Row - Mid) * DataFanY;
+                Positions.Add(DN, FVector2D(DX, DY));
+                PlacedData.Add(DN);
+                ++Row;
+            }
+        }
+
+        // PASS B: data → data chains. If D2 feeds D1 and D1 is placed, put D2
+        //         to the left of D1. Loop until no more placements happen.
+        bool bChanged = true;
+        int32 Safety = DataNodes.Num() * 4 + 8;
+        while (bChanged && Safety-- > 0)
+        {
+            bChanged = false;
+            for (UEdGraphNode* D : DataNodes)
+            {
+                if (PlacedData.Contains(D)) continue;
+                for (UEdGraphNode* C : GetDataConsumers(D))
+                {
+                    if (FVector2D* CPos = Positions.Find(C))
+                    {
+                        Positions.Add(D, FVector2D(CPos->X - 220.0f, CPos->Y));
+                        PlacedData.Add(D);
+                        bChanged = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // PASS C: orphan data nodes (no consumer in the graph at all). Stack at
+        //         the bottom, below all chains.
+        int32 OrphanRow = 0;
+        for (UEdGraphNode* D : DataNodes)
+        {
+            if (PlacedData.Contains(D)) continue;
+            Positions.Add(D, FVector2D((float)OriginX, ChainYBase + OrphanRow * 100.0f));
+            ++OrphanRow;
+        }
+
+        // 9. Apply positions.
+        int32 MovedCount = 0;
+        for (const TPair<UEdGraphNode*, FVector2D>& Pair : Positions)
+        {
+            UEdGraphNode* N = Pair.Key;
+            const int32 OldX = N->NodePosX, OldY = N->NodePosY;
+            N->NodePosX = (int32)Pair.Value.X;
+            N->NodePosY = (int32)Pair.Value.Y;
+            if (OldX != N->NodePosX || OldY != N->NodePosY) ++MovedCount;
         }
 
         FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
         const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
 
+        // Report number of columns = MaxColIdx + 1 (or 0 if nothing).
+        const int32 ColCount = (ColMaxWidth.Num() == 0) ? 0 : (MaxColIdx + 1);
+
         return FString::Printf(
             TEXT("{\"ok\":true,\"command\":\"auto_layout_graph\",\"graph\":%s,")
             TEXT("\"moved_count\":%d,\"node_count\":%d,\"exec_count\":%d,\"data_count\":%d,")
-            TEXT("\"columns\":%d,\"padding_x\":%d,\"padding_y\":%d,\"saved\":%s}\n"),
+            TEXT("\"chains\":%d,\"columns\":%d,\"padding_x\":%d,\"padding_y\":%d,\"saved\":%s}\n"),
             *EscapeJsonString(GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName),
             MovedCount, AllNodes.Num(), ExecNodes.Num(), DataNodes.Num(),
-            Cols.Num(), PaddingX, PaddingY,
+            Chains.Num(), ColCount, PaddingX, PaddingY,
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
@@ -7827,7 +8303,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.23.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.24.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -8451,6 +8927,56 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("add_component"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.24.0 delete_component (rev17 ISSUE-1) ---
+    if (Command.Equals(TEXT("delete_component"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, ComponentName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("delete_component"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("component_name"), ComponentName) || ComponentName.IsEmpty())
+            return JsonError(TEXT("delete_component"), TEXT("missing_field"), TEXT("component_name"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, ComponentName]() mutable
+            {
+                Promise.SetValue(DeleteComponentOnGameThread(Blueprint, ComponentName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("delete_component"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.24.0 add_component_bound_event (rev17 ISSUE-2) ---
+    if (Command.Equals(TEXT("add_component_bound_event"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, ComponentName, DelegateName, AnchorName, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_component_bound_event"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("component_name"), ComponentName) || ComponentName.IsEmpty())
+            return JsonError(TEXT("add_component_bound_event"), TEXT("missing_field"), TEXT("component_name"));
+        if (!JsonObject->TryGetStringField(TEXT("delegate_name"), DelegateName) || DelegateName.IsEmpty())
+            return JsonError(TEXT("add_component_bound_event"), TEXT("missing_field"), TEXT("delegate_name"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_component_bound_event"), TEXT("missing_field"), TEXT("anchor_name"));
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, ComponentName, DelegateName, AnchorName, PosX, PosY, GraphName]() mutable
+            {
+                Promise.SetValue(AddComponentBoundEventOnGameThread(Blueprint, ComponentName, DelegateName, AnchorName, PosX, PosY, GraphName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_component_bound_event"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

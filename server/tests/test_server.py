@@ -5464,3 +5464,191 @@ def test_ping_returns_plugin_version_9_23_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.23.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.24.0 — auto_layout v2 (per-entry lanes + data-hug) + delete_component
+#           + add_component_bound_event (closes rev17 ISSUE-1/2)
+# ---------------------------------------------------------------------------
+
+
+def test_auto_layout_graph_response_includes_chains_field() -> None:
+    """v9.24.0 — response now includes ``chains`` (number of entry-rooted
+    exec subgraphs). Existing fields unchanged for backward compat."""
+    response = (
+        b'{"ok":true,"command":"auto_layout_graph","graph":"EventGraph",'
+        b'"moved_count":20,"node_count":25,"exec_count":12,"data_count":13,'
+        b'"chains":3,"columns":5,"padding_x":350,"padding_y":160,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.auto_layout_graph(blueprint="/Game/BP_Test")
+    assert r["ok"] is True
+    assert r["chains"] == 3
+    assert r["columns"] == 5
+    assert r["moved_count"] == 20
+
+
+def test_delete_component_success() -> None:
+    """v9.24.0 — delete_component returns the deleted component's class name."""
+    response = (
+        b'{"ok":true,"command":"delete_component","component_name":"TopCam",'
+        b'"component_class":"CameraComponent","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.delete_component(blueprint="/Game/BP_RippleGrid", component_name="TopCam")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "delete_component",
+        "blueprint": "/Game/BP_RippleGrid",
+        "component_name": "TopCam",
+    }
+    assert r["ok"] is True
+    assert r["component_class"] == "CameraComponent"
+
+
+def test_delete_component_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"delete_component","error":"component_not_found",'
+        b'"detail":"\'Ghost\' not in SCS of \'/Game/BP_Test\'"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.delete_component(blueprint="/Game/BP_Test", component_name="Ghost")
+    assert r["ok"] is False
+    assert r["error"] == "component_not_found"
+
+
+def test_delete_component_missing_args() -> None:
+    """Empty blueprint or component_name → client-side missing_argument
+    (no network call)."""
+    r = server.delete_component(blueprint="", component_name="X")
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+    r = server.delete_component(blueprint="/Game/BP_X", component_name="")
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+def test_add_component_bound_event_success() -> None:
+    """v9.24.0 — happy path for OnComponentHit binding."""
+    response = (
+        b'{"ok":true,"command":"add_component_bound_event","anchor_name":"on_hit",'
+        b'"component_name":"Mesh","delegate_name":"OnComponentHit",'
+        b'"component_class":"StaticMeshComponent",'
+        b'"node_guid":"00000000-0000-0000-0000-000000000001",'
+        b'"pins":[{"name":"OutputDelegate","direction":"output","type":"delegate","container":"none"},'
+        b'{"name":"HitComp","direction":"output","type":"object","container":"none"},'
+        b'{"name":"OtherActor","direction":"output","type":"object","container":"none"},'
+        b'{"name":"OtherComp","direction":"output","type":"object","container":"none"},'
+        b'{"name":"NormalImpulse","direction":"output","type":"struct","container":"none"},'
+        b'{"name":"Hit","direction":"output","type":"struct","container":"none"},'
+        b'{"name":"then","direction":"output","type":"exec","container":"none"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_component_bound_event(
+            blueprint="/Game/BP_RippleBall",
+            component_name="Mesh",
+            delegate_name="OnComponentHit",
+            anchor_name="on_hit",
+            position_x=-200,
+            position_y=100,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_component_bound_event"
+    assert sent_dict["component_name"] == "Mesh"
+    assert sent_dict["delegate_name"] == "OnComponentHit"
+    assert sent_dict["anchor_name"] == "on_hit"
+    assert sent_dict["position_x"] == -200
+    assert sent_dict["position_y"] == 100
+    assert r["ok"] is True
+    # The signature params from OnComponentHit should be present
+    pin_names = {p["name"] for p in r["pins"]}
+    assert "OtherActor" in pin_names
+    assert "Hit" in pin_names
+    assert "then" in pin_names
+
+
+def test_add_component_bound_event_delegate_not_found() -> None:
+    """v9.24.0 — error includes the list of available delegates as a hint."""
+    response = (
+        b'{"ok":false,"command":"add_component_bound_event","error":"delegate_not_found",'
+        b'"detail":"\'StaticMeshComponent\' has no multicast delegate \'OnTotallyMadeUp\'. '
+        b'Available (first 12): OnComponentHit, OnComponentBeginOverlap, OnComponentEndOverlap"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component_bound_event(
+            blueprint="/Game/BP_Test",
+            component_name="Mesh",
+            delegate_name="OnTotallyMadeUp",
+            anchor_name="bogus",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "delegate_not_found"
+    assert "OnComponentHit" in r["detail"]
+
+
+def test_add_component_bound_event_binding_exists() -> None:
+    """v9.24.0 — second binding to same (component, delegate) is rejected."""
+    response = (
+        b'{"ok":false,"command":"add_component_bound_event","error":"binding_exists",'
+        b'"detail":"Already bound: Mesh.OnComponentHit on this graph"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_component_bound_event(
+            blueprint="/Game/BP_Test",
+            component_name="Mesh",
+            delegate_name="OnComponentHit",
+            anchor_name="dup_bind",
+        )
+    assert r["ok"] is False
+    assert r["error"] == "binding_exists"
+
+
+def test_add_component_bound_event_missing_args() -> None:
+    """Empty required args → client-side missing_argument."""
+    r = server.add_component_bound_event(
+        blueprint="",
+        component_name="X",
+        delegate_name="Y",
+        anchor_name="Z",
+    )
+    assert r["ok"] is False
+    assert r["error"] == "missing_argument"
+
+
+def test_add_component_bound_event_with_graph_name() -> None:
+    """v9.24.0 — graph_name reaches the plugin (for function bodies)."""
+    response = (
+        b'{"ok":true,"command":"add_component_bound_event","anchor_name":"on_hit",'
+        b'"component_name":"Mesh","delegate_name":"OnComponentHit",'
+        b'"component_class":"StaticMeshComponent",'
+        b'"node_guid":"00000000-0000-0000-0000-000000000002","pins":[],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_component_bound_event(
+            blueprint="/Game/BP_Test",
+            component_name="Mesh",
+            delegate_name="OnComponentHit",
+            anchor_name="on_hit",
+            graph_name="HelperFunc",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "HelperFunc"
+
+
+def test_ping_returns_plugin_version_9_24_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.24.0","build_date":"May 27 2026 18:00:00",'
+        b'"timestamp":"2026-05-27T18:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.24.0"

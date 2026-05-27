@@ -1469,53 +1469,63 @@ def auto_layout_graph(
     origin_x: int = 0,
     origin_y: int = 0,
 ) -> dict[str, Any]:
-    """One-shot tidy of a Blueprint graph — v9.23.0.
+    """One-shot tidy of a Blueprint graph — v9.23.0 + v9.24.0 rewrite (rev17).
 
-    Topologically sorts nodes by exec flow and stacks them in columns,
-    fixing the "everything overlaps and wires criss-cross" mess that
-    happens when nodes were placed with literal ``(x, y)`` ints that
-    didn't account for node size. Call this **after** a batch of
-    ``add_node`` / ``add_branch`` / ``add_macro`` / etc. — the LLM
-    no longer needs to think about pixel layout, just topology.
+    Topologically sorts nodes by exec flow and lays them out so the wiring
+    logic reads left-to-right. Call this **after** a batch of ``add_node`` /
+    ``add_branch`` / ``add_macro`` / etc. — the LLM doesn't have to think
+    about pixel layout, just topology.
 
-    Algorithm:
+    **v9.24.0 algorithm** (rewrite of v9.23 which left "wires criss-cross"):
         1. Skip ``K2Node_Knot`` (reroute) and ``EdGraphNode_Comment`` —
            their positions are intentional.
-        2. Entry nodes = exec nodes with no exec INPUT (events,
-           FunctionEntry, etc.) → column 0.
-        3. BFS through exec successor links; longest-path depth wins.
-           Cycles (e.g. While loops) are truncated at ``num_exec_nodes``.
-        4. Data nodes go one column LEFT of their lowest-depth consumer
-           (orphans default to column 0).
-        5. Within each column, sort by current Y, stack vertically with
-           ``estimated_height + padding_y`` stride.
-        6. X = ``origin_x`` + sum of previous columns' max widths +
-           ``padding_x`` per gap.
+        2. **Per-entry lanes**: each entry (exec node with no exec INPUT —
+           BeginPlay, Tick, CustomEvent, FunctionEntry, etc.) and the exec
+           nodes BFS-reachable from it become one "chain". Each chain gets
+           its own horizontal band stacked top-to-bottom — no two chains
+           overlap. Sorted by current Y so BeginPlay tends to come first.
+        3. **Longest-path depth within chain**: each exec node gets a
+           column index = longest exec path from its entry. Cycles (While
+           loops) truncated at ``num_exec_nodes_in_chain``.
+        4. **Median-of-predecessors sort within each column**: minimizes
+           edge crossings (Sugiyama-style layered drawing). When col N+1
+           has two consumers of col N's nodes A(top) and B(bottom), they
+           come out as A→top, B→bottom rather than crossed.
+        5. **Data nodes hug their specific consumer**: for each exec node,
+           its data-input nodes fan out vertically just to its left. A
+           data node with multiple consumers binds to the first; wires to
+           the others extend from there. (Big change from v9.23 — data
+           nodes are no longer dumped into one giant column.)
+        6. Data → data chains placed leftward iteratively.
+        7. Orphan data nodes stacked at the bottom (below all chains).
 
     Args:
         blueprint: Full BP asset path.
         graph_name: Target graph (default empty = EventGraph). For user
             functions / macros, pass the graph name (same as ``add_node``).
         padding_x: Horizontal gap between columns (default 350). Increase
-            for wide nodes (e.g. nodes with many long pin names).
-        padding_y: Vertical gap between stacked nodes (default 160).
+            for wide nodes (many long pin names).
+        padding_y: Vertical gap between stacked nodes within a chain
+            (default 160). Inter-chain gap is ``max(padding_y * 1.5, 200)``.
         origin_x, origin_y: Top-left of the laid-out region (default 0,0).
-            Use this if you want to keep, say, an event node in its old
-            spot and lay out everything to the right of it.
 
     Returns:
         ``{"ok": True, "graph": "EventGraph", "moved_count": int,
             "node_count": int, "exec_count": int, "data_count": int,
-            "columns": int, "padding_x": int, "padding_y": int,
-            "saved": True}``
+            "chains": int, "columns": int,
+            "padding_x": int, "padding_y": int, "saved": True}``
+
+        ``chains`` (new in v9.24.0) = number of distinct entry-rooted
+        exec subgraphs. A typical BP has 2-5 chains (BeginPlay, Tick,
+        any CustomEvents, any InputAction events).
 
     Limitations:
-        - AnimGraph state machines: state node positions are spatially
-          meaningful; calling this on an AnimGraph rearranges them by
-          exec-flow which usually isn't what you want. Skip AnimGraphs.
-        - Doesn't reroute wires — wires stay straight from node to node.
-          For very tall columns you may still see one wire crossing
-          another column. ``add_reroute`` (future) would fix that.
+        - AnimGraph state machines: state positions are spatially meaningful
+          (you arrange the state diagram by hand). Calling auto-layout
+          rearranges them by exec-flow which usually isn't what you want.
+        - Doesn't reroute wires — wires stay straight node-to-node. For
+          very tall columns, one long wire may still pass through another
+          column's gap. ``add_reroute`` (future) would fix that.
 
     Common errors:
         blueprint_not_found, graph_not_found, game_thread_timeout
@@ -2400,6 +2410,130 @@ def add_component(
         "component_class": component_class,
         "name": name,
     })
+
+
+@mcp.tool()
+def delete_component(blueprint: str, component_name: str) -> dict[str, Any]:
+    """Remove a component from a Blueprint's SCS — v9.24.0 (closes rev17 ISSUE-1).
+
+    Symmetric to ``add_component``. Detaches the named component from the
+    BP's SimpleConstructionScript and force-compiles so the FProperty surface
+    updates immediately. If the component had child components attached, they
+    are re-parented (via ``RemoveNodeAndPromoteChildren``) so the BP doesn't
+    end up with dangling orphans.
+
+    **Caller responsibility**: this does NOT walk the graph to remove
+    ``add_component_get`` nodes referencing this component, nor remove any
+    ``set_component_property`` calls. Use ``delete_node`` on those first
+    (or fix up the graph after — they'll surface ``component_not_found``
+    errors after the next compile if left in place).
+
+    Args:
+        blueprint: BP asset path.
+        component_name: Component name (same as you passed to ``add_component``,
+            or what shows in the Components panel).
+
+    Returns:
+        ``{"ok": True, "component_name": "...", "component_class": "...", "saved": True}``
+
+    Common errors:
+        blueprint_not_found
+        no_scs                 — BP isn't an Actor (no SimpleConstructionScript)
+        component_not_found    — not in SCS; inherited / native components
+                                  from a parent C++ class cannot be removed
+                                  here (they live on the parent class itself)
+    """
+    if not blueprint or not component_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "delete_component",
+        "blueprint": blueprint,
+        "component_name": component_name,
+    })
+
+
+@mcp.tool()
+def add_component_bound_event(
+    blueprint: str,
+    component_name: str,
+    delegate_name: str,
+    anchor_name: str,
+    position_x: int = 0,
+    position_y: int = 0,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Bind exec to a component's multicast delegate — v9.24.0 (rev17 ISSUE-2).
+
+    Spawns a ``K2Node_ComponentBoundEvent`` that fires when the named
+    component's named multicast delegate broadcasts. This is the standard
+    UE event-driven pattern for collisions, overlaps, UMG button clicks,
+    etc. — what the editor produces when you click the ``+`` on a delegate
+    pin in the Details panel.
+
+    Without this tool, the LLM was forced into Tick-polling
+    (``GetAllActorsOfClass`` + per-frame distance check) instead of true
+    event-driven flow.
+
+    **Common (component, delegate) pairs**:
+        UPrimitiveComponent (and all StaticMesh / Skeletal subclasses):
+            - ``OnComponentHit``           (physics collision)
+            - ``OnComponentBeginOverlap``  (trigger volumes — receives Other actor + comp)
+            - ``OnComponentEndOverlap``
+            - ``OnComponentWake`` / ``OnComponentSleep``
+            - ``OnClicked`` / ``OnReleased`` (mouse interaction)
+            - ``OnBeginCursorOver`` / ``OnEndCursorOver`` / ``OnInputTouchBegin`` / etc.
+
+        UMG (BP parent = UserWidget):
+            - ``Button.OnClicked`` / ``OnPressed`` / ``OnReleased`` / ``OnHovered``
+            - ``CheckBox.OnCheckStateChanged``
+            - ``Slider.OnValueChanged``
+            - ``EditableTextBox.OnTextChanged`` / ``OnTextCommitted``
+
+    Args:
+        blueprint: BP asset path.
+        component_name: Component to bind on (must exist in this BP's SCS or
+            be an inherited UPROPERTY).
+        delegate_name: Multicast delegate name on the component's class. The
+            tool's error message lists up to 12 available delegates if the
+            name doesn't resolve, so a typo gets a useful hint.
+        anchor_name: User-given label (unique within the target graph). The
+            event's ``then`` pin is referenced as ``<anchor_name>.then``.
+        position_x, position_y: Graph position (default 0, 0).
+        graph_name: Target graph (default empty = EventGraph).
+
+    Returns:
+        ``{"ok": True, "anchor_name": ..., "component_name": ...,
+            "delegate_name": ..., "component_class": "<short class name>",
+            "node_guid": ..., "pins": [...], "saved": True}``
+        ``pins`` includes the delegate's signature parameters (e.g.
+        ``OnComponentHit`` exposes ``HitComp / OtherActor / OtherComp /
+        NormalImpulse / Hit / then``). Wire them with ``connect_pins`` and
+        ``set_pin_default`` as usual.
+
+    Common errors:
+        blueprint_not_found
+        component_not_found  — not in SCS and not a parent-class UPROPERTY
+        delegate_not_found   — no multicast delegate with that name on the
+                                component's class (response includes the
+                                first 12 available delegate names as a hint)
+        binding_exists       — that exact (component, delegate) is already
+                                bound in this graph (UE only fires the first)
+        anchor_name_exists
+    """
+    if not blueprint or not component_name or not delegate_name or not anchor_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_component_bound_event",
+        "blueprint": blueprint,
+        "component_name": component_name,
+        "delegate_name": delegate_name,
+        "anchor_name": anchor_name,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
 
 
 @mcp.tool()
