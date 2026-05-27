@@ -5307,3 +5307,160 @@ def test_ping_returns_plugin_version_9_22_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.22.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.23.0 — auto_layout_graph + set_node_position (graph tidying)
+# ---------------------------------------------------------------------------
+
+
+def test_auto_layout_graph_default_args() -> None:
+    """v9.23.0 — defaults (padding 350/160, origin 0,0) reach the plugin."""
+    response = (
+        b'{"ok":true,"command":"auto_layout_graph","graph":"EventGraph",'
+        b'"moved_count":12,"node_count":15,"exec_count":8,"data_count":7,'
+        b'"columns":4,"padding_x":350,"padding_y":160,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.auto_layout_graph(blueprint="/Game/BP_Test")
+    assert r["ok"] is True
+    assert r["moved_count"] == 12
+    assert r["columns"] == 4
+
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "auto_layout_graph"
+    assert sent_dict["blueprint"] == "/Game/BP_Test"
+    assert sent_dict["padding_x"] == 350
+    assert sent_dict["padding_y"] == 160
+    assert sent_dict["origin_x"] == 0
+    assert sent_dict["origin_y"] == 0
+    # graph_name omitted when default
+    assert "graph_name" not in sent_dict
+
+
+def test_auto_layout_graph_custom_padding_and_origin() -> None:
+    """v9.23.0 — custom padding + origin + graph_name surface in payload."""
+    response = (
+        b'{"ok":true,"command":"auto_layout_graph","graph":"MyFunc",'
+        b'"moved_count":4,"node_count":4,"exec_count":3,"data_count":1,'
+        b'"columns":3,"padding_x":500,"padding_y":200,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.auto_layout_graph(
+            blueprint="/Game/BP_Test",
+            graph_name="MyFunc",
+            padding_x=500,
+            padding_y=200,
+            origin_x=100,
+            origin_y=-50,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+    assert sent_dict["padding_x"] == 500
+    assert sent_dict["padding_y"] == 200
+    assert sent_dict["origin_x"] == 100
+    assert sent_dict["origin_y"] == -50
+    assert r["ok"] is True
+
+
+def test_auto_layout_graph_empty_graph_no_op() -> None:
+    """v9.23.0 — empty graph returns moved_count=0, columns=0."""
+    response = (
+        b'{"ok":true,"command":"auto_layout_graph","graph":"EventGraph",'
+        b'"moved_count":0,"node_count":0,"columns":0,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.auto_layout_graph(blueprint="/Game/BP_Empty")
+    assert r["ok"] is True
+    assert r["moved_count"] == 0
+    assert r["columns"] == 0
+
+
+def test_auto_layout_graph_blueprint_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"auto_layout_graph","error":"blueprint_not_found",'
+        b'"detail":"/Game/BP_NoExist"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.auto_layout_graph(blueprint="/Game/BP_NoExist")
+    assert r["ok"] is False
+    assert r["error"] == "blueprint_not_found"
+
+
+def test_set_node_position_success() -> None:
+    """v9.23.0 — set_node_position returns old + new coords for verification."""
+    response = (
+        b'{"ok":true,"command":"set_node_position","anchor":"my_node",'
+        b'"old_position":[0,0],"new_position":[500,200],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_node_position(
+            blueprint="/Game/BP_Test",
+            anchor="my_node",
+            position_x=500,
+            position_y=200,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "set_node_position",
+        "blueprint": "/Game/BP_Test",
+        "anchor": "my_node",
+        "position_x": 500,
+        "position_y": 200,
+    }
+    assert r["ok"] is True
+    assert r["old_position"] == [0, 0]
+    assert r["new_position"] == [500, 200]
+
+
+def test_set_node_position_anchor_not_found() -> None:
+    response = (
+        b'{"ok":false,"command":"set_node_position","error":"anchor_not_found",'
+        b'"detail":"ghost_anchor"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_node_position(
+            blueprint="/Game/BP_Test",
+            anchor="ghost_anchor",
+            position_x=0,
+            position_y=0,
+        )
+    assert r["ok"] is False
+    assert r["error"] == "anchor_not_found"
+
+
+def test_set_node_position_with_graph_name() -> None:
+    """v9.23.0 — graph_name reaches the plugin payload."""
+    response = (
+        b'{"ok":true,"command":"set_node_position","anchor":"helper",'
+        b'"old_position":[100,100],"new_position":[300,400],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.set_node_position(
+            blueprint="/Game/BP_Test",
+            anchor="helper",
+            position_x=300,
+            position_y=400,
+            graph_name="MyFunc",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_ping_returns_plugin_version_9_23_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.23.0","build_date":"May 27 2026 12:00:00",'
+        b'"timestamp":"2026-05-27T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.23.0"

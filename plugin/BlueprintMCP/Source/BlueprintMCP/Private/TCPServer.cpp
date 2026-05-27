@@ -6958,6 +6958,361 @@ namespace
             (unsigned long long)GFrameCounter);
     }
 
+    // ===== v9.23.0 — Graph layout (BP nodes no longer overlap / wires no longer cross) =====
+    //
+    // The LLM places nodes by passing literal (PosX, PosY) ints. Without size
+    // awareness, batches of 30+ nodes end up overlapping and wires crisscross.
+    // Two new tools:
+    //   - auto_layout_graph: one-shot tidy. Topo-sort by exec flow, stack
+    //     each column vertically, data nodes go one column left of consumer.
+    //   - set_node_position: post-hoc manual nudge by anchor.
+    // And add_node-family responses now carry estimated_width/height so the
+    // caller can do better arithmetic up front.
+    //
+    // Width/height estimation: K2Node has UK2Node::EstimateNodeWidth but
+    // that's a static helper requiring the rendered title. The actual SGraphNode
+    // size is only computed after Slate measures it in the editor. We use a
+    // reproducible heuristic from pin count + title length — close enough for
+    // collision avoidance; exact pixel size doesn't matter when columns are
+    // generously padded.
+
+    float EstimateNodeWidth(const UEdGraphNode* Node)
+    {
+        if (Node == nullptr) return 200.0f;
+        // Rough heuristic: title width + widest pin name on each side.
+        const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+        float TitlePx = 60.0f + Title.Len() * 7.5f;
+
+        int32 MaxInputName = 0;
+        int32 MaxOutputName = 0;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin == nullptr || Pin->bHidden) continue;
+            const int32 Len = Pin->PinName.ToString().Len();
+            if (Pin->Direction == EGPD_Input)  MaxInputName  = FMath::Max(MaxInputName,  Len);
+            else                                MaxOutputName = FMath::Max(MaxOutputName, Len);
+        }
+        const float PinsPx = 40.0f + (MaxInputName + MaxOutputName) * 7.5f;
+        // Use the larger of title vs. pin width; clamp to [180, 500].
+        return FMath::Clamp(FMath::Max(TitlePx, PinsPx), 180.0f, 500.0f);
+    }
+
+    float EstimateNodeHeight(const UEdGraphNode* Node)
+    {
+        if (Node == nullptr) return 80.0f;
+        int32 NumInputs = 0, NumOutputs = 0;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin == nullptr || Pin->bHidden) continue;
+            if (Pin->Direction == EGPD_Input)  ++NumInputs;
+            else                                ++NumOutputs;
+        }
+        // Header (~40) + (max(in,out)+1) rows * ~20px.
+        const int32 SideRows = FMath::Max(NumInputs, NumOutputs);
+        return FMath::Clamp(40.0f + (SideRows + 1) * 20.0f, 60.0f, 400.0f);
+    }
+
+    bool NodeHasExecInput(const UEdGraphNode* Node)
+    {
+        if (Node == nullptr) return false;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin != nullptr && !Pin->bHidden
+                && Pin->Direction == EGPD_Input
+                && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+                return true;
+        }
+        return false;
+    }
+
+    bool NodeHasExecOutput(const UEdGraphNode* Node)
+    {
+        if (Node == nullptr) return false;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin != nullptr && !Pin->bHidden
+                && Pin->Direction == EGPD_Output
+                && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+                return true;
+        }
+        return false;
+    }
+
+    TArray<UEdGraphNode*> GetExecSuccessors(const UEdGraphNode* Node)
+    {
+        TArray<UEdGraphNode*> Out;
+        if (Node == nullptr) return Out;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin == nullptr) continue;
+            if (Pin->Direction != EGPD_Output) continue;
+            if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+            for (UEdGraphPin* Linked : Pin->LinkedTo)
+            {
+                if (Linked == nullptr) continue;
+                if (UEdGraphNode* DN = Linked->GetOwningNode())
+                {
+                    Out.AddUnique(DN);
+                }
+            }
+        }
+        return Out;
+    }
+
+    /** All nodes that take any of `DataNode`s data-output pins as a data input. */
+    TArray<UEdGraphNode*> GetDataConsumers(const UEdGraphNode* DataNode)
+    {
+        TArray<UEdGraphNode*> Out;
+        if (DataNode == nullptr) return Out;
+        for (const UEdGraphPin* Pin : DataNode->Pins)
+        {
+            if (Pin == nullptr) continue;
+            if (Pin->Direction != EGPD_Output) continue;
+            if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+            for (UEdGraphPin* Linked : Pin->LinkedTo)
+            {
+                if (Linked == nullptr) continue;
+                if (UEdGraphNode* DN = Linked->GetOwningNode())
+                {
+                    Out.AddUnique(DN);
+                }
+            }
+        }
+        return Out;
+    }
+
+    // ===== v9.23.0 — auto_layout_graph =====
+    //
+    // Algorithm:
+    //   1. Skip Knot (reroute) and Comment nodes — leave alone.
+    //   2. Partition: ExecNodes (any exec pin) vs DataNodes (no exec pin).
+    //   3. Entry = ExecNodes with no exec INPUT (events, FunctionEntry, etc.).
+    //   4. BFS from entries through exec successor links, assigning longest-path
+    //      depth. Re-visit if a longer path is found. Hard cap at NumExecNodes
+    //      iterations per node to truncate cycles deterministically.
+    //   5. Data nodes: depth = min(consumer depth) - 1 (clamped >= 0).
+    //      Orphan data nodes default to column 0.
+    //   6. Group by column, sort within column by current Y, stack vertically
+    //      with (estimated_height + padding_y) stride.
+    //   7. X = origin_x + column * (max_width_in_prev_columns + padding_x).
+
+    FString AutoLayoutGraphOnGameThread(
+        const FString& BlueprintPath,
+        const FString& GraphName,
+        int32 PaddingX,
+        int32 PaddingY,
+        int32 OriginX,
+        int32 OriginY)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("auto_layout_graph");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* Graph = ResolveTargetGraph(Blueprint, GraphName);
+        if (Graph == nullptr)
+            return JsonGraphNotFound(CmdName, GraphName);
+
+        // 1. Collect candidate nodes (skip Knot / Comment).
+        TArray<UEdGraphNode*> AllNodes;
+        for (UEdGraphNode* N : Graph->Nodes)
+        {
+            if (N == nullptr) continue;
+            // Knots are reroute nodes — their position is meaningful for wire shape.
+            // Comment frames likewise wrap other content; leave them alone.
+            const FString Cls = N->GetClass()->GetName();
+            if (Cls == TEXT("K2Node_Knot") || Cls == TEXT("EdGraphNode_Comment")) continue;
+            AllNodes.Add(N);
+        }
+
+        if (AllNodes.Num() == 0)
+        {
+            return FString::Printf(
+                TEXT("{\"ok\":true,\"command\":\"auto_layout_graph\",\"graph\":%s,\"moved_count\":0,\"node_count\":0,\"columns\":0,\"saved\":true}\n"),
+                *EscapeJsonString(GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
+        }
+
+        // 2. Partition.
+        TArray<UEdGraphNode*> ExecNodes;
+        TArray<UEdGraphNode*> DataNodes;
+        for (UEdGraphNode* N : AllNodes)
+        {
+            if (NodeHasExecInput(N) || NodeHasExecOutput(N))
+                ExecNodes.Add(N);
+            else
+                DataNodes.Add(N);
+        }
+
+        // 3. Entry exec nodes (no exec input).
+        TArray<UEdGraphNode*> Entries;
+        for (UEdGraphNode* N : ExecNodes)
+        {
+            if (!NodeHasExecInput(N)) Entries.Add(N);
+        }
+
+        // 4. BFS longest-path depth from entries. Cap at NumExecNodes to truncate cycles.
+        TMap<UEdGraphNode*, int32> Depth;
+        for (UEdGraphNode* N : ExecNodes) Depth.Add(N, 0);
+
+        struct FBfsItem { UEdGraphNode* Node; int32 NewDepth; };
+        TArray<FBfsItem> Queue;
+        for (UEdGraphNode* Entry : Entries)
+        {
+            Queue.Push({Entry, 0});
+        }
+
+        const int32 MaxDepthCap = ExecNodes.Num();   // any node visited at depth > MaxDepthCap is in a cycle
+        int32 SafetyIterations = ExecNodes.Num() * 8 + 16;   // hard guard against pathological input
+        while (Queue.Num() > 0 && SafetyIterations-- > 0)
+        {
+            const FBfsItem Item = Queue.Pop(EAllowShrinking::No);
+            if (Item.NewDepth > MaxDepthCap) continue;     // cycle truncation
+            int32* Existing = Depth.Find(Item.Node);
+            if (Existing == nullptr) continue;
+            if (Item.NewDepth <= *Existing && *Existing != 0) continue;
+            // Accept the deeper depth (or initial assignment from a 0 entry).
+            if (Item.NewDepth > *Existing || (Item.NewDepth == 0 && Entries.Contains(Item.Node)))
+            {
+                *Existing = Item.NewDepth;
+            }
+            for (UEdGraphNode* Succ : GetExecSuccessors(Item.Node))
+            {
+                Queue.Push({Succ, Item.NewDepth + 1});
+            }
+        }
+
+        // 5. Data nodes: pin to (min consumer depth - 1), clamped.
+        // First pass: pure data->exec consumers.
+        TMap<UEdGraphNode*, int32> DataDepth;
+        for (UEdGraphNode* D : DataNodes)
+        {
+            int32 BestDepth = INT_MAX;
+            for (UEdGraphNode* Consumer : GetDataConsumers(D))
+            {
+                if (int32* CD = Depth.Find(Consumer))
+                {
+                    BestDepth = FMath::Min(BestDepth, *CD);
+                }
+                else if (int32* CD2 = DataDepth.Find(Consumer))
+                {
+                    // data->data chain; consumer hasn't been placed yet, skip this pass
+                    BestDepth = FMath::Min(BestDepth, *CD2);
+                }
+            }
+            DataDepth.Add(D, BestDepth == INT_MAX ? 0 : FMath::Max(0, BestDepth - 1));
+        }
+
+        // 6. Combine all into Column → [Node] map.
+        TMap<int32, TArray<UEdGraphNode*>> ColumnNodes;
+        for (const TPair<UEdGraphNode*, int32>& Kv : Depth)
+        {
+            ColumnNodes.FindOrAdd(Kv.Value).Add(Kv.Key);
+        }
+        for (const TPair<UEdGraphNode*, int32>& Kv : DataDepth)
+        {
+            ColumnNodes.FindOrAdd(Kv.Value).Add(Kv.Key);
+        }
+
+        // 7. Sort columns ascending; within each column sort nodes by current Y.
+        TArray<int32> Cols;
+        ColumnNodes.GetKeys(Cols);
+        Cols.Sort();
+
+        // Compute max width of each column → determines next column's X offset.
+        TArray<float> ColumnMaxWidth;
+        ColumnMaxWidth.SetNumZeroed(Cols.Num() == 0 ? 1 : Cols.Last() + 1);
+        for (int32 Col : Cols)
+        {
+            float W = 0.0f;
+            for (UEdGraphNode* N : ColumnNodes[Col])
+            {
+                W = FMath::Max(W, EstimateNodeWidth(N));
+            }
+            ColumnMaxWidth[Col] = W;
+        }
+
+        int32 MovedCount = 0;
+        for (int32 Col : Cols)
+        {
+            TArray<UEdGraphNode*>& ColNodes = ColumnNodes[Col];
+            ColNodes.Sort([](const UEdGraphNode& A, const UEdGraphNode& B) {
+                return A.NodePosY < B.NodePosY;
+            });
+
+            // Compute this column's X = OriginX + sum(prev column widths + padding_x).
+            float X = (float)OriginX;
+            for (int32 PrevCol = 0; PrevCol < Col; ++PrevCol)
+            {
+                X += ColumnMaxWidth[PrevCol] + (float)PaddingX;
+            }
+
+            float Y = (float)OriginY;
+            for (UEdGraphNode* N : ColNodes)
+            {
+                const int32 OldX = N->NodePosX;
+                const int32 OldY = N->NodePosY;
+                N->NodePosX = (int32)X;
+                N->NodePosY = (int32)Y;
+                if (OldX != N->NodePosX || OldY != N->NodePosY) ++MovedCount;
+                Y += EstimateNodeHeight(N) + (float)PaddingY;
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"auto_layout_graph\",\"graph\":%s,")
+            TEXT("\"moved_count\":%d,\"node_count\":%d,\"exec_count\":%d,\"data_count\":%d,")
+            TEXT("\"columns\":%d,\"padding_x\":%d,\"padding_y\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName),
+            MovedCount, AllNodes.Num(), ExecNodes.Num(), DataNodes.Num(),
+            Cols.Num(), PaddingX, PaddingY,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.23.0 — set_node_position =====
+
+    FString SetNodePositionOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        int32 PosX,
+        int32 PosY,
+        const FString& GraphName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_node_position");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* Graph = ResolveTargetGraph(Blueprint, GraphName);
+        if (Graph == nullptr)
+            return JsonGraphNotFound(CmdName, GraphName);
+
+        UEdGraphNode* Node = FindNodeByAnchor(Graph, AnchorName);
+        if (Node == nullptr)
+            return JsonError(CmdName, TEXT("anchor_not_found"), AnchorName);
+
+        const int32 OldX = Node->NodePosX;
+        const int32 OldY = Node->NodePosY;
+        Node->NodePosX = PosX;
+        Node->NodePosY = PosY;
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_node_position\",\"anchor\":%s,")
+            TEXT("\"old_position\":[%d,%d],\"new_position\":[%d,%d],\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            OldX, OldY, PosX, PosY,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
     // ===== v8.3 — Input simulation (v9.9.0 extends with duration + player movement) =====
 
     FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex, float DurationSec)
@@ -7472,7 +7827,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.22.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.23.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -9529,6 +9884,58 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("get_pie_perf_stats"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.23.0 auto_layout_graph (tidy a graph: topo-sort by exec flow, stack columns) ---
+    if (Command.Equals(TEXT("auto_layout_graph"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("auto_layout_graph"), TEXT("missing_field"), TEXT("blueprint"));
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+        int32 PaddingX = 350, PaddingY = 160, OriginX = 0, OriginY = 0;
+        JsonObject->TryGetNumberField(TEXT("padding_x"), PaddingX);
+        JsonObject->TryGetNumberField(TEXT("padding_y"), PaddingY);
+        JsonObject->TryGetNumberField(TEXT("origin_x"),  OriginX);
+        JsonObject->TryGetNumberField(TEXT("origin_y"),  OriginY);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, GraphName, PaddingX, PaddingY, OriginX, OriginY]() mutable
+            {
+                Promise.SetValue(AutoLayoutGraphOnGameThread(Blueprint, GraphName, PaddingX, PaddingY, OriginX, OriginY));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("auto_layout_graph"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.23.0 set_node_position (move a node by anchor) ---
+    if (Command.Equals(TEXT("set_node_position"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, Anchor, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("set_node_position"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor"), Anchor) || Anchor.IsEmpty())
+            return JsonError(TEXT("set_node_position"), TEXT("missing_field"), TEXT("anchor"));
+        int32 PosX = 0, PosY = 0;
+        if (!JsonObject->TryGetNumberField(TEXT("position_x"), PosX))
+            return JsonError(TEXT("set_node_position"), TEXT("missing_field"), TEXT("position_x"));
+        if (!JsonObject->TryGetNumberField(TEXT("position_y"), PosY))
+            return JsonError(TEXT("set_node_position"), TEXT("missing_field"), TEXT("position_y"));
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, Anchor, PosX, PosY, GraphName]() mutable
+            {
+                Promise.SetValue(SetNodePositionOnGameThread(Blueprint, Anchor, PosX, PosY, GraphName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_node_position"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 

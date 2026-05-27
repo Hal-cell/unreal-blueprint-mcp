@@ -1461,6 +1461,129 @@ def delete_actor(actor: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def auto_layout_graph(
+    blueprint: str,
+    graph_name: str = "",
+    padding_x: int = 350,
+    padding_y: int = 160,
+    origin_x: int = 0,
+    origin_y: int = 0,
+) -> dict[str, Any]:
+    """One-shot tidy of a Blueprint graph — v9.23.0.
+
+    Topologically sorts nodes by exec flow and stacks them in columns,
+    fixing the "everything overlaps and wires criss-cross" mess that
+    happens when nodes were placed with literal ``(x, y)`` ints that
+    didn't account for node size. Call this **after** a batch of
+    ``add_node`` / ``add_branch`` / ``add_macro`` / etc. — the LLM
+    no longer needs to think about pixel layout, just topology.
+
+    Algorithm:
+        1. Skip ``K2Node_Knot`` (reroute) and ``EdGraphNode_Comment`` —
+           their positions are intentional.
+        2. Entry nodes = exec nodes with no exec INPUT (events,
+           FunctionEntry, etc.) → column 0.
+        3. BFS through exec successor links; longest-path depth wins.
+           Cycles (e.g. While loops) are truncated at ``num_exec_nodes``.
+        4. Data nodes go one column LEFT of their lowest-depth consumer
+           (orphans default to column 0).
+        5. Within each column, sort by current Y, stack vertically with
+           ``estimated_height + padding_y`` stride.
+        6. X = ``origin_x`` + sum of previous columns' max widths +
+           ``padding_x`` per gap.
+
+    Args:
+        blueprint: Full BP asset path.
+        graph_name: Target graph (default empty = EventGraph). For user
+            functions / macros, pass the graph name (same as ``add_node``).
+        padding_x: Horizontal gap between columns (default 350). Increase
+            for wide nodes (e.g. nodes with many long pin names).
+        padding_y: Vertical gap between stacked nodes (default 160).
+        origin_x, origin_y: Top-left of the laid-out region (default 0,0).
+            Use this if you want to keep, say, an event node in its old
+            spot and lay out everything to the right of it.
+
+    Returns:
+        ``{"ok": True, "graph": "EventGraph", "moved_count": int,
+            "node_count": int, "exec_count": int, "data_count": int,
+            "columns": int, "padding_x": int, "padding_y": int,
+            "saved": True}``
+
+    Limitations:
+        - AnimGraph state machines: state node positions are spatially
+          meaningful; calling this on an AnimGraph rearranges them by
+          exec-flow which usually isn't what you want. Skip AnimGraphs.
+        - Doesn't reroute wires — wires stay straight from node to node.
+          For very tall columns you may still see one wire crossing
+          another column. ``add_reroute`` (future) would fix that.
+
+    Common errors:
+        blueprint_not_found, graph_not_found, game_thread_timeout
+    """
+    if not blueprint:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "auto_layout_graph",
+        "blueprint": blueprint,
+        "padding_x": padding_x,
+        "padding_y": padding_y,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
+def set_node_position(
+    blueprint: str,
+    anchor: str,
+    position_x: int,
+    position_y: int,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Move an existing node to (position_x, position_y) — v9.23.0.
+
+    Lets the LLM nudge individual nodes after the fact — previously the
+    only way to "move" a node was ``delete_node`` + re-add, which broke
+    every wire and anchor reference. Useful for:
+      - touching up after ``auto_layout_graph`` (e.g. push an orphan
+        data node closer to its consumer).
+      - placing nodes manually if you have a specific layout in mind.
+
+    Args:
+        blueprint: Full BP asset path.
+        anchor: Node anchor name (the NodeComment label you set, or a
+            well-known event short-name like ``"begin_play"`` / ``"tick"``).
+        position_x, position_y: New graph-space position.
+        graph_name: Target graph (default empty = EventGraph).
+
+    Returns:
+        ``{"ok": True, "anchor": "...",
+            "old_position": [oldX, oldY], "new_position": [X, Y],
+            "saved": True}``
+
+    Common errors:
+        blueprint_not_found, graph_not_found,
+        anchor_not_found — no node with that NodeComment in the graph
+        game_thread_timeout
+    """
+    if not blueprint or not anchor:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "set_node_position",
+        "blueprint": blueprint,
+        "anchor": anchor,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
 def compile_blueprint(name: str) -> dict[str, Any]:
     """Compile a Blueprint after modifying its graph.
 
