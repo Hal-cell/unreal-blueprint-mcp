@@ -6,7 +6,91 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.22.0.
+Everything shipped through v9.23.0.
+
+---
+
+## [v9.23.0] — 2026-05-27 — auto_layout_graph + set_node_position (fix overlapping nodes + messy wiring)
+
+### Direct user complaint addressed
+
+> "现在你每次blueprint编程接线都很乱，并且node之间会重叠，不方便我查看"
+> ("Every time you wire up a Blueprint it's a mess, and the nodes overlap
+> each other, making it hard to view.")
+
+Root cause: the LLM places nodes by passing literal `(position_x,
+position_y)` ints with no size awareness. For ~70-node BPs (rev16's
+tunnel) the result is unreadable. Two new tools to fix this end-to-end.
+
+### Added — 2 new tools (91 → 93)
+
+- **`auto_layout_graph(blueprint, graph_name="", padding_x=350,
+   padding_y=160, origin_x=0, origin_y=0)`** — one-shot tidy.
+   - Algorithm:
+     - Skip `K2Node_Knot` (reroute) + `EdGraphNode_Comment` (frames);
+       their positions are intentional.
+     - Entries = exec nodes with no exec INPUT (events, FunctionEntry,
+       CustomEvent, InputKey, etc.) → column 0.
+     - BFS through exec-successor links, longest-path depth wins.
+       Cycles capped at `num_exec_nodes` to truncate While loops
+       deterministically (no infinite relaxation).
+     - Data nodes go one column LEFT of their lowest-depth consumer
+       (orphans default to column 0).
+     - Within each column, sort by existing Y, stack with
+       `(estimated_height + padding_y)` stride.
+     - `X = origin_x + sum(prev columns' max widths) + padding_x` per gap.
+   - Returns `moved_count, node_count, exec_count, data_count, columns,
+     padding_x, padding_y, saved`.
+   - **Idempotent** — re-running on an already-tidied graph yields
+     `moved_count=0`.
+
+- **`set_node_position(blueprint, anchor, position_x, position_y, graph_name="")`**
+   — move a single existing node by anchor. Closes the "can't move a
+   node after creating it" gap — previously the only fix was `delete_node`
+   + re-add, which destroyed every wire. Returns `old_position` +
+   `new_position` so the caller can verify.
+
+### Helper utilities (internal)
+
+Added to the anon namespace for layout:
+- `EstimateNodeWidth` / `EstimateNodeHeight` — heuristic from pin count +
+  title length, clamped to `[180, 500]` / `[60, 400]` px.
+- `NodeHasExecInput` / `NodeHasExecOutput`.
+- `GetExecSuccessors` (follow `PC_Exec` output pins to downstream nodes).
+- `GetDataConsumers` (follow data output pins to consuming nodes).
+
+### Verification
+
+Live smoke on a deliberately-overlapping BP (10 nodes all placed at
+`(0, 0)`, exec chain `begin_play → p1 → br1 → p2 → d1` plus a data
+variable get feeding the branch condition via int→bool auto-conversion):
+
+- After `auto_layout_graph`:
+  - Exec chain x-coords: `(0, 582, 1142, 1672, 2202)` — strictly
+    monotonic left-to-right ✅
+  - Data node `g_v` at column 0 (x=0), consumer `br1` at column 2 (x=1142)
+    — data placed left of consumer ✅
+  - 7 anchors, 7 unique positions — zero overlap ✅
+  - Second pass: `moved_count=0` — idempotent ✅
+
+- `set_node_position`:
+  - Move + verify via returned `old_position`/`new_position` ✅
+  - `anchor_not_found` error path ✅
+
+Tests: +8 mock (302 → 310). Integration: 10/10 passed clean.
+
+### Limitations
+
+- **AnimGraph state machines**: state node positions are spatially
+  meaningful (the editor lets you arrange the state diagram by hand);
+  calling `auto_layout_graph` on an AnimGraph rearranges them by
+  exec-flow which usually isn't what you want. Skip AnimGraphs.
+- **No wire rerouting**: wires stay straight from node to node. For
+  very tall columns you may still see one wire crossing another
+  column's gap. A future `add_reroute` tool would fix that.
+
+### `ping.plugin_version`
+"9.22.0" → **"9.23.0"**.
 
 ---
 
