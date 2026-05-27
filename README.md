@@ -5,9 +5,9 @@
 Say it: *"Make a Blueprint that prints 'hello world' on BeginPlay, then spawn it."*
 Get it: an actual `.uasset`, wired graph, compiled, and an instance sitting in your level — ready to PIE.
 
-[![v9.23.0](https://img.shields.io/badge/version-v9.23.0-brightgreen)](#status)
-[![93 tools](https://img.shields.io/badge/tools-93-blue)](#tools)
-[![310 tests](https://img.shields.io/badge/tests-310%20passing-success)](#requirements)
+[![v9.24.0](https://img.shields.io/badge/version-v9.24.0-brightgreen)](#status)
+[![95 tools](https://img.shields.io/badge/tools-95-blue)](#tools)
+[![320 tests](https://img.shields.io/badge/tests-320%20passing-success)](#requirements)
 [![UE 5.4](https://img.shields.io/badge/UE-5.4-orange)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -86,7 +86,8 @@ There are larger projects in this space ([`chongdashu/unreal-mcp`](https://githu
 | **v9.21.0** | ✅ `get_pie_perf_stats` (closes rev15 ISSUE-1 — reads engine perf globals: `average_fps` / `average_frame_ms` / `delta_time_ms` / `game_thread_ms` / `render_thread_ms` / `rhi_thread_ms` / `gpu_frame_ms` / `frame_counter` / `pie_running`; equivalent of `stat unit` so optimization tasks can quantify before/after) + `add_node` docstring lists common `KismetArrayLibrary` C++ names with display-name mapping (closes rev15 ISSUE-2 — calls out `Array_Remove` takes index vs `Array_RemoveItem` takes value, plus 13 other staples) |
 | **v9.22.0** | ✅ Four rev16 fixes: `add_component_get` regression on ISM (closes rev16 ISSUE-1 — force-compile + pin synthesis so SCS-added components' Get nodes always have output pins, even without a manual `compile_blueprint` in between) + `connect_pins` int→real auto-conversion now reports `ok=true, conversion_inserted=true` instead of `connection_dropped` (closes rev16 ISSUE-2 — handles `CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE` via link-delta check) + `list_level_actors(world="auto"\|"editor"\|"pie")` so the LLM can see PIE-spawned actors during a running PIE session (closes rev16 ISSUE-3) + `add_property_set` docstring documents the deferred-spawn-needs-Cast pattern (closes rev16 ISSUE-4 — `BeginDeferredActorSpawnFromClass.ReturnValue` is base-`Actor`-typed even with a concrete `ActorClass`) |
 | **v9.23.0** | ✅ Graph readability fix — direct user pain: nodes overlap, wires crisscross. Two new tools: `auto_layout_graph(padding_x=350, padding_y=160)` one-shot tidy that topo-sorts by exec flow (entries → column 0, BFS longest-path depth, data nodes placed left of their consumer, idempotent on second pass) + `set_node_position(anchor, x, y)` for post-hoc nudging (returns `old_position`/`new_position`; closes the "can't move a node after creating it" gap that previously forced delete+re-add). Smoke: 10 overlapping nodes at (0,0) → exec chain laid out at x=(0, 582, 1142, 1672, 2202), 7 unique positions, zero overlap |
-| **Unit tests** | **310 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
+| **v9.24.0** | ✅ Three improvements: (1) `auto_layout_graph` **v2 rewrite** — fixes v9.23's "all data nodes in one giant column" problem. Now uses per-entry **lanes** (each entry's exec chain gets its own horizontal Y-band; chains never overlap) + **data nodes hug their specific consumer** (variable gets / math nodes fan out vertically just to the left of the exec node consuming them, not stacked among unrelated data) + **median-of-predecessors sort** within columns (Sugiyama-style crossing reduction). Smoke verified: 2 chains separated by 1160 px in Y, data node g_s1 = 245 px from its consumer p1 vs 775 / 1405 px from unrelated nodes. (2) `delete_component(component_name)` — closes rev17 ISSUE-1, symmetric to `add_component`, uses `RemoveNodeAndPromoteChildren` so attached children re-parent cleanly. (3) `add_component_bound_event(component_name, delegate_name)` — closes rev17 ISSUE-2, spawns `K2Node_ComponentBoundEvent` so the LLM can write true event-driven flow (`OnComponentHit` / `OnComponentBeginOverlap` / `Button.OnClicked` / etc.) instead of falling back to per-frame `GetAllActorsOfClass` polling |
+| **Unit tests** | **320 passing**, 10 integration tests gated on a running UE editor (GUI 10/10, headless 8/10 + 2 explicit skips) |
 | **Plugin binary** | **~1.0 MB** dylib on macOS / UE 5.4.4 |
 
 ## Requirements

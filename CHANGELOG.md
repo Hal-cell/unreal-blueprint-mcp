@@ -6,7 +6,132 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.23.0.
+Everything shipped through v9.24.0.
+
+---
+
+## [v9.24.0] — 2026-05-27 — auto_layout v2 (per-entry lanes + data-hug) + delete_component + add_component_bound_event (closes rev17 ISSUE-1/2)
+
+### Direct user complaint (again)
+
+> "你现在这个node排布方式太离谱了，这个线接的乱七八糟的"
+> ("Your current node layout is ridiculous; the wires are a tangled mess.")
+
+v9.23 was the first attempt at layout but the algorithm was too crude:
+- All data nodes were dumped into one giant column at `consumer.depth - 1`,
+  creating a vertical wall of variable-gets / math nodes with wires
+  fanning out chaotically to find their specific consumer.
+- Multiple entries (BeginPlay + Tick + auto-spawned ActorBeginOverlap) all
+  stacked in column 0, so their downstream chains overlapped each other
+  in a single canvas region.
+- Within a column, sort-by-current-Y meant adjacent-column consumers
+  often forced wires to cross unnecessarily.
+
+### `auto_layout_graph` v2 (rewrite)
+
+Three structural fixes:
+
+- **Per-entry lanes**: each entry (BeginPlay, Tick, CustomEvent,
+  FunctionEntry, InputAction event, etc.) and its BFS-reachable exec
+  successors form one "chain" that gets its own horizontal Y-band
+  stacked top-to-bottom. Chains never overlap. Inter-chain gap =
+  `max(padding_y * 1.5, 200)` px.
+
+- **Data nodes hug their specific exec consumer**: for each exec node
+  E, its data-input nodes are placed in a vertical fan just to its
+  left at `(E.x - 0.7 * padding_x, E.y ± fan_offset)`. A data node
+  with multiple consumers binds to the first visited; wires extend to
+  the others from there. Data → data chains are placed leftward
+  iteratively. Orphans go to a bottom row below all chains.
+
+- **Median-of-predecessors sort within each column**: standard
+  Sugiyama-style layered-graph-drawing heuristic. For col N+1, each
+  node is ordered by the median rank of its exec predecessors in col N.
+  Result: when A(top) → C(top) and B(bottom) → D(bottom), C/D come out
+  in the right order rather than crossed.
+
+Response now includes `chains` field (number of distinct entry-rooted
+exec subgraphs). All other fields unchanged — backward compatible.
+
+**Live verification** (BP with 2 separate exec chains + 3 string vars
+each feeding their own PrintString):
+
+```
+       col 0 (x=0)  col 1 (x=337)  col 2 (x=582)  col 3 (x=867)  col 4 (x=1112)
+y=0    begin_play   g_s1           p1             g_s2           p2
+y=1160 tick         g_s3           p3
+```
+
+- Chains separated by 1160 px in Y — clean horizontal lanes ✅
+- g_s1 ↔ p1 (its consumer) = 245 px L1 distance
+- g_s1 ↔ p2 = 775 px, g_s1 ↔ p3 = 1405 px — variable correctly nearest
+  to its specific consumer ✅
+- Idempotent on second pass ✅
+
+### Closes rev17 issues
+
+- **ISSUE-1** (medium) — Missing `delete_component`. User asked to
+  remove the `TopCam` camera from `BP_RippleGrid`; only `add_component`
+  existed, not its inverse. Had to instruct the user to do it manually
+  in the editor.
+- **ISSUE-2** (low-medium) — Missing component-level event binding
+  (`OnComponentHit`, `OnComponentBeginOverlap`, etc.). LLM had to fall
+  back to `Tick` + `GetAllActorsOfClass` per-frame polling for the
+  "physics ball hits ripple grid" feature instead of true event-driven
+  flow.
+
+### Added — 2 new tools + 1 algorithm rewrite (93 → 95)
+
+- **`delete_component(blueprint, component_name)`** — symmetric to
+  `add_component`. Removes the named component from the BP's SCS using
+  `RemoveNodeAndPromoteChildren` (attached children get re-parented; no
+  dangling orphans). Force-compiles afterward so the FProperty surface
+  updates immediately. Caller still needs to `delete_node` any graph-side
+  references separately (`add_component_get` nodes, `set_component_property`
+  calls).
+
+- **`add_component_bound_event(blueprint, component_name, delegate_name,
+   anchor_name, position_x=0, position_y=0, graph_name="")`** — spawns a
+   `K2Node_ComponentBoundEvent`, mirroring what the editor produces when
+   you click "+" on a delegate pin in the Details panel. Resolves the
+   component's class via SCS or the generated class's `FObjectProperty`,
+   finds the named `FMulticastDelegateProperty` on that class, and calls
+   `InitializeComponentBoundEventParams` so the node compiles.
+
+   Common (component, delegate) pairs documented in the docstring:
+   `OnComponentHit` / `OnComponentBeginOverlap` / `OnComponentEndOverlap`
+   / `OnClicked` / `OnComponentWake` / etc. for primitive components,
+   plus `Button.OnClicked` / `Slider.OnValueChanged` / etc. for UMG.
+
+   Error handling:
+   - `delegate_not_found` — response includes hint listing first 12
+     available multicast delegates on the component's class.
+   - `binding_exists` — refuses a second binding to the same
+     `(component, delegate)` pair (UE only fires the first anyway).
+   - Force-compiles if the component FProperty isn't on the generated
+     class yet (same v9.22 ISM-fix pattern, so a fresh `add_component`
+     immediately followed by `add_component_bound_event` works).
+
+### Helper utilities (internal)
+
+Added to anon namespace for the layout v2 pass:
+- `GetExecPredecessors` (inverse of `GetExecSuccessors` — needed for
+  median sort).
+- `GetDataInputNodesOrdered` (per-exec-node data input enumeration in
+  pin order — the data-hug pass walks this).
+
+### Tests (+10 mock, total 320)
+
+- `test_auto_layout_graph_response_includes_chains_field`
+- `test_delete_component_success / _not_found / _missing_args`
+- `test_add_component_bound_event_success / _delegate_not_found /
+  _binding_exists / _missing_args / _with_graph_name`
+- `test_ping_returns_plugin_version_9_24_0`
+
+Integration: 10/10 passed clean.
+
+### `ping.plugin_version`
+"9.23.0" → **"9.24.0"**.
 
 ---
 
