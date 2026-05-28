@@ -5781,3 +5781,228 @@ def test_ping_returns_plugin_version_9_25_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.25.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.26.0 — Timeline (add/track/key) + duplicate_blueprint + level mgmt (rev19)
+# ---------------------------------------------------------------------------
+
+
+def test_add_timeline_basic() -> None:
+    response = (
+        b'{"ok":true,"command":"add_timeline","anchor_name":"tl_advance",'
+        b'"timeline_name":"AdvanceTL","node_guid":"00000000-0000-0000-0000-000000000010",'
+        b'"length_seconds":2.2,"loop":false,"autoplay":false,'
+        b'"pins":[{"name":"Play","direction":"input","type":"exec","container":"none"},'
+        b'{"name":"PlayFromStart","direction":"input","type":"exec","container":"none"},'
+        b'{"name":"Stop","direction":"input","type":"exec","container":"none"},'
+        b'{"name":"Reverse","direction":"input","type":"exec","container":"none"},'
+        b'{"name":"Update","direction":"output","type":"exec","container":"none"},'
+        b'{"name":"Finished","direction":"output","type":"exec","container":"none"},'
+        b'{"name":"Direction","direction":"output","type":"byte","container":"none"}],'
+        b'"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_timeline(
+            blueprint="/Game/BP_T",
+            anchor_name="tl_advance",
+            timeline_name="AdvanceTL",
+            length_seconds=2.2,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["command"] == "add_timeline"
+    assert sent_dict["timeline_name"] == "AdvanceTL"
+    assert sent_dict["length_seconds"] == 2.2
+    assert sent_dict["loop"] is False
+    assert sent_dict["autoplay"] is False
+    assert r["ok"] is True
+    pin_names = {p["name"] for p in r["pins"]}
+    assert "Play" in pin_names and "Update" in pin_names and "Finished" in pin_names
+
+
+def test_add_timeline_loop_autoplay_payload() -> None:
+    response = (
+        b'{"ok":true,"command":"add_timeline","anchor_name":"tl","timeline_name":"L",'
+        b'"node_guid":"x","length_seconds":1.0,"loop":true,"autoplay":true,'
+        b'"pins":[],"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.add_timeline(
+            blueprint="/Game/BP_T", anchor_name="tl", timeline_name="L",
+            length_seconds=1.0, loop=True, autoplay=True, graph_name="MyFunc",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["loop"] is True
+    assert sent_dict["autoplay"] is True
+    assert sent_dict["graph_name"] == "MyFunc"
+
+
+def test_add_timeline_name_exists() -> None:
+    response = (
+        b'{"ok":false,"command":"add_timeline","error":"timeline_name_exists",'
+        b'"detail":"AdvanceTL"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_timeline(blueprint="/Game/BP_T", anchor_name="x", timeline_name="AdvanceTL")
+    assert r["ok"] is False
+    assert r["error"] == "timeline_name_exists"
+
+
+def test_add_timeline_track_float_success() -> None:
+    response = (
+        b'{"ok":true,"command":"add_timeline_track_float","timeline_name":"AdvanceTL",'
+        b'"track_name":"Alpha","track_count":1,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.add_timeline_track_float(
+            blueprint="/Game/BP_T", timeline_name="AdvanceTL", track_name="Alpha",
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "add_timeline_track_float",
+        "blueprint": "/Game/BP_T",
+        "timeline_name": "AdvanceTL",
+        "track_name": "Alpha",
+    }
+    assert r["track_count"] == 1
+
+
+def test_set_timeline_curve_key_default_cubic() -> None:
+    response = (
+        b'{"ok":true,"command":"set_timeline_curve_key","timeline_name":"AdvanceTL",'
+        b'"track_name":"Alpha","time":0.0,"value":0.0,"interp_mode":"cubic",'
+        b'"replaced":false,"key_count":1,"saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.set_timeline_curve_key(
+            blueprint="/Game/BP_T", timeline_name="AdvanceTL",
+            track_name="Alpha", time=0.0, value=0.0,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["interp_mode"] == "cubic"
+    assert r["replaced"] is False
+    assert r["key_count"] == 1
+
+
+def test_set_timeline_curve_key_replace_existing() -> None:
+    response = (
+        b'{"ok":true,"command":"set_timeline_curve_key","timeline_name":"AdvanceTL",'
+        b'"track_name":"Alpha","time":0.5,"value":0.7,"interp_mode":"linear",'
+        b'"replaced":true,"key_count":2,"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_timeline_curve_key(
+            blueprint="/Game/BP_T", timeline_name="AdvanceTL",
+            track_name="Alpha", time=0.5, value=0.7, interp_mode="linear",
+        )
+    assert r["replaced"] is True
+
+
+def test_set_timeline_curve_key_invalid_interp() -> None:
+    response = (
+        b'{"ok":false,"command":"set_timeline_curve_key","error":"invalid_interp_mode",'
+        b'"detail":"Got \'sigmoid\' \xe2\x80\x94 must be \'linear\' | \'cubic\' | \'constant\'"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.set_timeline_curve_key(
+            blueprint="/Game/BP_T", timeline_name="A", track_name="X",
+            time=0, value=0, interp_mode="sigmoid",
+        )
+    assert r["error"] == "invalid_interp_mode"
+
+
+def test_duplicate_blueprint_success() -> None:
+    response = (
+        b'{"ok":true,"command":"duplicate_blueprint",'
+        b'"source":"/Game/BP_X","dest":"/Game/BP_X1",'
+        b'"dest_class":"Blueprint","saved":true}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.duplicate_blueprint(source_path="/Game/BP_X", dest_path="/Game/BP_X1")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "duplicate_blueprint",
+        "source_path": "/Game/BP_X",
+        "dest_path": "/Game/BP_X1",
+    }
+    assert r["dest_class"] == "Blueprint"
+
+
+def test_duplicate_blueprint_refuses_overwrite() -> None:
+    response = (
+        b'{"ok":false,"command":"duplicate_blueprint","error":"dest_exists",'
+        b'"detail":"\'/Game/BP_X1\' already exists; delete first or pick a different path"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.duplicate_blueprint(source_path="/Game/BP_X", dest_path="/Game/BP_X1")
+    assert r["ok"] is False
+    assert r["error"] == "dest_exists"
+
+
+def test_create_level_success() -> None:
+    response = b'{"ok":true,"command":"create_level","level":"/Game/Levels/MyL","saved":true}\n'
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.create_level(level_path="/Game/Levels/MyL")
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {"command": "create_level", "level_path": "/Game/Levels/MyL"}
+    assert r["ok"] is True
+
+
+def test_create_level_already_exists() -> None:
+    response = (
+        b'{"ok":false,"command":"create_level","error":"level_exists",'
+        b'"detail":"/Game/Levels/MyL already exists; use load_level to open it"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.create_level(level_path="/Game/Levels/MyL")
+    assert r["error"] == "level_exists"
+
+
+def test_load_level_returns_active_world() -> None:
+    response = (
+        b'{"ok":true,"command":"load_level","level":"/Game/Levels/MyL",'
+        b'"active_world":"MyL","active_world_path":"/Game/Levels/MyL"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.load_level(level_path="/Game/Levels/MyL")
+    assert r["active_world"] == "MyL"
+    assert r["active_world_path"] == "/Game/Levels/MyL"
+
+
+def test_list_levels_returns_count_and_active_flag() -> None:
+    response = (
+        b'{"ok":true,"command":"list_levels","folder":"/Game",'
+        b'"active_world_path":"/Game/Levels/Main",'
+        b'"levels":['
+        b'{"name":"Main","path":"/Game/Levels/Main","active":true},'
+        b'{"name":"AV_Cube","path":"/Game/Levels/AV_Cube","active":false}'
+        b'],"count":2}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.list_levels()
+    assert r["count"] == 2
+    main = next(l for l in r["levels"] if l["name"] == "Main")
+    assert main["active"] is True
+
+
+def test_ping_returns_plugin_version_9_26_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.26.0","build_date":"May 28 2026 18:00:00",'
+        b'"timestamp":"2026-05-28T18:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.26.0"

@@ -52,6 +52,9 @@ public class BlueprintMCP : ModuleRules
             // v9.21.0: RenderCore — GGameThreadTime / GRenderThreadTime /
             // GRHIThreadTime perf globals for get_pie_perf_stats
             "RenderCore",
+            // v9.26.0: LevelEditor — ULevelEditorSubsystem for create_level /
+            // load_level (MISSING-3). Replaces deprecated UEditorLevelLibrary.
+            "LevelEditor",
         });
     }
 }

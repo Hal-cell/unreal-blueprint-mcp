@@ -1593,6 +1593,311 @@ def set_node_position(
     return _send_command(payload)
 
 
+# ---------------------------------------------------------------------------
+# v9.26.0 — Timeline / duplicate_blueprint / level management (closes rev19)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def add_timeline(
+    blueprint: str,
+    anchor_name: str,
+    timeline_name: str,
+    length_seconds: float = 1.0,
+    loop: bool = False,
+    autoplay: bool = False,
+    position_x: int = 0,
+    position_y: int = 0,
+    graph_name: str = "",
+) -> dict[str, Any]:
+    """Spawn a K2Node_Timeline + UTimelineTemplate — v9.26.0 (closes rev19 MISSING-1).
+
+    Timeline is UE's native "play a curve over a fixed duration" primitive.
+    Common use cases: trigger a smooth camera advance / fade-in / curve-driven
+    movement that auto-stops at the end (no per-frame ``FInterpTo`` bookkeeping).
+
+    The spawned node has these pins (visible via ``add_node``-style ``pins[]``):
+        Inputs:  ``Play`` / ``PlayFromStart`` / ``Stop`` / ``Reverse`` /
+                 ``ReverseFromEnd`` / ``SetNewTime`` (with ``NewTime`` float input)
+        Outputs: ``Update`` (exec — fires every frame while playing) /
+                 ``Finished`` (exec — fires once when reaching end) /
+                 ``Direction`` (enum — Forward / Reverse) /
+                 ``<TrackName>`` (float per track added — see ``add_timeline_track_float``)
+
+    Add tracks with ``add_timeline_track_float(blueprint, timeline_name, track_name)``
+    THEN ``set_timeline_curve_key(..., time, value, interp_mode)`` to define
+    the curve shape. The new ``<TrackName>`` output pin appears after the
+    track is added.
+
+    Args:
+        blueprint: BP asset path.
+        anchor_name: User-given label (unique within the target graph).
+            Used for ``connect_pins("<anchor>.<pin>")`` references.
+        timeline_name: UE-internal name for the timeline (becomes a UProperty
+            on the generated class — also drives the
+            ``<TrackName>`` pin prefix when reading).
+        length_seconds: Duration in seconds (default 1.0). The timeline's
+            ``Finished`` exec fires when ``Play`` reaches this length.
+        loop: If True, ``Play`` restarts at 0 on reaching the end instead
+            of firing ``Finished``. (default False)
+        autoplay: If True, the timeline plays automatically when the
+            owning Actor's BeginPlay fires — no need to connect ``Play``
+            manually. (default False)
+        position_x, position_y: Graph position.
+        graph_name: Target graph (default empty = EventGraph). Note:
+            timelines are spawned on the BP, not on a function graph, so
+            their per-track curve data follows the BP across function refs.
+
+    Returns:
+        ``{"ok": True, "anchor_name": ..., "timeline_name": ...,
+            "node_guid": ..., "length_seconds": float,
+            "loop": bool, "autoplay": bool, "pins": [...], "saved": True}``
+        ``pins`` includes Play / PlayFromStart / Stop / Reverse / Update /
+        Finished / Direction (no per-track pins yet — add those next).
+
+    Common errors:
+        blueprint_not_found, graph_not_found, anchor_name_exists,
+        timeline_name_exists  — another timeline on this BP already uses
+                                this name (UE compile fails on duplicates)
+        timeline_template_failed — internal — UE rejected the AddNewTimeline
+                                   call (rare; usually means BP is in a
+                                   broken state)
+    """
+    if not blueprint or not anchor_name or not timeline_name:
+        return {"ok": False, "error": "missing_argument"}
+    payload: dict[str, Any] = {
+        "command": "add_timeline",
+        "blueprint": blueprint,
+        "anchor_name": anchor_name,
+        "timeline_name": timeline_name,
+        "length_seconds": length_seconds,
+        "loop": loop,
+        "autoplay": autoplay,
+        "position_x": position_x,
+        "position_y": position_y,
+    }
+    if graph_name:
+        payload["graph_name"] = graph_name
+    return _send_command(payload)
+
+
+@mcp.tool()
+def add_timeline_track_float(
+    blueprint: str,
+    timeline_name: str,
+    track_name: str,
+) -> dict[str, Any]:
+    """Add a float curve track to a Timeline — v9.26.0.
+
+    After this call, the K2Node_Timeline gets a new output pin named
+    ``<track_name>`` that emits the curve's interpolated value while the
+    timeline is playing. Define the curve shape with
+    ``set_timeline_curve_key(blueprint, timeline_name, track_name, time, value)``.
+
+    The K2Node is ``ReconstructNode``-ed automatically so the new pin
+    appears in the next ``get_blueprint`` / ``connect_pins`` call without
+    needing a manual rebuild.
+
+    Args:
+        blueprint: BP asset path.
+        timeline_name: Must match what you passed to ``add_timeline``.
+        track_name: Name of the new track (becomes the output pin name
+            on the timeline node).
+
+    Returns:
+        ``{"ok": True, "timeline_name": ..., "track_name": ...,
+            "track_count": int, "saved": True}``
+        ``track_count`` = total float tracks on this timeline now.
+
+    Common errors:
+        blueprint_not_found
+        timeline_not_found  — no timeline with that name on this BP
+                              (use ``add_timeline`` first)
+        track_name_exists   — another track on this timeline already uses
+                              this name
+    """
+    if not blueprint or not timeline_name or not track_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "add_timeline_track_float",
+        "blueprint": blueprint,
+        "timeline_name": timeline_name,
+        "track_name": track_name,
+    })
+
+
+@mcp.tool()
+def set_timeline_curve_key(
+    blueprint: str,
+    timeline_name: str,
+    track_name: str,
+    time: float,
+    value: float,
+    interp_mode: str = "cubic",
+) -> dict[str, Any]:
+    """Add or update a keyframe on a timeline's float track — v9.26.0.
+
+    If a key already exists at this ``time`` (within 1e-4 tolerance), its
+    value + interp mode are updated in place. Otherwise a new key is
+    added. This makes it safe to iterate over the same time twice in a
+    setup script without producing duplicate keys.
+
+    Typical use — define a 0..1 ramp:
+        ``set_timeline_curve_key(BP, "MyTimeline", "Alpha", time=0.0, value=0.0)``
+        ``set_timeline_curve_key(BP, "MyTimeline", "Alpha", time=1.0, value=1.0)``
+
+    Args:
+        blueprint: BP asset path.
+        timeline_name: Must match an existing timeline on this BP.
+        track_name: Must match an existing track on that timeline.
+        time: Key time in seconds (0 = start of timeline, ``length_seconds``
+            = end).
+        value: Float value at that time.
+        interp_mode: Interpolation mode out of this key. One of:
+            - ``"linear"`` — straight-line interpolation to the next key.
+            - ``"cubic"`` (default) — smooth tangent-based interpolation.
+              UE editor's default for "Add Key".
+            - ``"constant"`` — value holds until next key (step function).
+
+    Returns:
+        ``{"ok": True, "timeline_name": ..., "track_name": ...,
+            "time": float, "value": float, "interp_mode": str,
+            "replaced": bool, "key_count": int, "saved": True}``
+        ``replaced=True`` if a key at this time already existed.
+        ``key_count`` = total keys on the curve now.
+
+    Common errors:
+        blueprint_not_found, timeline_not_found, track_not_found,
+        track_curve_missing — internal; the FTTFloatTrack lacks its
+                              UCurveFloat (rare; means asset corruption)
+        invalid_interp_mode — not one of linear / cubic / constant
+    """
+    if not blueprint or not timeline_name or not track_name:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "set_timeline_curve_key",
+        "blueprint": blueprint,
+        "timeline_name": timeline_name,
+        "track_name": track_name,
+        "time": time,
+        "value": value,
+        "interp_mode": interp_mode,
+    })
+
+
+@mcp.tool()
+def duplicate_blueprint(source_path: str, dest_path: str) -> dict[str, Any]:
+    """Copy a Blueprint asset to a new path — v9.26.0 (closes rev19 MISSING-2).
+
+    Symmetric to "right-click → Duplicate" in the editor's Content Browser.
+    Uses ``UEditorAssetLibrary::DuplicateAsset`` internally — the new BP
+    is a deep copy (variables, components, graphs, defaults all carry over)
+    and saved to disk.
+
+    Use this when you want to "fork" a BP — keep the original, work on a
+    copy. Common patterns: experimenting with a variant, making a
+    feature-flag-style toggle copy, etc.
+
+    **Refuses to overwrite**: if ``dest_path`` already exists, returns
+    ``dest_exists`` error. Delete the existing one first with
+    ``delete_blueprint(path=dest_path)`` if you really want to replace.
+
+    Args:
+        source_path: Source BP asset path (e.g. ``/Game/Blueprints/BP_X``).
+            Must exist and be a Blueprint.
+        dest_path: Destination asset path (e.g. ``/Game/Blueprints/BP_X1``).
+            Must NOT already exist.
+
+    Returns:
+        ``{"ok": True, "source": ..., "dest": ..., "dest_class": str, "saved": True}``
+
+    Common errors:
+        blueprint_not_found — source path doesn't resolve to a Blueprint
+        dest_exists         — dest_path already has an asset
+        duplicate_failed    — UEditorAssetLibrary refused the copy
+                              (e.g. source-control lock, write permission)
+    """
+    if not source_path or not dest_path:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({
+        "command": "duplicate_blueprint",
+        "source_path": source_path,
+        "dest_path": dest_path,
+    })
+
+
+@mcp.tool()
+def create_level(level_path: str) -> dict[str, Any]:
+    """Create a new empty level (UWorld asset) — v9.26.0 (closes rev19 MISSING-3).
+
+    Uses ``ULevelEditorSubsystem::NewLevel`` — the UE 5.x replacement for
+    the deprecated ``UEditorLevelLibrary::NewLevel``. The new level is
+    created AND saved at the given path, but is NOT automatically loaded
+    as the active editor world (use ``load_level`` for that).
+
+    Args:
+        level_path: Asset path for the new level
+            (e.g. ``/Game/Levels/MyLevel`` — no extension).
+
+    Returns:
+        ``{"ok": True, "level": "...", "saved": True}``
+
+    Common errors:
+        level_exists       — asset already exists at this path
+        create_failed      — UE refused (e.g. invalid path, source-control)
+        no_level_subsystem — GEditor null or subsystem unavailable
+    """
+    if not level_path:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "create_level", "level_path": level_path})
+
+
+@mcp.tool()
+def load_level(level_path: str) -> dict[str, Any]:
+    """Switch the active editor world to the given level — v9.26.0.
+
+    Use this to "open" a level so subsequent ``spawn_actor`` / ``list_level_actors``
+    / etc. target the right world. Replaces what the editor's
+    File → Open Level dialog does.
+
+    Args:
+        level_path: Asset path of an existing level
+            (e.g. ``/Game/Levels/MyLevel``).
+
+    Returns:
+        ``{"ok": True, "level": "...", "active_world": "MyLevel",
+            "active_world_path": "/Game/Levels/MyLevel"}``
+        ``active_world`` / ``active_world_path`` reflect what UE now has
+        loaded — useful to verify the switch took effect.
+
+    Common errors:
+        level_not_found  — no asset at that path
+        load_failed      — UE refused (check Output Log for details)
+        no_level_subsystem
+    """
+    if not level_path:
+        return {"ok": False, "error": "missing_argument"}
+    return _send_command({"command": "load_level", "level_path": level_path})
+
+
+@mcp.tool()
+def list_levels(folder: str = "/Game") -> dict[str, Any]:
+    """List all level (UWorld) assets in a folder — v9.26.0.
+
+    Uses the asset registry to enumerate all ``UWorld`` assets recursively
+    under ``folder``. Each entry includes a ``active`` flag so you can
+    tell which level is currently loaded.
+
+    Args:
+        folder: ``/Game``-rooted folder (default ``/Game`` = entire project).
+
+    Returns:
+        ``{"ok": True, "folder": "...", "active_world_path": "...",
+            "levels": [{"name", "path", "active"}, ...], "count": int}``
+    """
+    return _send_command({"command": "list_levels", "folder": folder})
+
+
 @mcp.tool()
 def compile_blueprint(name: str) -> dict[str, Any]:
     """Compile a Blueprint after modifying its graph.

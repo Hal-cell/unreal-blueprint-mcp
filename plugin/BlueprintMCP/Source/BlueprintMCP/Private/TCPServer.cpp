@@ -72,6 +72,18 @@
 // (OnComponentHit, OnComponentBeginOverlap, OnClicked, etc.)
 #include "K2Node_ComponentBoundEvent.h"
 
+// v9.26.0: add_timeline — K2Node_Timeline + UTimelineTemplate + float tracks
+// (closes rev19 MISSING-1)
+#include "K2Node_Timeline.h"
+#include "Engine/TimelineTemplate.h"
+#include "Curves/CurveFloat.h"
+#include "Curves/RichCurve.h"
+#include "Curves/KeyHandle.h"
+
+// v9.26.0: create_level / load_level — modern ULevelEditorSubsystem replaces
+// the deprecated UEditorLevelLibrary (closes rev19 MISSING-3)
+#include "LevelEditorSubsystem.h"
+
 // Spike B9: add_variable (+ TimerHandle struct)
 #include "Engine/EngineTypes.h"  // FTimerHandle
 
@@ -7887,6 +7899,392 @@ namespace
             bSaved ? TEXT("true") : TEXT("false"));
     }
 
+    // ===== v9.26.0 — Timeline tools (closes rev19 MISSING-1) =====
+    //
+    // Three tools together create a working K2Node_Timeline + float track + keys:
+    //   add_timeline             — UTimelineTemplate + K2Node_Timeline (length, loop, autoplay flags)
+    //   add_timeline_track_float — adds an FTTFloatTrack with a fresh UCurveFloat
+    //   set_timeline_curve_key   — keyframe on the track's curve (time, value, interp_mode)
+    //
+    // After adding tracks, K2Node_Timeline::ReconstructNode regenerates pins so the
+    // new "<TrackName>" output appears. Pins on a Timeline node:
+    //   inputs:  Play, PlayFromStart, Stop, Reverse, ReverseFromEnd, SetNewTime, NewTime
+    //   outputs: Update (exec), Finished (exec), Direction (enum), <TrackName> (float per track)
+
+    FString AddTimelineOnGameThread(
+        const FString& BlueprintPath,
+        const FString& AnchorName,
+        const FString& TimelineName,
+        float LengthSeconds,
+        bool bLoop,
+        bool bAutoPlay,
+        int32 PosX, int32 PosY,
+        const FString& GraphName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_timeline");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        UEdGraph* TargetGraph = ResolveTargetGraph(Blueprint, GraphName);
+        if (TargetGraph == nullptr)
+            return JsonGraphNotFound(CmdName, GraphName);
+
+        if (FindNodeByAnchor(TargetGraph, AnchorName) != nullptr)
+            return JsonError(CmdName, TEXT("anchor_name_exists"), AnchorName);
+
+        const FName TLFName(*TimelineName);
+
+        // Refuse duplicate timeline name on this BP (UE itself errors at compile
+        // if there are two with the same name; surface a clean error here).
+        for (UTimelineTemplate* Existing : Blueprint->Timelines)
+        {
+            if (Existing != nullptr && Existing->GetVariableName() == TLFName)
+            {
+                return JsonError(CmdName, TEXT("timeline_name_exists"), TimelineName);
+            }
+        }
+
+        // 1. Add the UTimelineTemplate via the engine's standard helper.
+        UTimelineTemplate* Template = FBlueprintEditorUtils::AddNewTimeline(Blueprint, TLFName);
+        if (Template == nullptr)
+            return JsonError(CmdName, TEXT("timeline_template_failed"), TimelineName);
+
+        Template->TimelineLength = FMath::Max(0.0001f, LengthSeconds);
+        Template->LengthMode     = TL_TimelineLength;
+        Template->bLoop          = bLoop;
+        Template->bAutoPlay      = bAutoPlay;
+
+        // 2. Spawn the K2Node_Timeline that references this template.
+        UK2Node_Timeline* TimelineNode = NewObject<UK2Node_Timeline>(TargetGraph);
+        TimelineNode->SetFlags(RF_Transactional);
+        TimelineNode->TimelineName = TLFName;
+        TimelineNode->NodePosX = PosX;
+        TimelineNode->NodePosY = PosY;
+        TimelineNode->NodeComment = AnchorName;
+        TimelineNode->bCommentBubbleVisible = true;
+
+        TargetGraph->AddNode(TimelineNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+        TimelineNode->CreateNewGuid();
+        TimelineNode->PostPlacedNewNode();
+        TimelineNode->AllocateDefaultPins();
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        const FString PinsJson = BuildPinsJsonArray(TimelineNode);
+        const FString GuidStr = TimelineNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_timeline\",\"anchor_name\":%s,")
+            TEXT("\"timeline_name\":%s,\"node_guid\":%s,\"length_seconds\":%f,")
+            TEXT("\"loop\":%s,\"autoplay\":%s,\"pins\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(AnchorName),
+            *EscapeJsonString(TimelineName),
+            *EscapeJsonString(GuidStr),
+            Template->TimelineLength,
+            bLoop ? TEXT("true") : TEXT("false"),
+            bAutoPlay ? TEXT("true") : TEXT("false"),
+            *PinsJson,
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString AddTimelineTrackFloatOnGameThread(
+        const FString& BlueprintPath,
+        const FString& TimelineName,
+        const FString& TrackName)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("add_timeline_track_float");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName TLFName(*TimelineName);
+        const FName TrackFName(*TrackName);
+
+        UTimelineTemplate* Template = nullptr;
+        for (UTimelineTemplate* T : Blueprint->Timelines)
+        {
+            if (T != nullptr && T->GetVariableName() == TLFName) { Template = T; break; }
+        }
+        if (Template == nullptr)
+            return JsonError(CmdName, TEXT("timeline_not_found"), TimelineName);
+
+        // Refuse duplicate track name (UE compile errors out otherwise).
+        for (const FTTFloatTrack& Existing : Template->FloatTracks)
+        {
+            if (Existing.GetTrackName() == TrackFName)
+                return JsonError(CmdName, TEXT("track_name_exists"), TrackName);
+        }
+
+        // Append the new track. SetTrackName() registers it with the template.
+        FTTFloatTrack NewTrack;
+        NewTrack.SetTrackName(TrackFName, Template);
+        // Curve must be owned by the BP so it serializes with the asset.
+        NewTrack.CurveFloat = NewObject<UCurveFloat>(Blueprint, NAME_None, RF_Public | RF_Transactional);
+        const int32 NewIdx = Template->FloatTracks.Add(NewTrack);
+
+        Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_FloatInterp, NewIdx));
+
+        // ReconstructNode on all K2Node_Timeline references so the new
+        // <TrackName> output pin appears in the graph.
+        for (UEdGraph* UG : Blueprint->UbergraphPages)
+        {
+            if (UG == nullptr) continue;
+            for (UEdGraphNode* N : UG->Nodes)
+            {
+                if (UK2Node_Timeline* TLN = Cast<UK2Node_Timeline>(N))
+                {
+                    if (TLN->TimelineName == TLFName) TLN->ReconstructNode();
+                }
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"add_timeline_track_float\",\"timeline_name\":%s,")
+            TEXT("\"track_name\":%s,\"track_count\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(TimelineName),
+            *EscapeJsonString(TrackName),
+            Template->FloatTracks.Num(),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    FString SetTimelineCurveKeyOnGameThread(
+        const FString& BlueprintPath,
+        const FString& TimelineName,
+        const FString& TrackName,
+        float Time,
+        float Value,
+        const FString& InterpMode)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("set_timeline_curve_key");
+
+        UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *BlueprintPath);
+        if (Blueprint == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), BlueprintPath);
+
+        const FName TLFName(*TimelineName);
+        const FName TrackFName(*TrackName);
+
+        UTimelineTemplate* Template = nullptr;
+        for (UTimelineTemplate* T : Blueprint->Timelines)
+        {
+            if (T != nullptr && T->GetVariableName() == TLFName) { Template = T; break; }
+        }
+        if (Template == nullptr)
+            return JsonError(CmdName, TEXT("timeline_not_found"), TimelineName);
+
+        FTTFloatTrack* Track = nullptr;
+        for (FTTFloatTrack& T : Template->FloatTracks)
+        {
+            if (T.GetTrackName() == TrackFName) { Track = &T; break; }
+        }
+        if (Track == nullptr)
+            return JsonError(CmdName, TEXT("track_not_found"), TrackName);
+        if (Track->CurveFloat == nullptr)
+            return JsonError(CmdName, TEXT("track_curve_missing"), TrackName);
+
+        // Resolve interp mode
+        ERichCurveInterpMode Mode = RCIM_Cubic;   // default — UE editor default for new keys
+        FString ModeLower = InterpMode.ToLower();
+        if      (ModeLower == TEXT("linear"))   Mode = RCIM_Linear;
+        else if (ModeLower == TEXT("cubic") || ModeLower.IsEmpty()) Mode = RCIM_Cubic;
+        else if (ModeLower == TEXT("constant")) Mode = RCIM_Constant;
+        else
+        {
+            return JsonError(CmdName, TEXT("invalid_interp_mode"),
+                FString::Printf(TEXT("Got '%s' — must be 'linear' | 'cubic' | 'constant'"), *InterpMode));
+        }
+
+        FRichCurve& Curve = Track->CurveFloat->FloatCurve;
+        // Replace an existing key at the same time (within tolerance); else add new.
+        const FKeyHandle Existing = Curve.FindKey(Time, /*KeyTimeTolerance=*/ 1e-4f);
+        FKeyHandle Handle;
+        bool bReplaced = false;
+        if (Curve.IsKeyHandleValid(Existing))
+        {
+            Curve.SetKeyValue(Existing, Value);
+            Handle = Existing;
+            bReplaced = true;
+        }
+        else
+        {
+            Handle = Curve.AddKey(Time, Value);
+        }
+        Curve.SetKeyInterpMode(Handle, Mode);
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(BlueprintPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"set_timeline_curve_key\",\"timeline_name\":%s,")
+            TEXT("\"track_name\":%s,\"time\":%f,\"value\":%f,\"interp_mode\":%s,")
+            TEXT("\"replaced\":%s,\"key_count\":%d,\"saved\":%s}\n"),
+            *EscapeJsonString(TimelineName),
+            *EscapeJsonString(TrackName),
+            Time, Value,
+            *EscapeJsonString(ModeLower.IsEmpty() ? TEXT("cubic") : ModeLower),
+            bReplaced ? TEXT("true") : TEXT("false"),
+            Curve.GetNumKeys(),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.26.0 — duplicate_blueprint (closes rev19 MISSING-2) =====
+
+    FString DuplicateBlueprintOnGameThread(
+        const FString& SourcePath,
+        const FString& DestPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("duplicate_blueprint");
+
+        // Validate source exists and is a Blueprint
+        UBlueprint* Source = LoadObject<UBlueprint>(nullptr, *SourcePath);
+        if (Source == nullptr)
+            return JsonError(CmdName, TEXT("blueprint_not_found"), SourcePath);
+
+        // Refuse to overwrite — UEditorAssetLibrary::DuplicateAsset would
+        // silently make a "_1" suffix. Be explicit instead.
+        if (UEditorAssetLibrary::DoesAssetExist(DestPath))
+            return JsonError(CmdName, TEXT("dest_exists"),
+                FString::Printf(TEXT("'%s' already exists; delete first or pick a different path"), *DestPath));
+
+        UObject* NewAsset = UEditorAssetLibrary::DuplicateAsset(SourcePath, DestPath);
+        if (NewAsset == nullptr)
+            return JsonError(CmdName, TEXT("duplicate_failed"),
+                FString::Printf(TEXT("%s -> %s"), *SourcePath, *DestPath));
+
+        const bool bSaved = UEditorAssetLibrary::SaveAsset(DestPath, /*bOnlyIfIsDirty*/ false);
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"duplicate_blueprint\",\"source\":%s,\"dest\":%s,")
+            TEXT("\"dest_class\":%s,\"saved\":%s}\n"),
+            *EscapeJsonString(SourcePath),
+            *EscapeJsonString(DestPath),
+            *EscapeJsonString(NewAsset->GetClass()->GetName()),
+            bSaved ? TEXT("true") : TEXT("false"));
+    }
+
+    // ===== v9.26.0 — Level management (closes rev19 MISSING-3) =====
+    //
+    // Uses ULevelEditorSubsystem (the UE 5.x replacement for UEditorLevelLibrary).
+    // create_level: NewLevel — creates + saves at the given asset path.
+    // load_level:   LoadLevel — switches the active editor world.
+    // list_levels:  asset registry query for all UWorld assets under /Game.
+
+    FString CreateLevelOnGameThread(const FString& LevelPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("create_level");
+
+        if (GEditor == nullptr) return JsonError(CmdName, TEXT("no_editor"), TEXT(""));
+        ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+        if (LES == nullptr) return JsonError(CmdName, TEXT("no_level_subsystem"), TEXT(""));
+
+        if (UEditorAssetLibrary::DoesAssetExist(LevelPath))
+            return JsonError(CmdName, TEXT("level_exists"),
+                FString::Printf(TEXT("'%s' already exists; use load_level to open it"), *LevelPath));
+
+        const bool bOK = LES->NewLevel(LevelPath, /*bIsPartitionedWorld*/ false);
+        if (!bOK)
+            return JsonError(CmdName, TEXT("create_failed"),
+                FString::Printf(TEXT("NewLevel('%s') returned false — check Output Log"), *LevelPath));
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"create_level\",\"level\":%s,\"saved\":true}\n"),
+            *EscapeJsonString(LevelPath));
+    }
+
+    FString LoadLevelOnGameThread(const FString& LevelPath)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("load_level");
+
+        if (GEditor == nullptr) return JsonError(CmdName, TEXT("no_editor"), TEXT(""));
+        ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+        if (LES == nullptr) return JsonError(CmdName, TEXT("no_level_subsystem"), TEXT(""));
+
+        if (!UEditorAssetLibrary::DoesAssetExist(LevelPath))
+            return JsonError(CmdName, TEXT("level_not_found"), LevelPath);
+
+        // Pre-save the current level so LoadLevel doesn't prompt with a modal
+        // "Save changes?" dialog (which freezes the game thread waiting for
+        // user input, killing the TCP connection). SaveCurrentLevel is a
+        // no-op if the level isn't dirty.
+        LES->SaveCurrentLevel();
+
+        const bool bOK = LES->LoadLevel(LevelPath);
+        if (!bOK)
+            return JsonError(CmdName, TEXT("load_failed"),
+                FString::Printf(TEXT("LoadLevel('%s') returned false — check Output Log"), *LevelPath));
+
+        UWorld* Active = GEditor->GetEditorWorldContext().World();
+        const FString ActiveName = (Active != nullptr) ? Active->GetName() : FString();
+        const FString ActivePath = (Active != nullptr && Active->GetOutermost() != nullptr)
+            ? Active->GetOutermost()->GetName() : FString();
+
+        return FString::Printf(
+            TEXT("{\"ok\":true,\"command\":\"load_level\",\"level\":%s,\"active_world\":%s,\"active_world_path\":%s}\n"),
+            *EscapeJsonString(LevelPath),
+            *EscapeJsonString(ActiveName),
+            *EscapeJsonString(ActivePath));
+    }
+
+    FString ListLevelsOnGameThread(const FString& Folder)
+    {
+        check(IsInGameThread());
+        const TCHAR* CmdName = TEXT("list_levels");
+
+        FAssetRegistryModule& AssetRegistryModule =
+            FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+        const FString ScanFolder = Folder.IsEmpty() ? FString(TEXT("/Game")) : Folder;
+        FARFilter Filter;
+        Filter.ClassPaths.Add(UWorld::StaticClass()->GetClassPathName());
+        Filter.PackagePaths.Add(FName(*ScanFolder));
+        Filter.bRecursivePaths = true;
+
+        TArray<FAssetData> Assets;
+        AssetRegistry.GetAssets(Filter, Assets);
+
+        UWorld* Active = (GEditor != nullptr) ? GEditor->GetEditorWorldContext().World() : nullptr;
+        const FString ActivePath = (Active != nullptr && Active->GetOutermost() != nullptr)
+            ? Active->GetOutermost()->GetName() : FString();
+
+        FString OutJson;
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+        Writer->WriteObjectStart();
+        Writer->WriteValue(TEXT("ok"), true);
+        Writer->WriteValue(TEXT("command"), CmdName);
+        Writer->WriteValue(TEXT("folder"), ScanFolder);
+        Writer->WriteValue(TEXT("active_world_path"), ActivePath);
+        Writer->WriteArrayStart(TEXT("levels"));
+        for (const FAssetData& AD : Assets)
+        {
+            Writer->WriteObjectStart();
+            Writer->WriteValue(TEXT("name"), AD.AssetName.ToString());
+            Writer->WriteValue(TEXT("path"), AD.PackageName.ToString());
+            Writer->WriteValue(TEXT("active"),
+                ActivePath == AD.PackageName.ToString());
+            Writer->WriteObjectEnd();
+        }
+        Writer->WriteArrayEnd();
+        Writer->WriteValue(TEXT("count"), Assets.Num());
+        Writer->WriteObjectEnd();
+        Writer->Close();
+        return OutJson + TEXT("\n");
+    }
+
     // ===== v8.3 — Input simulation (v9.9.0 extends with duration + player movement) =====
 
     FString PiePressKeyOnGameThread(const FString& KeyName, int32 PlayerIndex, float DurationSec)
@@ -8415,7 +8813,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.25.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.26.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -10579,6 +10977,168 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
             });
         if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
             return JsonError(TEXT("set_node_position"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.26.0 add_timeline (closes rev19 MISSING-1) ---
+    if (Command.Equals(TEXT("add_timeline"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, AnchorName, TimelineName, GraphName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_timeline"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("anchor_name"), AnchorName) || AnchorName.IsEmpty())
+            return JsonError(TEXT("add_timeline"), TEXT("missing_field"), TEXT("anchor_name"));
+        if (!JsonObject->TryGetStringField(TEXT("timeline_name"), TimelineName) || TimelineName.IsEmpty())
+            return JsonError(TEXT("add_timeline"), TEXT("missing_field"), TEXT("timeline_name"));
+        double LengthSeconds = 1.0;
+        JsonObject->TryGetNumberField(TEXT("length_seconds"), LengthSeconds);
+        bool bLoop = false, bAutoPlay = false;
+        JsonObject->TryGetBoolField(TEXT("loop"), bLoop);
+        JsonObject->TryGetBoolField(TEXT("autoplay"), bAutoPlay);
+        int32 PosX = 0, PosY = 0;
+        JsonObject->TryGetNumberField(TEXT("position_x"), PosX);
+        JsonObject->TryGetNumberField(TEXT("position_y"), PosY);
+        JsonObject->TryGetStringField(TEXT("graph_name"), GraphName);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, AnchorName, TimelineName,
+             LengthSeconds, bLoop, bAutoPlay, PosX, PosY, GraphName]() mutable
+            {
+                Promise.SetValue(AddTimelineOnGameThread(Blueprint, AnchorName, TimelineName,
+                    (float)LengthSeconds, bLoop, bAutoPlay, PosX, PosY, GraphName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_timeline"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.26.0 add_timeline_track_float (closes rev19 MISSING-1) ---
+    if (Command.Equals(TEXT("add_timeline_track_float"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, TimelineName, TrackName;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("add_timeline_track_float"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("timeline_name"), TimelineName) || TimelineName.IsEmpty())
+            return JsonError(TEXT("add_timeline_track_float"), TEXT("missing_field"), TEXT("timeline_name"));
+        if (!JsonObject->TryGetStringField(TEXT("track_name"), TrackName) || TrackName.IsEmpty())
+            return JsonError(TEXT("add_timeline_track_float"), TEXT("missing_field"), TEXT("track_name"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, TimelineName, TrackName]() mutable
+            {
+                Promise.SetValue(AddTimelineTrackFloatOnGameThread(Blueprint, TimelineName, TrackName));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("add_timeline_track_float"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.26.0 set_timeline_curve_key (closes rev19 MISSING-1) ---
+    if (Command.Equals(TEXT("set_timeline_curve_key"), ESearchCase::IgnoreCase))
+    {
+        FString Blueprint, TimelineName, TrackName, InterpMode;
+        if (!JsonObject->TryGetStringField(TEXT("blueprint"), Blueprint) || Blueprint.IsEmpty())
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("missing_field"), TEXT("blueprint"));
+        if (!JsonObject->TryGetStringField(TEXT("timeline_name"), TimelineName) || TimelineName.IsEmpty())
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("missing_field"), TEXT("timeline_name"));
+        if (!JsonObject->TryGetStringField(TEXT("track_name"), TrackName) || TrackName.IsEmpty())
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("missing_field"), TEXT("track_name"));
+        double Time = 0.0, Value = 0.0;
+        if (!JsonObject->TryGetNumberField(TEXT("time"), Time))
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("missing_field"), TEXT("time"));
+        if (!JsonObject->TryGetNumberField(TEXT("value"), Value))
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("missing_field"), TEXT("value"));
+        JsonObject->TryGetStringField(TEXT("interp_mode"), InterpMode);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Blueprint, TimelineName, TrackName, Time, Value, InterpMode]() mutable
+            {
+                Promise.SetValue(SetTimelineCurveKeyOnGameThread(Blueprint, TimelineName, TrackName,
+                    (float)Time, (float)Value, InterpMode));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("set_timeline_curve_key"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.26.0 duplicate_blueprint (closes rev19 MISSING-2) ---
+    if (Command.Equals(TEXT("duplicate_blueprint"), ESearchCase::IgnoreCase))
+    {
+        FString Source, Dest;
+        if (!JsonObject->TryGetStringField(TEXT("source_path"), Source) || Source.IsEmpty())
+            return JsonError(TEXT("duplicate_blueprint"), TEXT("missing_field"), TEXT("source_path"));
+        if (!JsonObject->TryGetStringField(TEXT("dest_path"), Dest) || Dest.IsEmpty())
+            return JsonError(TEXT("duplicate_blueprint"), TEXT("missing_field"), TEXT("dest_path"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Source, Dest]() mutable
+            {
+                Promise.SetValue(DuplicateBlueprintOnGameThread(Source, Dest));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("duplicate_blueprint"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    // --- v9.26.0 create_level / load_level / list_levels (closes rev19 MISSING-3) ---
+    if (Command.Equals(TEXT("create_level"), ESearchCase::IgnoreCase))
+    {
+        FString LevelPath;
+        if (!JsonObject->TryGetStringField(TEXT("level_path"), LevelPath) || LevelPath.IsEmpty())
+            return JsonError(TEXT("create_level"), TEXT("missing_field"), TEXT("level_path"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), LevelPath]() mutable
+            {
+                Promise.SetValue(CreateLevelOnGameThread(LevelPath));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("create_level"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("load_level"), ESearchCase::IgnoreCase))
+    {
+        FString LevelPath;
+        if (!JsonObject->TryGetStringField(TEXT("level_path"), LevelPath) || LevelPath.IsEmpty())
+            return JsonError(TEXT("load_level"), TEXT("missing_field"), TEXT("level_path"));
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), LevelPath]() mutable
+            {
+                Promise.SetValue(LoadLevelOnGameThread(LevelPath));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("load_level"), TEXT("game_thread_timeout"));
+        return Future.Get();
+    }
+
+    if (Command.Equals(TEXT("list_levels"), ESearchCase::IgnoreCase))
+    {
+        FString Folder;
+        JsonObject->TryGetStringField(TEXT("folder"), Folder);
+
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread,
+            [Promise = MoveTemp(Promise), Folder]() mutable
+            {
+                Promise.SetValue(ListLevelsOnGameThread(Folder));
+            });
+        if (!Future.WaitFor(FTimespan::FromSeconds(kGameThreadTimeoutSeconds)))
+            return JsonError(TEXT("list_levels"), TEXT("game_thread_timeout"));
         return Future.Get();
     }
 
