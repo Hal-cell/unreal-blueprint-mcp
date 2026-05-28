@@ -6,7 +6,94 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.25.0.
+Everything shipped through v9.26.0.
+
+---
+
+## [v9.26.0] — 2026-05-28 — add_timeline + duplicate_blueprint + level mgmt (closes rev19 MISSING-1/2/3)
+
+### Closes rev19 missing tools (pre-report — user explicitly listed gaps before the work)
+
+rev19 was a planning round: user asked for the next task ("G/H-key
+Timeline-triggered camera advance + segment animation on duplicated BPs
+in a new level") and listed three tool gaps that needed closing first.
+
+- **MISSING-1** (high, blocking) — No Timeline node spawning. Forced a
+  variant on `FInterpTo` + manual time-accumulation, which works but
+  isn't the real UE pattern the user asked for.
+- **MISSING-2** (high) — No `duplicate_blueprint`. User manually
+  right-clicked → Duplicate in the editor.
+- **MISSING-3** (medium) — No `create_level` / `load_level` /
+  `list_levels`. User manually used File → New Level.
+
+### Added — 7 new tools (95 → 102)
+
+**Timeline trio** (the core MISSING-1 fix):
+
+- **`add_timeline(blueprint, anchor_name, timeline_name,
+   length_seconds=1.0, loop=False, autoplay=False,
+   position_x=0, position_y=0, graph_name="")`** — spawns a
+   `K2Node_Timeline` + `UTimelineTemplate` via
+   `FBlueprintEditorUtils::AddNewTimeline`. Returns the standard pin set
+   (Play / PlayFromStart / Stop / Reverse / ReverseFromEnd / SetNewTime /
+   NewTime / Update / Finished / Direction). Per-track output pins come
+   from subsequent `add_timeline_track_float` calls.
+
+- **`add_timeline_track_float(blueprint, timeline_name, track_name)`** —
+   appends an `FTTFloatTrack` with a fresh `UCurveFloat` owned by the BP.
+   Calls `SetTrackName` + `AddDisplayTrack` for template registration,
+   then `ReconstructNode` on the K2Node so the `<TrackName>` output pin
+   appears. Refuses duplicate track names.
+
+- **`set_timeline_curve_key(blueprint, timeline_name, track_name, time,
+   value, interp_mode="cubic")`** — keyframe on the track's `FRichCurve`.
+   Replace-in-place if a key already exists at this time (within 1e-4
+   tolerance) — safe to call twice with the same time. `interp_mode`
+   accepts `"linear"` / `"cubic"` (default) / `"constant"`.
+
+**Other two**:
+
+- **`duplicate_blueprint(source_path, dest_path)`** — wraps
+   `UEditorAssetLibrary::DuplicateAsset`. Refuses to overwrite (returns
+   `dest_exists` rather than silently appending `_1`). Deep-copies
+   everything including Timeline templates with their tracks + curves.
+
+- **`create_level(level_path)`** + **`load_level(level_path)`** +
+   **`list_levels(folder="/Game")`** — `ULevelEditorSubsystem`-based
+   level management (UE 5.x modern API, replaces deprecated
+   `UEditorLevelLibrary`). `load_level` pre-calls `SaveCurrentLevel()`
+   so unsaved changes don't trigger a modal save dialog that would
+   freeze the game thread + kill the TCP connection. `list_levels` uses
+   the Asset Registry (`FARFilter` on `UWorld::StaticClass()`) and
+   marks the active world with `active=True`.
+
+### Module dependency
+
+`Build.cs` added `"LevelEditor"` for `ULevelEditorSubsystem.h`.
+
+### Verification
+
+Live smoke on TESTMCP:
+- `add_timeline("AdvanceTL", length=2.0)` → all 10 standard pins. ✅
+- `add_timeline_track_float("Alpha")` + `("Beta")` →
+  `track_count: 1 → 2`. Duplicate `"Alpha"` → `track_name_exists`. ✅
+- 3 keys at `t=0/1/2 v=0/0.5/1.0` → `key_count: 3`. Replace key at
+  `t=1.0` with `value=0.8 interp=linear` → `replaced=true, key_count=3`
+  (in-place update). Invalid interp `"sigmoid"` → `invalid_interp_mode`. ✅
+- `get_blueprint` shows `Alpha` + `Beta` as output pins on the
+  timeline node — `ReconstructNode` worked. ✅
+- `compile_blueprint` on BP with timeline + 2 tracks + 3 keys →
+  `up_to_date`. ✅
+- `duplicate_blueprint` → dup carries the timeline. Refuses second
+  overwrite. ✅
+- `create_level(/Game/Levels/L_v926Test)` → ok, `list_levels` shows it. ✅
+- `load_level` switches active world — `SaveCurrentLevel` pre-call
+  prevents the modal-save-dialog deadlock that killed the first attempt. ✅
+
+Tests: +14 mock (327 → 341). Integration: 10/10 passed clean.
+
+### `ping.plugin_version`
+"9.25.0" → **"9.26.0"**.
 
 ---
 
