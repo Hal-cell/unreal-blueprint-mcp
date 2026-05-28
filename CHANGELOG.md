@@ -6,7 +6,80 @@ Each entry lists the **growth in tool surface**, **bugs fixed**, and **翻车点
 
 ## [Unreleased]
 
-Everything shipped through v9.24.0.
+Everything shipped through v9.25.0.
+
+---
+
+## [v9.25.0] — 2026-05-28 — canonical cast pin name + read_log_capture(since_seq=) (closes rev18 ISSUE-1/2)
+
+### Closes rev18 issues
+
+rev18 was a small polish round (rev17 ISSUE-1/2 had already closed in v9.24).
+Two consistency issues surfaced:
+
+- **ISSUE-1** (low-medium) — `add_cast`'s returned `pins[]` and
+  `get_blueprint`'s same-pin lookup disagreed on the cast result pin
+  name. `add_cast` returned `"AsBP_TunnelCam_C"` (our v6.0.2 override —
+  underscored, keeps `_C`); `get_blueprint` returned `"AsBP Tunnel Cam"`
+  (UE's default — spaces, strips `_C`) because the override didn't survive
+  `ReconstructNode` (triggered by any later `compile_blueprint`).
+- **ISSUE-2** (low) — `read_log_capture` returned errors from earlier
+  iteration's failed compile, getting mistaken for current errors.
+  Workaround was manual `clear_log_capture` between iterations.
+
+### Added — 2 fixes (no new tools — 95 → 95)
+
+- **`GetCanonicalPinName` + `FindPinOnNodeByName` helpers**: for cast
+  result pins, both serialize and lookup paths derive the name fresh
+  from `TargetType->GetName()` ("As<ClassName>" — keeps `_C`, no
+  spaces). All other pins pass through unchanged. `BuildPinsJsonArray`
+  + `WriteNodeAnchor` (the two pin emitters used by every tool) now
+  route through `GetCanonicalPinName`, and `ResolvePinRef` +
+  `set_pin_default`'s pin lookup route through `FindPinOnNodeByName`
+  which tries UE's native `FindPin` first and falls back to canonical
+  match. Both forms work as input. Result: `add_cast` and `get_blueprint`
+  always return the same name regardless of when in the lifecycle the
+  call is made.
+
+- **`read_log_capture(since_seq=N)` + `latest_seq` response field**:
+  each captured entry now has a monotonic `int64` sequence number
+  (`NextSeq` in `FBlueprintMCPLogCapture`, never reset on `Clear`).
+  Recommended pattern (in docstring):
+  ```python
+  baseline = server.read_log_capture(max_lines=0)["latest_seq"]
+  server.compile_blueprint(name=BP)
+  server.start_pie()
+  new_only = server.read_log_capture(since_seq=baseline)["lines"]
+  ```
+  Sequences survive `clear_log_capture` — saved baselines stay valid
+  even if the buffer was wiped between iterations.
+
+### Header change
+
+`TCPServer.h`: `FBlueprintMCPLogCapture` storage changed from
+`TArray<FString>` to `TArray<TPair<int64, FString>>` to carry per-entry
+sequence. New public methods `SnapshotWithSeq(MinSeq, MaxLines)` +
+`GetLatestSeq()`. Legacy `Snapshot(MaxLines)` keeps the bare-string
+signature for backward compat with existing log-capture tests.
+
+### Verification
+
+Live smoke on TESTMCP:
+- `add_cast(target_class="BP_v925CastTarget_C")` → pins include
+  `AsBP_v925CastTarget_C`. `compile_blueprint`. `get_blueprint` →
+  pins still include `AsBP_v925CastTarget_C` (NOT `"As BP V925
+  Cast Target"`). `connect_pins(a_cast.AsBP_v925CastTarget_C →
+  VariableSet)` succeeds ✅
+- `baseline = 356`. 3 `ping` calls. `read_log_capture(since_seq=356)` →
+  `latest_seq=370` (advanced), `since_seq=356` echoed ✅
+- `seq_before_clear = 375`. `clear_log_capture`. 2 `ping` calls.
+  `read_log_capture(since_seq=375)` → `latest_seq=383` (monotonic
+  across clear — baseline still valid) ✅
+
+Tests: +7 mock (320 → 327). Integration: 10/10 passed clean.
+
+### `ping.plugin_version`
+"9.24.0" → **"9.25.0"**.
 
 ---
 
