@@ -5652,3 +5652,132 @@ def test_ping_returns_plugin_version_9_24_0() -> None:
     with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
         r = server.ping_ue()
     assert r["plugin_version"] == "9.24.0"
+
+
+# ---------------------------------------------------------------------------
+# v9.25.0 — read_log_capture(since_seq=) + canonical cast pin names (rev18)
+# ---------------------------------------------------------------------------
+
+
+def test_read_log_capture_default_omits_since_seq() -> None:
+    """v9.25.0 — when since_seq=0 (default), the field is NOT in the payload."""
+    response = (
+        b'{"ok":true,"command":"read_log_capture","total_captured":5,"returned":5,'
+        b'"latest_seq":5,"lines":["a","b","c","d","e"]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.read_log_capture()
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert "since_seq" not in sent_dict
+    assert r["latest_seq"] == 5
+
+
+def test_read_log_capture_since_seq_sent_and_echoed() -> None:
+    """v9.25.0 — since_seq > 0 is in the payload; response echoes it back +
+    only returns entries newer than the cursor."""
+    response = (
+        b'{"ok":true,"command":"read_log_capture","total_captured":2,"returned":2,'
+        b'"latest_seq":12,"since_seq":10,"lines":["[Cat][Log] new1","[Cat][Log] new2"]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        r = server.read_log_capture(since_seq=10)
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict["since_seq"] == 10
+    assert r["since_seq"] == 10
+    assert r["latest_seq"] == 12
+    assert len(r["lines"]) == 2
+
+
+def test_read_log_capture_latest_seq_zero_on_empty() -> None:
+    """v9.25.0 — empty buffer reports latest_seq=0 (no entries seen)."""
+    response = (
+        b'{"ok":true,"command":"read_log_capture","total_captured":0,"returned":0,'
+        b'"latest_seq":0,"lines":[]}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.read_log_capture()
+    assert r["ok"] is True
+    assert r["latest_seq"] == 0
+    assert r["lines"] == []
+
+
+def test_read_log_capture_since_seq_combined_with_filters() -> None:
+    """v9.25.0 — since_seq composes with category / verbosity / contains."""
+    response = (
+        b'{"ok":true,"command":"read_log_capture","total_captured":1,"returned":1,'
+        b'"latest_seq":100,"since_seq":80,'
+        b'"lines":["[LogPlayLevel][Error] compile failed"]}\n'
+    )
+    sent: dict = {}
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response, sent)):
+        server.read_log_capture(
+            since_seq=80, category="PlayLevel", verbosity="Error", max_lines=50,
+        )
+    import json
+    sent_dict = json.loads(sent["data"].decode("utf-8").rstrip())
+    assert sent_dict == {
+        "command": "read_log_capture",
+        "max_lines": 50,
+        "category": "PlayLevel",
+        "verbosity": "Error",
+        "since_seq": 80,
+    }
+
+
+def test_read_log_capture_docstring_documents_checkpoint_pattern() -> None:
+    """v9.25.0 — the docstring tells callers to baseline-then-since_seq when
+    iterating. Without this guidance, stale failed-compile errors from
+    earlier iterations bleed through (rev18 ISSUE-2 footgun)."""
+    doc = server.read_log_capture.__doc__ or ""
+    assert "since_seq" in doc
+    assert "baseline" in doc.lower() or "checkpoint" in doc.lower()
+    # The recommended pattern code-shape
+    assert "latest_seq" in doc
+
+
+def test_add_cast_pin_name_canonical_form_underscore_with_c_suffix() -> None:
+    """v9.25.0 — rev18 ISSUE-1: cast result pin emitted with canonical
+    underscore form including the _C suffix, NOT the spaced display form
+    that UE produces internally and that survives recompiles."""
+    # Simulate what add_cast returns for a BP class target
+    response = (
+        b'{"ok":true,"command":"add_cast","anchor_name":"a_cast",'
+        b'"node_guid":"00000000-0000-0000-0000-000000000003",'
+        b'"node_type":"K2Node_DynamicCast","target_class":"BP_TunnelCam_C",'
+        b'"pins":['
+        b'{"name":"execute","direction":"input","type":"exec","container":"none"},'
+        b'{"name":"Object","direction":"input","type":"object","container":"none"},'
+        b'{"name":"then","direction":"output","type":"exec","container":"none"},'
+        b'{"name":"CastFailed","direction":"output","type":"exec","container":"none"},'
+        b'{"name":"AsBP_TunnelCam_C","direction":"output","type":"object","container":"none"},'
+        b'{"name":"bSuccess","direction":"output","type":"bool","container":"none"}'
+        b'],"saved":true}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.add_cast(
+            blueprint="/Game/BP_Test",
+            target_class="/Game/Blueprints/BP_TunnelCam.BP_TunnelCam_C",
+            anchor_name="a_cast",
+        )
+    assert r["ok"] is True
+    pin_names = {p["name"] for p in r["pins"]}
+    # The canonical name: keep _C, no spaces
+    assert "AsBP_TunnelCam_C" in pin_names
+    # The spaced display form should NOT leak in
+    assert "AsBP Tunnel Cam" not in pin_names
+    assert "As BP Tunnel Cam" not in pin_names
+
+
+def test_ping_returns_plugin_version_9_25_0() -> None:
+    response = (
+        b'{"ok":true,"command":"ping","version":"0.0.1",'
+        b'"plugin_version":"9.25.0","build_date":"May 28 2026 12:00:00",'
+        b'"timestamp":"2026-05-28T12:00:00.000Z"}\n'
+    )
+    with mock.patch.object(socket, "create_connection", return_value=_fake_sock(response)):
+        r = server.ping_ue()
+    assert r["plugin_version"] == "9.25.0"

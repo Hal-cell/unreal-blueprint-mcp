@@ -30,12 +30,28 @@ public:
     /** Copy the last `MaxLines` captured lines (or all if MaxLines <= 0 or >= count). */
     TArray<FString> Snapshot(int32 MaxLines = 1000) const;
 
+    /**
+     * v9.25.0 — return (sequence, line) pairs so callers can checkpoint via
+     * since_seq. Sequences are monotonic across the entire process lifetime
+     * (never reset on Clear, so callers' checkpoints stay valid even if the
+     * buffer was wiped in between). MinSeq filters to entries with seq > MinSeq
+     * (use 0 for no filter). MaxLines tail-trims AFTER the seq filter.
+     */
+    TArray<TPair<int64, FString>> SnapshotWithSeq(int64 MinSeq, int32 MaxLines) const;
+
+    /** v9.25.0 — read the next sequence number that will be assigned. Useful
+     *  as a baseline checkpoint: read latest_seq, do operation, read again
+     *  with since_seq=baseline to get only the new entries. */
+    int64 GetLatestSeq() const;
+
     /** Drop all captured lines. */
     void Clear();
 
 private:
     mutable FCriticalSection Mutex;
-    TArray<FString> Lines;
+    // v9.25.0: each entry is (monotonic seq, formatted line).
+    TArray<TPair<int64, FString>> Entries;
+    int64 NextSeq = 1;                                  // 1-based; 0 = "no entries seen"
     static constexpr int32 kMaxBufferedLines = 1000;   // circular buffer cap
 };
 

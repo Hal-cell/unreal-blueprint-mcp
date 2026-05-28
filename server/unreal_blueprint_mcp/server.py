@@ -4039,12 +4039,33 @@ def read_log_capture(
     category: str = "",
     verbosity: str = "",
     contains: str = "",
+    since_seq: int = 0,
 ) -> dict[str, Any]:
-    """Read recent UE log lines captured by the plugin's FOutputDevice — v8.1.
+    """Read recent UE log lines captured by the plugin's FOutputDevice — v8.1 + v9.25.0.
 
     The plugin installs a global log capture at module startup. Every
     ``UE_LOG`` / ``PrintString`` line goes into a thread-safe circular buffer
     (default cap: 1000 lines). This tool reads + filters the buffer.
+
+    **v9.25.0 — stale-entry skipping** (closes rev18 ISSUE-2). Each captured
+    entry now carries a monotonic sequence number (never reset on
+    ``clear_log_capture``). The recommended pattern when iterating
+    (e.g. retrying a failing compile until it succeeds):
+
+        # 1. Record a baseline BEFORE doing the action
+        baseline = server.read_log_capture(max_lines=0)["latest_seq"]
+
+        # 2. Do the action (compile, PIE, etc.)
+        server.compile_blueprint(name="/Game/BP_X")
+        server.start_pie()
+        time.sleep(2)
+
+        # 3. Read ONLY entries newer than the baseline
+        new_lines = server.read_log_capture(since_seq=baseline)["lines"]
+
+    This avoids the v9.24 footgun where a previous iteration's failed-compile
+    error stayed in the ring buffer and got mistaken for a current error.
+    The alternative ``clear_log_capture`` works too but loses useful context.
 
     Args:
         max_lines: Limit on returned lines (default 100). 0 = no cap.
@@ -4060,10 +4081,20 @@ def read_log_capture(
             ``"Error"``, ``"Log"``.
         contains: If non-empty, only return lines containing this substring (anywhere
             in the line, case-insensitive).
+        since_seq: **v9.25.0** — if > 0, only return entries with sequence
+            number strictly greater than this. Pair with the ``latest_seq``
+            returned by a prior call (or by an initial baseline-only call)
+            to get a clean "what's new since checkpoint" view. Sequences
+            survive ``clear_log_capture`` — your baseline stays valid even
+            if the buffer was wiped in between.
 
     Returns:
-        ``{"ok": True, "total_captured": N, "returned": M, "lines": [...]}``
+        ``{"ok": True, "total_captured": N, "returned": M,
+            "latest_seq": int, "lines": [...]}``
         Each line is formatted ``[Category][Verbosity] message``.
+        ``latest_seq`` = sequence number of the most recently captured entry
+        (or 0 if buffer is empty). Use this as the ``since_seq`` for the
+        next iteration. ``since_seq`` is echoed back when it was > 0.
 
     Use this after triggering an action to see what UE logged.
     """
@@ -4077,6 +4108,8 @@ def read_log_capture(
         payload["verbosity"] = verbosity
     if contains:
         payload["contains"] = contains
+    if since_seq > 0:
+        payload["since_seq"] = since_seq
     return _send_command(payload)
 
 

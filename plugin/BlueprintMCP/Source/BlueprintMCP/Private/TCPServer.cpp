@@ -219,35 +219,65 @@ void FBlueprintMCPLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verb
         V);
 
     FScopeLock Lock(&Mutex);
-    if (Lines.Num() >= kMaxBufferedLines)
+    if (Entries.Num() >= kMaxBufferedLines)
     {
         // Drop oldest. RemoveAt(0) is O(N) but kMaxBufferedLines is small.
-        Lines.RemoveAt(0);
+        Entries.RemoveAt(0);
     }
-    Lines.Add(MoveTemp(Formatted));
+    Entries.Add(TPair<int64, FString>(NextSeq++, MoveTemp(Formatted)));
 }
 
 TArray<FString> FBlueprintMCPLogCapture::Snapshot(int32 MaxLines) const
 {
     FScopeLock Lock(&Mutex);
-    if (MaxLines <= 0 || MaxLines >= Lines.Num())
+    TArray<FString> Out;
+    if (MaxLines <= 0 || MaxLines >= Entries.Num())
     {
-        return Lines;   // full copy
+        Out.Reserve(Entries.Num());
+        for (const TPair<int64, FString>& E : Entries) Out.Add(E.Value);
+        return Out;
     }
-    TArray<FString> Tail;
-    Tail.Reserve(MaxLines);
-    const int32 Start = Lines.Num() - MaxLines;
-    for (int32 i = Start; i < Lines.Num(); ++i)
+    Out.Reserve(MaxLines);
+    const int32 Start = Entries.Num() - MaxLines;
+    for (int32 i = Start; i < Entries.Num(); ++i)
     {
-        Tail.Add(Lines[i]);
+        Out.Add(Entries[i].Value);
     }
-    return Tail;
+    return Out;
+}
+
+TArray<TPair<int64, FString>> FBlueprintMCPLogCapture::SnapshotWithSeq(int64 MinSeq, int32 MaxLines) const
+{
+    FScopeLock Lock(&Mutex);
+    TArray<TPair<int64, FString>> Out;
+    Out.Reserve(Entries.Num());
+    for (const TPair<int64, FString>& E : Entries)
+    {
+        if (E.Key > MinSeq) Out.Add(E);
+    }
+    if (MaxLines > 0 && Out.Num() > MaxLines)
+    {
+        // Keep the tail (most recent).
+        const int32 Drop = Out.Num() - MaxLines;
+        Out.RemoveAt(0, Drop, EAllowShrinking::No);
+    }
+    return Out;
+}
+
+int64 FBlueprintMCPLogCapture::GetLatestSeq() const
+{
+    FScopeLock Lock(&Mutex);
+    // NextSeq is what the NEXT entry will use. The latest already-assigned seq is NextSeq-1.
+    return NextSeq - 1;
 }
 
 void FBlueprintMCPLogCapture::Clear()
 {
     FScopeLock Lock(&Mutex);
-    Lines.Empty();
+    Entries.Empty();
+    // Note: NextSeq does NOT reset on Clear. Callers that captured a baseline
+    // via since_seq before clear can keep using it — old entries are gone but
+    // new entries will be at seq >> baseline, so the filter still works.
 }
 
 // v9.21.0 — perf globals needed by GetPIEPerfStatsOnGameThread.
@@ -578,13 +608,76 @@ namespace
         }
     }
 
+    // v9.25.0 — rev18 ISSUE-1 fix: canonical pin name for cast result pins.
+    //
+    // K2Node_DynamicCast::AllocateDefaultPins generates the result pin name from
+    // TargetType->GetDisplayNameText().ToString() which inserts spaces between
+    // camelCase words AND strips the "_C" suffix from BP class names. The
+    // resulting FName ("As BP Tunnel Cam" instead of "AsBP_TunnelCam_C") is
+    // (a) annoying for the LLM to type, and (b) regenerated on every
+    // ReconstructNode call, so any local override in add_cast doesn't survive
+    // a compile_blueprint.
+    //
+    // Fix: never trust UE's stored PinName for cast result pins. Both serialize
+    // (BuildPinsJsonArray / WriteNodeAnchor) and lookup (FindPinOnNodeByName)
+    // route cast-result-pin names through this canonical function so they
+    // always agree regardless of when in the lifecycle the call is made.
+    //
+    // Returns:
+    //   - For UK2Node_DynamicCast's cast result pin: "As<TargetType->GetName()>"
+    //     (e.g. "AsBP_TunnelCam_C" — keeps the _C, no spaces).
+    //   - For all other pins: Pin->PinName.ToString() unchanged.
+    FString GetCanonicalPinName(const UEdGraphPin* Pin)
+    {
+        if (Pin == nullptr) return FString();
+        if (const UK2Node_DynamicCast* CastNode = Cast<UK2Node_DynamicCast>(Pin->GetOwningNodeUnchecked()))
+        {
+            // Cast result pin = first object-typed output pin whose subcategory matches TargetType.
+            // (UE keeps a single result pin; bool "Success" output is exec-flow not a data pin.)
+            // PinSubCategoryObject is TWeakObjectPtr<UObject>; TargetType is TSubclassOf<UObject>.
+            // Compare raw pointers via .Get() / *TSubclassOf.
+            const UObject* PinSubcatObj = Pin->PinType.PinSubCategoryObject.Get();
+            const UObject* TargetObj = CastNode->TargetType.Get();
+            if (Pin->Direction == EGPD_Output
+                && TargetObj != nullptr
+                && (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object
+                    || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class
+                    || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Interface)
+                && PinSubcatObj == TargetObj)
+            {
+                return FString::Printf(TEXT("As%s"), *CastNode->TargetType->GetName());
+            }
+        }
+        return Pin->PinName.ToString();
+    }
+
+    // v9.25.0 — companion to GetCanonicalPinName: lookup a pin by either
+    // its UE-stored PinName OR its canonical name (for cast result pins).
+    // Use this in ResolvePinRef so connect_pins / disconnect_pins / set_pin_default
+    // all accept the canonical form the LLM sees in add_cast / get_blueprint
+    // output, regardless of how UE has currently chosen to spell it internally.
+    UEdGraphPin* FindPinOnNodeByName(UEdGraphNode* Node, const FString& Name)
+    {
+        if (Node == nullptr) return nullptr;
+        // Fast path: UE's native lookup on the FName.
+        if (UEdGraphPin* P = Node->FindPin(FName(*Name))) return P;
+        // Slow path: walk pins, compare canonical name (handles cast result pin).
+        for (UEdGraphPin* P : Node->Pins)
+        {
+            if (P == nullptr) continue;
+            if (GetCanonicalPinName(P) == Name) return P;
+        }
+        return nullptr;
+    }
+
     FString BuildPinsJsonArray(const UEdGraphNode* Node)
     {
         TArray<FString> PinJsonItems;
         for (const UEdGraphPin* Pin : Node->Pins)
         {
             if (Pin->bHidden) continue;   // BUG-4 fix
-            const FString PinName = Pin->PinName.ToString();
+            // v9.25.0 — canonical name (handles cast result pin's UE-versus-display drift)
+            const FString PinName = GetCanonicalPinName(Pin);
             const FString Direction = (Pin->Direction == EGPD_Input) ? TEXT("input") : TEXT("output");
             const FString TypeCategory = Pin->PinType.PinCategory.ToString();
             // v9.18.0 — rev12 ISSUE-1 (a): emit ContainerType so callers can
@@ -948,7 +1041,11 @@ namespace
             return nullptr;
         }
 
-        UEdGraphPin* Pin = Node->FindPin(FName(*PinName));
+        // v9.25.0 — use the canonical-name-aware lookup so the LLM can pass
+        // "AsBP_TunnelCam_C" even after UE has regenerated PinName to
+        // "As BP Tunnel Cam" via ReconstructNode. Both forms resolve to
+        // the same pin.
+        UEdGraphPin* Pin = FindPinOnNodeByName(Node, PinName);
         if (Pin == nullptr)
         {
             OutErrorJson = JsonError(Command, TEXT("pin_not_found"),
@@ -1015,8 +1112,8 @@ namespace
             return JsonError(TEXT("set_pin_default"), TEXT("anchor_not_found"), AnchorName);
         }
 
-        // 5. Find target pin
-        UEdGraphPin* TargetPin = TargetNode->FindPin(FName(*PinName));
+        // 5. Find target pin — v9.25.0 canonical-aware lookup (handles cast result pin)
+        UEdGraphPin* TargetPin = FindPinOnNodeByName(TargetNode, PinName);
         if (TargetPin == nullptr)
         {
             return JsonError(TEXT("set_pin_default"), TEXT("pin_not_found"),
@@ -4363,7 +4460,8 @@ namespace
         for (const UEdGraphPin* Pin : Node->Pins)
         {
             Writer->WriteObjectStart();
-            Writer->WriteValue(TEXT("name"), Pin->PinName.ToString());
+            // v9.25.0 — canonical name (consistent with add_cast / BuildPinsJsonArray)
+            Writer->WriteValue(TEXT("name"), GetCanonicalPinName(Pin));
             Writer->WriteValue(TEXT("direction"),
                 Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
             Writer->WriteValue(TEXT("type"), Pin->PinType.PinCategory.ToString());
@@ -8079,14 +8177,20 @@ namespace
 
     // ===== v8.1 — log capture read/clear (no game-thread needed; capture is thread-safe) =====
 
-    FString ReadLogCaptureSync(int32 MaxLines, const FString& CategoryFilter, const FString& VerbosityFilter, const FString& Substring)
+    FString ReadLogCaptureSync(int32 MaxLines, const FString& CategoryFilter, const FString& VerbosityFilter, const FString& Substring, int64 SinceSeq)
     {
         const TCHAR* CmdName = TEXT("read_log_capture");
         if (GBlueprintMCPLogCapture == nullptr)
             return JsonError(CmdName, TEXT("log_capture_not_installed"), TEXT(""));
 
-        // Snapshot copies under lock; safe to filter/serialize without holding mutex.
-        TArray<FString> All = GBlueprintMCPLogCapture->Snapshot(/*MaxLines=*/ 0);  // 0 = all
+        // v9.25.0 — pull entries with their sequence numbers, optionally filtered
+        // by SinceSeq. Callers can capture latest_seq from a prior call (or
+        // before doing an operation), then ask read_log_capture(since_seq=baseline)
+        // to get ONLY the entries produced after that point — no risk of stale
+        // failed-compile errors from earlier iterations bleeding through.
+        TArray<TPair<int64, FString>> AllWithSeq = GBlueprintMCPLogCapture->SnapshotWithSeq(SinceSeq, /*MaxLines=*/ 0);
+        const int64 LatestSeq = GBlueprintMCPLogCapture->GetLatestSeq();
+        const int32 TotalCaptured = AllWithSeq.Num();
 
         // v8.0.3 BUG-A fix: previously we wrapped CategoryFilter in `[%s]` and looked for
         // that as a substring of the line. That made the filter act as prefix-match
@@ -8115,10 +8219,11 @@ namespace
             return FString();
         };
 
-        TArray<FString> Filtered;
-        Filtered.Reserve(All.Num());
-        for (const FString& Line : All)
+        TArray<TPair<int64, FString>> Filtered;
+        Filtered.Reserve(AllWithSeq.Num());
+        for (const TPair<int64, FString>& E : AllWithSeq)
         {
+            const FString& Line = E.Value;
             if (bHasCat)
             {
                 const FString LineCat = ExtractBracketToken(Line, /*Nth=*/ 0);
@@ -8133,7 +8238,7 @@ namespace
             }
             if (bHasSub && !Line.Contains(Substring, ESearchCase::IgnoreCase))
                 continue;
-            Filtered.Add(Line);
+            Filtered.Add(E);
         }
 
         // Tail-trim to MaxLines (if > 0)
@@ -8150,12 +8255,19 @@ namespace
         Writer->WriteObjectStart();
         Writer->WriteValue(TEXT("ok"), true);
         Writer->WriteValue(TEXT("command"), TEXT("read_log_capture"));
-        Writer->WriteValue(TEXT("total_captured"), All.Num());
+        Writer->WriteValue(TEXT("total_captured"), TotalCaptured);
         Writer->WriteValue(TEXT("returned"), Filtered.Num());
-        Writer->WriteArrayStart(TEXT("lines"));
-        for (const FString& Line : Filtered)
+        // v9.25.0 — checkpoint cursor. Callers should record this and pass it
+        // back as since_seq next time to get only NEW entries.
+        Writer->WriteValue(TEXT("latest_seq"), (double)LatestSeq);
+        if (SinceSeq > 0)
         {
-            Writer->WriteValue(Line);
+            Writer->WriteValue(TEXT("since_seq"), (double)SinceSeq);
+        }
+        Writer->WriteArrayStart(TEXT("lines"));
+        for (const TPair<int64, FString>& E : Filtered)
+        {
+            Writer->WriteValue(E.Value);
         }
         Writer->WriteArrayEnd();
         Writer->WriteObjectEnd();
@@ -8303,7 +8415,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         const FString Timestamp = FDateTime::UtcNow().ToIso8601();
         // __DATE__ and __TIME__ resolve at compile time. ANSI string → TCHAR via TEXT() wrap.
         return FString::Printf(
-            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.24.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
+            TEXT("{\"ok\":true,\"command\":\"ping\",\"version\":\"0.0.1\",\"plugin_version\":\"9.25.0\",\"build_date\":\"%s %s\",\"timestamp\":\"%s\"}\n"),
             TEXT(__DATE__), TEXT(__TIME__),
             *Timestamp);
     }
@@ -10356,6 +10468,7 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
     }
 
     // --- v8.1 read_log_capture / clear_log_capture (no game-thread marshaling — thread-safe) ---
+    // v9.25.0: added since_seq for stale-entry skipping (closes rev18 ISSUE-2).
     if (Command.Equals(TEXT("read_log_capture"), ESearchCase::IgnoreCase))
     {
         int32 MaxLines = 100;
@@ -10364,7 +10477,11 @@ FString FTCPServerRunnable::DispatchCommand(const FString& JsonCommandLine)
         JsonObject->TryGetStringField(TEXT("category"), CategoryFilter);
         JsonObject->TryGetStringField(TEXT("verbosity"), VerbosityFilter);
         JsonObject->TryGetStringField(TEXT("contains"), Substring);
-        return ReadLogCaptureSync(MaxLines, CategoryFilter, VerbosityFilter, Substring);
+        // v9.25.0 — since_seq is int64-sized; JSON can carry it as a number.
+        double SinceSeqDouble = 0.0;
+        JsonObject->TryGetNumberField(TEXT("since_seq"), SinceSeqDouble);
+        const int64 SinceSeq = (int64)SinceSeqDouble;
+        return ReadLogCaptureSync(MaxLines, CategoryFilter, VerbosityFilter, Substring, SinceSeq);
     }
     if (Command.Equals(TEXT("clear_log_capture"), ESearchCase::IgnoreCase))
     {
